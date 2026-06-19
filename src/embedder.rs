@@ -112,4 +112,25 @@ mod tests {
         let c = e.embed("totally unrelated cooking recipe");
         assert!(cos(&a, &b) > cos(&a, &c), "shared-word text should score higher");
     }
+
+    // Guards the REAL semantic path: bge-small must rank a semantically-related pair above
+    // an unrelated one even with NO shared keywords (the HashEmbedder above cannot - it is
+    // keyword-equivalent). Gated so the default `cargo test` never loads the model.
+    #[cfg(feature = "fastembed")]
+    #[test]
+    fn fastembed_related_closer_than_unrelated() {
+        let e = FastEmbedder::new().expect("load bge-small model");
+        // bge-small vectors are L2-normalized, so dot product == cosine similarity.
+        let cos = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| x * y).sum::<f32>();
+        let a = e.embed("the database server crashed and lost data");
+        let b = e.embed("our postgres instance went down and we lost records");
+        let c = e.embed("a recipe for chocolate chip cookies");
+        assert_eq!(a.len(), DIM);
+        assert!(
+            cos(&a, &b) > cos(&a, &c),
+            "semantically-related pair must outscore unrelated: rel={} unrel={}",
+            cos(&a, &b),
+            cos(&a, &c)
+        );
+    }
 }
