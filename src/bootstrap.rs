@@ -109,10 +109,10 @@ pub fn run(devin: bool, claude: bool) -> Result<()> {
 
     if did_any {
         println!();
-        println!("Done. dm is wired in (SessionStart -> persona/recent, UserPromptSubmit -> recall).");
+        println!("Done. dmem is wired in (SessionStart -> persona/recent, UserPromptSubmit -> recall).");
         println!("Binary: {}", dm);
         println!("Test on Devin: start a devin session; the first prompt should surface a <daimon-memory> block.");
-        println!("Seed a memory first, e.g.:  dm log_decision --title \"hello\" --decision \"dm works\"");
+        println!("Seed a memory first, e.g.:  dmem log_decision --title \"hello\" --decision \"it works\"");
     } else {
         println!("Nothing wired. Pass --devin and/or --claude (or --all), and ensure the agent is installed.");
     }

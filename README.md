@@ -11,26 +11,26 @@ multitenant next. Same memory model as v1; only the engine is new.
 
 ```bash
 cargo build --release
-install -m755 target/release/dm ~/.local/bin/dm
+install -m755 target/release/dmem ~/.local/bin/dmem
 
 # save typed memory
-dm log_decision --title "Lock LanceDB" --decision "use LanceDB" --rationale "GA vector + hybrid"
-dm log_lesson   --title "AVX2 gate"   --lesson "the embedder needs AVX2"
-dm remember "Devin is the Windsurf lineage"
+dmem log_decision --title "Lock LanceDB" --decision "use LanceDB" --rationale "GA vector + hybrid"
+dmem log_lesson   --title "AVX2 gate"   --lesson "the embedder needs AVX2"
+dmem remember "Devin is the Windsurf lineage"
 
 # recall
-dm recall lancedb vector
-dm recent
+dmem recall lancedb vector
+dmem recent
 ```
 
 ## Test it on Devin (or Claude Code)
 
 ```bash
-dm bootstrap --devin     # installs SessionStart + UserPromptSubmit hooks into ~/.config/devin/config.json
-dm bootstrap --claude    # or Claude Code (~/.claude/settings.json)
+dmem bootstrap --devin     # installs SessionStart + UserPromptSubmit hooks into ~/.config/devin/config.json
+dmem bootstrap --claude    # or Claude Code (~/.claude/settings.json)
 ```
 
-Then start a `devin` session: at session start dm injects persona + recent context;
+Then start a `devin` session: at session start dmem injects persona + recent context;
 on each prompt it recalls relevant memory and injects a `<daimon-memory>` block. Hooks
 fail open - a memory hiccup never blocks your turn. (Old config backed up to
 `config.json.dm-bak`.)

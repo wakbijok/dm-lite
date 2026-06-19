@@ -17,7 +17,7 @@ use clap::{Parser, Subcommand};
 use tools::Memory;
 
 #[derive(Parser)]
-#[command(name = "dm", version, about = "daimon-memory v2: small embedded typed memory with hybrid recall")]
+#[command(name = "dmem", version, about = "daimon-memory v2: small embedded typed memory with hybrid recall")]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -217,7 +217,7 @@ fn wired(config_path: &std::path::Path, needle: &str) -> &'static str {
 fn status() -> Result<()> {
     let tenant = config::tenant();
     let db = config::db_path(&tenant)?;
-    println!("dm {} - daimon-memory v2 (embedded)", env!("CARGO_PKG_VERSION"));
+    println!("dmem {} - daimon-memory v2 (embedded)", env!("CARGO_PKG_VERSION"));
     println!("tenant : {}", tenant);
     println!("store  : {}", db.display());
     let m = Memory::open()?;
@@ -228,8 +228,8 @@ fn status() -> Result<()> {
         println!("  {:<18} {}", k, n);
     }
     if let Some(h) = dirs::home_dir() {
-        println!("devin  : {}", wired(&h.join(".config/devin/config.json"), "dm hook"));
-        println!("claude : {}", wired(&h.join(".claude/settings.json"), "dm hook"));
+        println!("devin  : {}", wired(&h.join(".config/devin/config.json"), "dmem hook"));
+        println!("claude : {}", wired(&h.join(".claude/settings.json"), "dmem hook"));
     }
     Ok(())
 }

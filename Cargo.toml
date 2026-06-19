@@ -6,7 +6,7 @@ description = "daimon-memory v2: a small embedded typed memory engine with hybri
 license = "MIT"
 
 [[bin]]
-name = "dm"
+name = "dmem"
 path = "src/main.rs"
 
 [dependencies]
