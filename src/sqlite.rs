@@ -51,6 +51,11 @@ impl SqliteStore {
             CREATE INDEX IF NOT EXISTS idx_entries_kind  ON entries(kind);
             CREATE INDEX IF NOT EXISTS idx_entries_valid ON entries(valid_to_ms);
             CREATE VIRTUAL TABLE IF NOT EXISTS entries_fts USING fts5(idref UNINDEXED, text);
+            CREATE TABLE IF NOT EXISTS signals (
+                uri            TEXT PRIMARY KEY,
+                access_count   INTEGER NOT NULL DEFAULT 0,
+                last_access_ms INTEGER NOT NULL DEFAULT 0
+            );
             "#,
         )
         .context("init schema")?;
@@ -158,6 +163,31 @@ impl SqliteStore {
         } else {
             Ok(None)
         }
+    }
+
+    /// Bump the runtime access signal for a uri (called best-effort after recall).
+    pub fn bump_signal(&self, uri: &str, now_ms: i64) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO signals(uri, access_count, last_access_ms) VALUES(?1, 1, ?2) \
+             ON CONFLICT(uri) DO UPDATE SET access_count = access_count + 1, last_access_ms = ?2",
+            params![uri, now_ms],
+        )?;
+        Ok(())
+    }
+
+    /// Read (access_count, last_access_ms) for a set of uris (absent uris omitted).
+    pub fn read_signals(&self, uris: &[String]) -> Result<std::collections::HashMap<String, (i64, i64)>> {
+        let mut out = std::collections::HashMap::new();
+        let mut stmt = self
+            .conn
+            .prepare("SELECT access_count, last_access_ms FROM signals WHERE uri=?1")?;
+        for uri in uris {
+            let mut rows = stmt.query(params![uri])?;
+            if let Some(r) = rows.next()? {
+                out.insert(uri.clone(), (r.get::<_, i64>(0)?, r.get::<_, i64>(1)?));
+            }
+        }
+        Ok(out)
     }
 }
 
@@ -356,6 +386,18 @@ mod tests {
         let s = mem_store();
         s.put(&mk(Kind::Memory, "resources/x", "alpha", "a")).unwrap();
         assert_eq!(s.recall("", 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn signals_bump_and_read() {
+        let s = mem_store();
+        s.bump_signal("daimon://a", 1000).unwrap();
+        s.bump_signal("daimon://a", 2000).unwrap();
+        let m = s
+            .read_signals(&["daimon://a".to_string(), "daimon://missing".to_string()])
+            .unwrap();
+        assert_eq!(m.get("daimon://a").copied(), Some((2, 2000)));
+        assert!(!m.contains_key("daimon://missing"));
     }
 
     #[test]

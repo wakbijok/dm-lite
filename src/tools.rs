@@ -2,7 +2,7 @@
 //! validation) + recall. This is daimon's distinctive layer over the engine.
 
 use crate::config;
-use crate::entry::{make_uri, Entry, Kind};
+use crate::entry::{make_uri, now_ms, Entry, Kind};
 use crate::sqlite::SqliteStore;
 use crate::store::MemoryStore;
 use anyhow::{anyhow, Result};
@@ -39,6 +39,22 @@ fn require(value: &str, field: &str) -> Result<()> {
 fn first_line(text: &str) -> String {
     let line = text.trim().lines().next().unwrap_or("").trim();
     line.chars().take(80).collect::<String>()
+}
+
+/// Modest, deterministic runtime-signal multiplier, clamped to [1.0, 1.25] so it only
+/// reorders near-ties and can never override relevance. Components (all small): record
+/// importance, recency of last access, and log access frequency. `last_access_ms <= 0`
+/// (never accessed) contributes no recency. Deterministic: `now_ms` is passed in.
+fn signal_boost(importance: i64, access_count: i64, last_access_ms: i64, now_ms: i64) -> f64 {
+    let importance_norm = (importance as f64 / 100.0).clamp(0.0, 1.0);
+    let recency = if last_access_ms <= 0 {
+        0.0
+    } else {
+        let age_days = ((now_ms - last_access_ms).max(0) as f64) / 86_400_000.0;
+        1.0 / (1.0 + age_days)
+    };
+    let freq = (1.0 + access_count.max(0) as f64).ln();
+    (1.0 + 0.05 * importance_norm + 0.05 * recency + 0.02 * freq).clamp(1.0, 1.25)
 }
 
 impl Memory {
@@ -157,10 +173,16 @@ impl Memory {
         if let Some(vindex) = &self.vindex {
             return self.recall_hybrid(query, limit, vindex);
         }
-        self.store.recall(query, limit)
+        // Keyword-only: pull a deeper pool, then apply modest runtime-signal rescoring.
+        let pool = limit.max(10);
+        let hits = self.store.recall(query, pool)?;
+        let out = self.rescore_keyword(hits, limit);
+        self.bump_recalled(&out);
+        Ok(out)
     }
 
-    /// Hybrid recall: SQLite FTS (keyword) + zvec (dense vector), fused by RRF.
+    /// Hybrid recall: SQLite FTS (keyword) + zvec (dense vector), fused by RRF, then nudged
+    /// by runtime signals.
     #[cfg(feature = "zvec")]
     fn recall_hybrid(&self, query: &str, limit: usize, vindex: &crate::zvec_index::ZvecIndex) -> Result<Vec<Entry>> {
         use std::collections::HashMap;
@@ -182,15 +204,52 @@ impl Memory {
         for (rank, uri) in vec.iter().enumerate() {
             *score.entry(uri.clone()).or_default() += 1.0 / (k + rank as f64 + 1.0);
         }
-        let mut ranked: Vec<(String, f64)> = score.into_iter().collect();
-        ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        let mut out = Vec::new();
-        for (uri, _) in ranked.into_iter().take(limit) {
+        // Hydrate, then apply the modest runtime-signal multiplier AFTER RRF so it only
+        // reorders near-ties and never overrides semantic/keyword relevance.
+        let now = now_ms();
+        let uris: Vec<String> = score.keys().cloned().collect();
+        let sigs = self.store.read_signals(&uris).unwrap_or_default();
+        let mut scored: Vec<(Entry, f64)> = Vec::new();
+        for (uri, rrf) in score {
             if let Some(e) = self.store.get(&uri)? {
-                out.push(e);
+                let (ac, la) = sigs.get(&uri).copied().unwrap_or((0, 0));
+                let s = rrf * signal_boost(e.importance, ac, la, now);
+                scored.push((e, s));
             }
         }
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        let out: Vec<Entry> = scored.into_iter().take(limit).map(|(e, _)| e).collect();
+        self.bump_recalled(&out);
         Ok(out)
+    }
+
+    /// Re-rank keyword hits by their FTS order (base = 1/(1+rank)), gently nudged by the
+    /// runtime-signal multiplier. The base dominates, so a higher-ranked hit can never be
+    /// displaced by a lower-ranked but more-accessed one.
+    fn rescore_keyword(&self, hits: Vec<Entry>, limit: usize) -> Vec<Entry> {
+        let now = now_ms();
+        let uris: Vec<String> = hits.iter().map(|e| e.uri.clone()).collect();
+        let sigs = self.store.read_signals(&uris).unwrap_or_default();
+        let mut scored: Vec<(Entry, f64)> = hits
+            .into_iter()
+            .enumerate()
+            .map(|(i, e)| {
+                let base = 1.0 / (1.0 + i as f64);
+                let (ac, la) = sigs.get(&e.uri).copied().unwrap_or((0, 0));
+                let s = base * signal_boost(e.importance, ac, la, now);
+                (e, s)
+            })
+            .collect();
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.into_iter().take(limit).map(|(e, _)| e).collect()
+    }
+
+    /// Best-effort: bump the access signal for each recalled record. Never fails recall.
+    fn bump_recalled(&self, entries: &[Entry]) {
+        let now = now_ms();
+        for e in entries {
+            let _ = self.store.bump_signal(&e.uri, now);
+        }
     }
 
     pub fn recent(&self, limit: usize) -> Result<Vec<Entry>> {
@@ -229,5 +288,61 @@ impl Memory {
         let mut out = self.store.by_kind("persona", 5)?;
         out.extend(self.store.by_kind("protocol", 5)?);
         Ok(out)
+    }
+
+    /// Construct a Memory directly over a store (tests only; bypasses config/embedder).
+    #[cfg(test)]
+    fn for_test(store: SqliteStore) -> Self {
+        #[cfg(feature = "zvec")]
+        {
+            Self { store, vindex: None, embedder: make_embedder() }
+        }
+        #[cfg(not(feature = "zvec"))]
+        {
+            Self { store }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sqlite::SqliteStore;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn tmp_store() -> SqliteStore {
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("dmtools-{}-{}-{}", std::process::id(), now_ms(), n));
+        std::fs::create_dir_all(&dir).unwrap();
+        SqliteStore::open(&dir.join("t.db")).unwrap()
+    }
+
+    fn ent(uri: &str, title: &str) -> Entry {
+        Entry::new_now(uri.into(), Kind::Memory, "ns".into(), title.into(), "".into(), vec![], 50, uri.into())
+    }
+
+    #[test]
+    fn signal_boost_is_modest_and_monotonic() {
+        let day = 86_400_000i64;
+        let low = signal_boost(50, 0, 0, day);
+        let high = signal_boost(90, 50, day, day);
+        assert!(high > low, "more importance/access/recency must boost more");
+        assert!(low >= 1.0 && high <= 1.25, "boost clamped to [1.0,1.25]: low={low} high={high}");
+    }
+
+    #[test]
+    fn frequency_does_not_displace_stronger_relevance() {
+        let store = tmp_store();
+        // hammer the access signal of the lower-ranked hit
+        for _ in 0..100 {
+            store.bump_signal("daimon://weak", now_ms()).unwrap();
+        }
+        let m = Memory::for_test(store);
+        // hits already in relevance order: strong (rank 0), weak (rank 1)
+        let out = m.rescore_keyword(vec![ent("daimon://strong", "Strong"), ent("daimon://weak", "Weak")], 10);
+        assert_eq!(out[0].uri, "daimon://strong", "strong relevance stays #1 despite weak's access spike");
+        assert_eq!(out.len(), 2);
     }
 }
