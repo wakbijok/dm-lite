@@ -4,6 +4,7 @@
 
 mod bootstrap;
 mod config;
+mod embedder;
 mod entry;
 mod hooks;
 mod mcp;
@@ -11,6 +12,8 @@ mod render;
 mod sqlite;
 mod store;
 mod tools;
+#[cfg(feature = "zvec")]
+mod zvec_index;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -224,6 +227,7 @@ fn status() -> Result<()> {
     let counts = m.counts()?;
     let total: usize = counts.iter().map(|(_, n)| n).sum();
     println!("records: {} live", total);
+    println!("recall : {}", m.recall_mode());
     for (k, n) in counts {
         println!("  {:<18} {}", k, n);
     }

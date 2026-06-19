@@ -9,6 +9,10 @@ use anyhow::{anyhow, Result};
 
 pub struct Memory {
     store: SqliteStore,
+    #[cfg(feature = "zvec")]
+    vindex: Option<crate::zvec_index::ZvecIndex>,
+    #[cfg(feature = "zvec")]
+    embedder: crate::embedder::HashEmbedder,
 }
 
 fn require(value: &str, field: &str) -> Result<()> {
@@ -27,7 +31,21 @@ fn first_line(text: &str) -> String {
 impl Memory {
     pub fn open() -> Result<Self> {
         let path = config::db_path(&config::tenant())?;
-        Ok(Self { store: SqliteStore::open(&path)? })
+        let store = SqliteStore::open(&path)?;
+        #[cfg(feature = "zvec")]
+        {
+            let vdir = config::data_dir()?.join("vectors").join(config::tenant());
+            let vindex = match crate::zvec_index::ZvecIndex::open(&vdir) {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    eprintln!("dmem: zvec vector index unavailable ({:#}); falling back to keyword-only recall", e);
+                    None
+                }
+            };
+            return Ok(Self { store, vindex, embedder: crate::embedder::HashEmbedder::new() });
+        }
+        #[cfg(not(feature = "zvec"))]
+        Ok(Self { store })
     }
 
     fn save(&self, kind: Kind, namespace: &str, title: &str, body: String, importance: i64, tags: Vec<String>) -> Result<String> {
@@ -45,6 +63,12 @@ impl Memory {
             valid_to_ms: None,
         };
         self.store.put(&e)?;
+        #[cfg(feature = "zvec")]
+        if let Some(vindex) = &self.vindex {
+            use crate::embedder::Embedder;
+            let v = self.embedder.embed(&e.body);
+            let _ = vindex.upsert(&e.uri, &v); // best-effort; keyword recall still works if it fails
+        }
         Ok(uri)
     }
 
@@ -113,11 +137,59 @@ impl Memory {
     }
 
     pub fn recall(&self, query: &str, limit: usize) -> Result<Vec<Entry>> {
+        #[cfg(feature = "zvec")]
+        if let Some(vindex) = &self.vindex {
+            return self.recall_hybrid(query, limit, vindex);
+        }
         self.store.recall(query, limit)
+    }
+
+    /// Hybrid recall: SQLite FTS (keyword) + zvec (dense vector), fused by RRF.
+    #[cfg(feature = "zvec")]
+    fn recall_hybrid(&self, query: &str, limit: usize, vindex: &crate::zvec_index::ZvecIndex) -> Result<Vec<Entry>> {
+        use crate::embedder::Embedder;
+        use std::collections::HashMap;
+        let pool = limit.max(10);
+        let kw: Vec<String> = self.store.recall(query, pool)?.into_iter().map(|e| e.uri).collect();
+        let qv = self.embedder.embed(query);
+        let vec: Vec<String> = vindex.search(&qv, pool).unwrap_or_default();
+        let k = 60.0_f64;
+        let mut score: HashMap<String, f64> = HashMap::new();
+        for (rank, uri) in kw.iter().enumerate() {
+            *score.entry(uri.clone()).or_default() += 1.0 / (k + rank as f64 + 1.0);
+        }
+        for (rank, uri) in vec.iter().enumerate() {
+            *score.entry(uri.clone()).or_default() += 1.0 / (k + rank as f64 + 1.0);
+        }
+        let mut ranked: Vec<(String, f64)> = score.into_iter().collect();
+        ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        let mut out = Vec::new();
+        for (uri, _) in ranked.into_iter().take(limit) {
+            if let Some(e) = self.store.get(&uri)? {
+                out.push(e);
+            }
+        }
+        Ok(out)
     }
 
     pub fn recent(&self, limit: usize) -> Result<Vec<Entry>> {
         self.store.recent(limit)
+    }
+
+    /// Which recall path is active (truthful: reflects whether zvec actually loaded).
+    pub fn recall_mode(&self) -> &'static str {
+        #[cfg(feature = "zvec")]
+        {
+            if self.vindex.is_some() {
+                "hybrid: SQLite FTS + zvec vector (RRF)"
+            } else {
+                "keyword only (SQLite FTS; zvec failed to load)"
+            }
+        }
+        #[cfg(not(feature = "zvec"))]
+        {
+            "keyword only (SQLite FTS)"
+        }
     }
 
     /// Persona + protocol records (the boot layer), most important first.

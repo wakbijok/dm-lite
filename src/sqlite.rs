@@ -72,6 +72,20 @@ impl SqliteStore {
             Ok(None)
         }
     }
+
+    /// Fetch the live entry for a uri (used by RRF fusion to hydrate vector hits).
+    pub fn get(&self, uri: &str) -> Result<Option<Entry>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT uri,kind,namespace,title,body,tags,importance,dedup_key,created_ms,valid_to_ms \
+             FROM entries WHERE uri=?1 AND valid_to_ms IS NULL ORDER BY created_ms DESC LIMIT 1",
+        )?;
+        let mut rows = stmt.query(params![uri])?;
+        if let Some(r) = rows.next()? {
+            Ok(Some(Self::row_to_entry(r)?))
+        } else {
+            Ok(None)
+        }
+    }
 }
 
 /// Build a safe FTS5 query: quote each alphanumeric term, OR them together.

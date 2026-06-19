@@ -169,6 +169,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "zvec",
 ]
 
 [[package]]
@@ -563,3 +564,16 @@ name = "zmij"
 version = "1.0.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b8848ee67ecc8aedbaf3e4122217aff892639231befc6a1b58d29fff4c2cabaa"
+
+[[package]]
+name = "zvec"
+version = "0.5.0"
+source = "git+https://github.com/zvec-ai/zvec-rust.git?tag=v0.5.0#fde3b811e1ff040a385d0366f833c5b9f1a95408"
+dependencies = [
+ "zvec-sys",
+]
+
+[[package]]
+name = "zvec-sys"
+version = "0.5.0"
+source = "git+https://github.com/zvec-ai/zvec-rust.git?tag=v0.5.0#fde3b811e1ff040a385d0366f833c5b9f1a95408"

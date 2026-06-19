@@ -52,14 +52,41 @@ keyword-only, zero models); **LanceDB** is the locked production engine that dro
 behind the same trait for dense vector recall. Source text is canonical; vectors are a
 rebuildable index. Embedder is a commodity swap behind an `Embedder` trait.
 
+## Dense vector recall (zvec, optional feature)
+
+The chosen vector substrate is Alibaba **zvec** (in-process, Apache-2.0), behind a feature
+so the default build stays pure-Rust, offline, keyword-only.
+
+```bash
+cargo build --release --features zvec
+cp target/release/dmem ~/.local/bin/dmem
+# zvec links a native lib; ship it ALONGSIDE the binary (build.rs rpaths @executable_path):
+cp "$(find target -name 'libzvec_c_api.dylib' | head -1)" ~/.local/bin/
+dmem status      # -> recall : hybrid: SQLite FTS + zvec vector (RRF)
+```
+
+With `--features zvec`, every save also writes an embedding to a zvec collection
+(database-per-tenant at `<data>/vectors/<tenant>`); recall fuses SQLite FTS (keyword) +
+zvec vector via RRF.
+
+**Honest status of the zvec path:**
+- zvec store + search + cross-process persistence: working, unit-tested (9 tests green).
+- The binary needs `libzvec_c_api.{dylib,so}` at runtime (zvec is a C++ core via FFI). The
+  first build is heavy (~2 min: pulls the zvec C++ tree + arrow/rocksdb/protobuf). On
+  failure to load, recall falls back to keyword-only and `status` says so.
+- The **embedder is a placeholder** (`HashEmbedder` - bag-of-hashed-tokens, offline, no
+  model). It wires + tests the vector pipeline but is keyword-equivalent, NOT real
+  semantics. Real semantic recall = a model (bge-small via fastembed/candle) behind the
+  `Embedder` trait. That is the next step and what makes the vector half earn its keep.
+
 ## Next (M1, toward complete v2)
 
 In priority order, each behind the existing seams (no model change):
 
-1. **Dense vector recall** - add an `Embedder` trait (default `bge-small`, offline
-   FTS-only when absent) + the **LanceDB** `MemoryStore` impl; fuse keyword + vector
-   with RRF. (Deferred from M0 only because LanceDB/Arrow compile + model download are
-   heavy; keyword recall already works.)
+1. **Real embedder for semantic recall** - the zvec vector store + RRF fusion are wired
+   (see above); swap the placeholder `HashEmbedder` for a real model (bge-small via
+   fastembed/candle) behind the `Embedder` trait. The store/search/fusion already work;
+   only the embedding *quality* is placeholder, so this is what unlocks true semantic recall.
 2. **Bitemporal** - replace the soft-close (`valid_to_ms`) with a system+valid-time
    versions model; as-of queries.
 3. **Runtime-signal rescoring** - access/importance/recency/maturity sidecar; reweight
