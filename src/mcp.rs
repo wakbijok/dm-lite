@@ -53,6 +53,12 @@ fn s<'a>(args: &'a Value, k: &str) -> &'a str {
     args.get(k).and_then(|v| v.as_str()).unwrap_or("")
 }
 
+/// The serverInfo reported in the MCP `initialize` response. Named "dmem" to match the
+/// binary (the old short name "dm" was a leftover from the dm -> dmem rename).
+fn server_info() -> Value {
+    json!({"name": "dmem", "version": env!("CARGO_PKG_VERSION")})
+}
+
 /// Run a tool; return the text content (or an error string).
 fn call_tool(mem: &Memory, name: &str, args: &Value) -> std::result::Result<String, String> {
     match name {
@@ -114,7 +120,7 @@ pub fn serve() -> Result<()> {
                 Some(json!({
                     "protocolVersion": pv,
                     "capabilities": {"tools": {}},
-                    "serverInfo": {"name": "dm", "version": env!("CARGO_PKG_VERSION")}
+                    "serverInfo": server_info()
                 }))
             }
             "tools/list" => Some(json!({"tools": tool_schemas()})),
@@ -138,4 +144,15 @@ pub fn serve() -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn server_info_reports_dmem() {
+        assert_eq!(server_info()["name"], "dmem");
+        assert_eq!(server_info()["version"], env!("CARGO_PKG_VERSION"));
+    }
 }
