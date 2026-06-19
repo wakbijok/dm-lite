@@ -31,6 +31,7 @@ impl SqliteStore {
         conn.execute_batch(
             r#"
             PRAGMA journal_mode=WAL;
+            PRAGMA busy_timeout=5000;
             CREATE TABLE IF NOT EXISTS entries (
                 id             INTEGER PRIMARY KEY,
                 uri            TEXT NOT NULL,
@@ -77,7 +78,9 @@ impl SqliteStore {
             r.filter_map(|x| x.ok()).collect()
         };
         let missing = |c: &str| !cols.iter().any(|x| x == c);
-        self.conn.execute_batch("BEGIN")?;
+        // BEGIN IMMEDIATE takes the write lock up front (with busy_timeout, a concurrent
+        // open waits rather than failing with SQLITE_BUSY mid-migration).
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
         let res = (|| -> Result<()> {
             if missing("valid_from_ms") {
                 self.conn.execute_batch("ALTER TABLE entries ADD COLUMN valid_from_ms INTEGER")?;
@@ -135,19 +138,6 @@ impl SqliteStore {
             system_from_ms: row.get("system_from_ms")?,
             system_to_ms: row.get("system_to_ms")?,
         })
-    }
-
-    fn get_by_id(&self, id: i64) -> Result<Option<Entry>> {
-        let now = crate::entry::now_ms();
-        let mut stmt = self
-            .conn
-            .prepare(&format!("SELECT {COLS} FROM entries WHERE id=?1 AND {CURRENT}"))?;
-        let mut rows = stmt.query(params![id, now])?;
-        if let Some(r) = rows.next()? {
-            Ok(Some(Self::row_to_entry(r)?))
-        } else {
-            Ok(None)
-        }
     }
 
     /// Fetch the current (live) entry for a uri (used by RRF fusion to hydrate vector hits).
@@ -208,26 +198,29 @@ fn fts_query(query: &str) -> Option<String> {
 impl MemoryStore for SqliteStore {
     fn put(&self, e: &Entry) -> Result<()> {
         let now = crate::entry::now_ms();
+        // Atomic: supersede + canonical INSERT + FTS INSERT must commit or roll back together,
+        // else a crash mid-way could leave a dedup_key with no current version (data loss) or
+        // entries/entries_fts desynced. unchecked_transaction because put takes &self; on any
+        // early-return error the tx Drops -> ROLLBACK.
+        let tx = self.conn.unchecked_transaction()?;
         // Append-only supersede: close prior CURRENT versions (same dedup_key) in SYSTEM
         // time only (system_to_ms = now) - the old version is retained, never deleted - and
         // drop their FTS rows so keyword recall sees only the current version.
-        let mut sel = self
-            .conn
+        let mut sel = tx
             .prepare("SELECT id FROM entries WHERE dedup_key=?1 AND system_to_ms IS NULL")?;
         let ids: Vec<i64> = sel
             .query_map(params![e.dedup_key], |r| r.get::<_, i64>(0))?
             .filter_map(|r| r.ok())
             .collect();
+        drop(sel);
         for id in &ids {
-            self.conn
-                .execute("UPDATE entries SET system_to_ms=?1 WHERE id=?2", params![now, id])?;
-            self.conn
-                .execute("DELETE FROM entries_fts WHERE idref=?1", params![id])?;
+            tx.execute("UPDATE entries SET system_to_ms=?1 WHERE id=?2", params![now, id])?;
+            tx.execute("DELETE FROM entries_fts WHERE idref=?1", params![id])?;
         }
         // Append the new current version: system_from = now (store-authoritative), system_to
         // = NULL. created_ms / valid_from_ms / valid_to_ms come from the entry.
         let tags = serde_json::to_string(&e.tags).unwrap_or_else(|_| "[]".into());
-        self.conn.execute(
+        tx.execute(
             "INSERT INTO entries(uri,kind,namespace,title,body,tags,importance,dedup_key,\
              created_ms,valid_from_ms,valid_to_ms,system_from_ms,system_to_ms) \
              VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,NULL)",
@@ -236,12 +229,13 @@ impl MemoryStore for SqliteStore {
                 e.importance, e.dedup_key, e.created_ms, e.valid_from_ms, e.valid_to_ms, now
             ],
         )?;
-        let new_id = self.conn.last_insert_rowid();
+        let new_id = tx.last_insert_rowid();
         let fts_text = format!("{} {} {}", e.title, e.body, e.tags.join(" "));
-        self.conn.execute(
+        tx.execute(
             "INSERT INTO entries_fts(idref, text) VALUES (?1, ?2)",
             params![new_id, fts_text],
         )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -250,19 +244,21 @@ impl MemoryStore for SqliteStore {
             Some(q) => q,
             None => return self.recent(limit),
         };
-        let mut stmt = self
-            .conn
-            .prepare("SELECT idref FROM entries_fts WHERE entries_fts MATCH ?1 ORDER BY rank LIMIT ?2")?;
-        let ids: Vec<i64> = stmt
-            .query_map(params![fq, limit as i64], |r| r.get::<_, i64>(0))?
+        let now = crate::entry::now_ms();
+        // Filter to the current slice in SQL (JOIN entries) BEFORE LIMIT, so the limit counts
+        // only live results - a stale FTS row (e.g. a record whose valid time has expired but
+        // is still system-current) can't consume a slot and crowd out a real match.
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {} FROM entries_fts JOIN entries e ON e.id = entries_fts.idref \
+             WHERE entries_fts MATCH ?1 AND e.system_to_ms IS NULL \
+             AND (e.valid_to_ms IS NULL OR e.valid_to_ms > ?2) \
+             ORDER BY entries_fts.rank LIMIT ?3",
+            COLS.split(',').map(|c| format!("e.{c}")).collect::<Vec<_>>().join(",")
+        ))?;
+        let out = stmt
+            .query_map(params![fq, now, limit as i64], Self::row_to_entry)?
             .filter_map(|r| r.ok())
             .collect();
-        let mut out = Vec::new();
-        for id in ids {
-            if let Some(e) = self.get_by_id(id)? {
-                out.push(e);
-            }
-        }
         Ok(out)
     }
 
@@ -386,6 +382,34 @@ mod tests {
         let s = mem_store();
         s.put(&mk(Kind::Memory, "resources/x", "alpha", "a")).unwrap();
         assert_eq!(s.recall("", 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn recall_filters_valid_expired_before_limit() {
+        let s = mem_store();
+        let live = mk(Kind::Memory, "ns", "alpha live", "alpha token here");
+        s.put(&live).unwrap();
+        // hand-insert a system-current but valid-EXPIRED row (valid_to in the past) that also
+        // matches "alpha"; it must not consume the LIMIT slot ahead of the live row.
+        s.conn
+            .execute(
+                "INSERT INTO entries(uri,kind,namespace,title,body,tags,importance,dedup_key,\
+                 created_ms,valid_from_ms,valid_to_ms,system_from_ms,system_to_ms) \
+                 VALUES('daimon://expired','memory','ns','alpha expired','alpha token here','[]',\
+                 50,'daimon://expired',1000,1000,2000,1000,NULL)",
+                [],
+            )
+            .unwrap();
+        let id = s.conn.last_insert_rowid();
+        s.conn
+            .execute(
+                "INSERT INTO entries_fts(idref, text) VALUES (?1, ?2)",
+                params![id, "alpha expired alpha token here"],
+            )
+            .unwrap();
+        let hits = s.recall("alpha", 1).unwrap();
+        assert_eq!(hits.len(), 1, "limit 1 must return a LIVE row, not be spent on the expired one");
+        assert_eq!(hits[0].uri, live.uri);
     }
 
     #[test]

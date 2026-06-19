@@ -88,7 +88,7 @@ enum Cmd {
         #[arg(long, default_value_t = 6)]
         limit: usize,
         /// Bitemporal: recall the store AS OF this epoch-ms (and facts valid then).
-        #[arg(long)]
+        #[arg(long = "as-of", visible_alias = "as_of")]
         as_of: Option<i64>,
     },
     /// Show recent high-importance memory.

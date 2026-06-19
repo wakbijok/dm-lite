@@ -16,7 +16,9 @@ default = []
 zvec = ["dep:zvec"]
 # fastembed: real semantic embeddings (bge-small-en-v1.5, 384d) via ONNX/ort. Downloads the
 # model on first use. Sets DIM=384; without it the placeholder HashEmbedder (256d) is used.
-fastembed = ["dep:fastembed"]
+# Implies `zvec`: the embedder is only consumed by the zvec vector path, so fastembed alone
+# would pull the heavy ort/onnx tree for zero behavioral change.
+fastembed = ["dep:fastembed", "zvec"]
 # server: network API (axum + tokio) with multi-token bearer -> tenant auth, over the
 # database-per-tenant store. Off by default so the embedded binary stays lean (no tokio).
 server = ["dep:axum", "dep:tokio", "dep:tower"]

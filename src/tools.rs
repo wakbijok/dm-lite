@@ -41,10 +41,12 @@ fn first_line(text: &str) -> String {
     line.chars().take(80).collect::<String>()
 }
 
-/// Modest, deterministic runtime-signal multiplier, clamped to [1.0, 1.25] so it only
-/// reorders near-ties and can never override relevance. Components (all small): record
-/// importance, recency of last access, and log access frequency. `last_access_ms <= 0`
-/// (never accessed) contributes no recency. Deterministic: `now_ms` is passed in.
+/// Modest, deterministic runtime-signal multiplier, clamped to [1.0, 1.25]. It NUDGES
+/// ranking: items at adjacent or deeper ranks may be reordered, but a clearly higher-ranked
+/// hit (a large base-score gap) is never displaced, because the multiplier is bounded. This
+/// is a bounded nudge, NOT an order-preserving guarantee at every rank. Components (all
+/// small): record importance, recency of last access, log access frequency; `last_access_ms
+/// <= 0` (never accessed) contributes no recency. Deterministic: `now_ms` is passed in.
 fn signal_boost(importance: i64, access_count: i64, last_access_ms: i64, now_ms: i64) -> f64 {
     let importance_norm = (importance as f64 / 100.0).clamp(0.0, 1.0);
     let recency = if last_access_ms <= 0 {
@@ -70,7 +72,7 @@ impl Memory {
         let store = SqliteStore::open(&path)?;
         #[cfg(feature = "zvec")]
         {
-            let vdir = config::data_dir()?.join("vectors").join(tenant);
+            let vdir = config::vector_dir(tenant)?;
             let vindex = match crate::zvec_index::ZvecIndex::open(&vdir) {
                 Ok(v) => Some(v),
                 Err(e) => {
@@ -180,8 +182,9 @@ impl Memory {
         if let Some(vindex) = &self.vindex {
             return self.recall_hybrid(query, limit, vindex);
         }
-        // Keyword-only: pull a deeper pool, then apply modest runtime-signal rescoring.
-        let pool = limit.max(10);
+        // Keyword-only: pull a deeper pool (so rescoring can promote beyond the top-`limit`
+        // keyword hits), then apply the modest runtime-signal rescoring.
+        let pool = (limit * 2).max(10);
         let hits = self.store.recall(query, pool)?;
         let out = self.rescore_keyword(hits, limit);
         self.bump_recalled(&out);
@@ -193,7 +196,7 @@ impl Memory {
     #[cfg(feature = "zvec")]
     fn recall_hybrid(&self, query: &str, limit: usize, vindex: &crate::zvec_index::ZvecIndex) -> Result<Vec<Entry>> {
         use std::collections::HashMap;
-        let pool = limit.max(10);
+        let pool = (limit * 2).max(10);
         let kw: Vec<String> = self.store.recall(query, pool)?.into_iter().map(|e| e.uri).collect();
         let qv = self.embedder.embed(query);
         let vec: Vec<String> = match vindex.search(&qv, pool) {
@@ -211,8 +214,8 @@ impl Memory {
         for (rank, uri) in vec.iter().enumerate() {
             *score.entry(uri.clone()).or_default() += 1.0 / (k + rank as f64 + 1.0);
         }
-        // Hydrate, then apply the modest runtime-signal multiplier AFTER RRF so it only
-        // reorders near-ties and never overrides semantic/keyword relevance.
+        // Hydrate, then apply the modest runtime-signal multiplier AFTER RRF: a bounded
+        // (<=1.25x) nudge that reorders near-equal scores without overturning a clear gap.
         let now = now_ms();
         let uris: Vec<String> = score.keys().cloned().collect();
         let sigs = self.store.read_signals(&uris).unwrap_or_default();
@@ -231,8 +234,8 @@ impl Memory {
     }
 
     /// Re-rank keyword hits by their FTS order (base = 1/(1+rank)), gently nudged by the
-    /// runtime-signal multiplier. The base dominates, so a higher-ranked hit can never be
-    /// displaced by a lower-ranked but more-accessed one.
+    /// runtime-signal multiplier (<=1.25x). The base dominates at the top, so a clearly
+    /// higher-ranked hit is not displaced; adjacent items at deeper ranks may reorder.
     fn rescore_keyword(&self, hits: Vec<Entry>, limit: usize) -> Vec<Entry> {
         let now = now_ms();
         let uris: Vec<String> = hits.iter().map(|e| e.uri.clone()).collect();
@@ -340,16 +343,27 @@ mod tests {
     }
 
     #[test]
-    fn frequency_does_not_displace_stronger_relevance() {
+    fn clearly_stronger_relevance_is_preserved() {
         let store = tmp_store();
-        // hammer the access signal of the lower-ranked hit
-        for _ in 0..100 {
-            store.bump_signal("daimon://weak", now_ms()).unwrap();
+        // hammer the access signal of a DEEPER hit (rank 5) - the bounded (<=1.25x) boost
+        // must still not lift it past the clearly higher-ranked hit at rank 0.
+        for _ in 0..1000 {
+            store.bump_signal("daimon://freq", now_ms()).unwrap();
         }
         let m = Memory::for_test(store);
-        // hits already in relevance order: strong (rank 0), weak (rank 1)
-        let out = m.rescore_keyword(vec![ent("daimon://strong", "Strong"), ent("daimon://weak", "Weak")], 10);
-        assert_eq!(out[0].uri, "daimon://strong", "strong relevance stays #1 despite weak's access spike");
-        assert_eq!(out.len(), 2);
+        let hits = vec![
+            ent("daimon://strong", "Strong"), // rank 0 (base 1.0)
+            ent("daimon://h1", "h1"),
+            ent("daimon://h2", "h2"),
+            ent("daimon://h3", "h3"),
+            ent("daimon://h4", "h4"),
+            ent("daimon://freq", "Freq"), // rank 5 (base 1/6), heavily accessed
+        ];
+        let out = m.rescore_keyword(hits, 10);
+        assert_eq!(
+            out[0].uri, "daimon://strong",
+            "a clearly higher-ranked hit must not be displaced by a deeper, much-accessed one"
+        );
+        assert_eq!(out.len(), 6);
     }
 }

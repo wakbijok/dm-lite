@@ -119,12 +119,28 @@ mod tests {
     #[cfg(feature = "fastembed")]
     #[test]
     fn fastembed_related_closer_than_unrelated() {
+        // The related pair shares NO content tokens, so a keyword-equivalent embedder
+        // (HashEmbedder) would score them at 0 and FAIL this - only real semantics pass.
+        let sent_a = "the production database stopped responding";
+        let sent_b = "our postgres node became unreachable";
+        let sent_c = "a recipe for chocolate chip cookies";
+        let toks = |s: &str| {
+            s.split(|c: char| !c.is_ascii_alphanumeric())
+                .filter(|t| t.len() >= 2)
+                .map(|t| t.to_lowercase())
+                .collect::<std::collections::HashSet<_>>()
+        };
+        assert!(
+            toks(sent_a).is_disjoint(&toks(sent_b)),
+            "related pair must share no keywords, else the test doesn't isolate semantics from overlap"
+        );
+
         let e = FastEmbedder::new().expect("load bge-small model");
         // bge-small vectors are L2-normalized, so dot product == cosine similarity.
         let cos = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| x * y).sum::<f32>();
-        let a = e.embed("the database server crashed and lost data");
-        let b = e.embed("our postgres instance went down and we lost records");
-        let c = e.embed("a recipe for chocolate chip cookies");
+        let a = e.embed(sent_a);
+        let b = e.embed(sent_b);
+        let c = e.embed(sent_c);
         assert_eq!(a.len(), DIM);
         assert!(
             cos(&a, &b) > cos(&a, &c),

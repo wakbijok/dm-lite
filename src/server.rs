@@ -36,16 +36,27 @@ pub struct BearerAuth {
 }
 
 impl BearerAuth {
-    pub fn from_env() -> Self {
-        let mut map = HashMap::new();
+    /// Build the token -> tenant map from `DM_TOKEN_<TENANT>` env vars. Fails fast on an
+    /// ambiguous config: the same secret mapping to two different tenants would otherwise
+    /// resolve nondeterministically (HashMap iteration order), silently breaking isolation.
+    pub fn from_env() -> Result<Self> {
+        let mut map: HashMap<String, String> = HashMap::new();
         for (k, v) in std::env::vars() {
             if let Some(tenant) = k.strip_prefix("DM_TOKEN_") {
-                if !tenant.is_empty() && !v.is_empty() {
-                    map.insert(v, tenant.to_lowercase());
+                if tenant.is_empty() || v.is_empty() {
+                    continue;
+                }
+                let tenant = crate::config::canonical_tenant(tenant);
+                if let Some(prev) = map.insert(v, tenant.clone()) {
+                    if prev != tenant {
+                        anyhow::bail!(
+                            "ambiguous DM_TOKEN config: one bearer secret maps to both tenants '{prev}' and '{tenant}'"
+                        );
+                    }
                 }
             }
         }
-        BearerAuth { map }
+        Ok(BearerAuth { map })
     }
 
     pub fn is_empty(&self) -> bool {
@@ -77,6 +88,19 @@ struct AppState {
 
 fn err(code: StatusCode, msg: &str) -> ApiResp {
     (code, Json(json!({ "error": msg })))
+}
+
+/// Log the full error chain server-side; return a generic body. Never leak internals (the
+/// anyhow chain includes absolute DB paths) to clients, even authenticated ones.
+fn internal(e: anyhow::Error) -> ApiResp {
+    eprintln!("dmem serve: handler error: {e:#}");
+    err(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
+}
+
+/// As `internal`, but for the typed-save routes where the failure is usually client input.
+fn bad_request(e: anyhow::Error) -> ApiResp {
+    eprintln!("dmem serve: handler error: {e:#}");
+    err(StatusCode::BAD_REQUEST, "invalid request")
 }
 
 /// Resolve the request's tenant from its Authorization header, or None (-> 401).
@@ -135,7 +159,7 @@ async fn recall_h(State(st): State<AppState>, headers: HeaderMap, Json(req): Jso
     let limit = req.limit.unwrap_or(6);
     match Memory::open_tenant(&tenant).and_then(|m| m.recall(&req.query, limit)) {
         Ok(hits) => (StatusCode::OK, Json(json!(hits))),
-        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, &format!("{e:#}")),
+        Err(e) => internal(e),
     }
 }
 
@@ -147,7 +171,7 @@ async fn remember_h(State(st): State<AppState>, headers: HeaderMap, Json(req): J
     let ns = ns_or(&req.namespace, "resources/notes").to_string();
     match Memory::open_tenant(&tenant).and_then(|m| m.remember(&req.text, &ns)) {
         Ok(uri) => (StatusCode::OK, Json(json!({ "uri": uri }))),
-        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, &format!("{e:#}")),
+        Err(e) => internal(e),
     }
 }
 
@@ -161,7 +185,7 @@ async fn decision_h(State(st): State<AppState>, headers: HeaderMap, Json(req): J
         .and_then(|m| m.log_decision(&req.title, &req.context, &req.decision, &req.rationale, &ns))
     {
         Ok(uri) => (StatusCode::OK, Json(json!({ "uri": uri }))),
-        Err(e) => err(StatusCode::BAD_REQUEST, &format!("{e:#}")),
+        Err(e) => bad_request(e),
     }
 }
 
@@ -173,7 +197,7 @@ async fn reminder_h(State(st): State<AppState>, headers: HeaderMap, Json(req): J
     let ns = ns_or(&req.namespace, "agent/reminders").to_string();
     match Memory::open_tenant(&tenant).and_then(|m| m.add_reminder(&req.title, &req.text, &ns)) {
         Ok(uri) => (StatusCode::OK, Json(json!({ "uri": uri }))),
-        Err(e) => err(StatusCode::BAD_REQUEST, &format!("{e:#}")),
+        Err(e) => bad_request(e),
     }
 }
 
@@ -190,7 +214,7 @@ pub fn router(auth: Arc<dyn Authenticator>) -> Router {
 
 /// Bind `addr` and serve until Ctrl-C (graceful shutdown). Tokens come from the environment.
 pub fn run_blocking(addr: &str) -> Result<()> {
-    let auth = BearerAuth::from_env();
+    let auth = BearerAuth::from_env()?;
     if auth.is_empty() {
         eprintln!(
             "dmem serve: no DM_TOKEN_<tenant> tokens in the environment; authed routes will 401 \
@@ -221,10 +245,16 @@ mod tests {
     use axum::http::Request;
     use tower::ServiceExt; // for `oneshot`
 
+    // These tests mutate process-global env (DM_DATA_DIR, DM_TOKEN_*). Cargo runs tests in a
+    // binary multithreaded, so they must serialize on this lock; any future env-reading test
+    // in this binary must take it too.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn bearer_resolves_tenant() {
+        let _g = ENV_LOCK.lock().unwrap();
         std::env::set_var("DM_TOKEN_ACME", "secret123");
-        let a = BearerAuth::from_env();
+        let a = BearerAuth::from_env().unwrap();
         assert_eq!(a.tenant_for(Some("Bearer secret123")).as_deref(), Some("acme"));
         assert_eq!(a.tenant_for(Some("bearer secret123")).as_deref(), Some("acme")); // case-insensitive
         assert_eq!(a.tenant_for(Some("Bearer nope")), None);
@@ -233,8 +263,20 @@ mod tests {
         std::env::remove_var("DM_TOKEN_ACME");
     }
 
+    #[test]
+    fn duplicate_secret_to_different_tenants_fails_fast() {
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var("DM_TOKEN_ACME", "shared");
+        std::env::set_var("DM_TOKEN_GLOBEX", "shared");
+        let r = BearerAuth::from_env();
+        assert!(r.is_err(), "same secret -> two tenants must be rejected");
+        std::env::remove_var("DM_TOKEN_ACME");
+        std::env::remove_var("DM_TOKEN_GLOBEX");
+    }
+
     #[tokio::test]
     async fn recall_route_authorizes_and_returns_hits() {
+        let _g = ENV_LOCK.lock().unwrap();
         let dir = std::env::temp_dir().join(format!("dmsrv-{}-{}", std::process::id(), crate::entry::now_ms()));
         std::env::set_var("DM_DATA_DIR", &dir);
         std::env::set_var("DM_TOKEN_T1SRV", "tok1");
@@ -242,7 +284,7 @@ mod tests {
         let m = Memory::open_tenant("t1srv").unwrap();
         m.remember("the vector substrate is zvec", "resources/notes").unwrap();
 
-        let app = router(Arc::new(BearerAuth::from_env()));
+        let app = router(Arc::new(BearerAuth::from_env().unwrap()));
 
         // missing token -> 401
         let resp = app
