@@ -52,6 +52,25 @@ keyword-only, zero models); **LanceDB** is the locked production engine that dro
 behind the same trait for dense vector recall. Source text is canonical; vectors are a
 rebuildable index. Embedder is a commodity swap behind an `Embedder` trait.
 
+## Next (M1, toward complete v2)
+
+In priority order, each behind the existing seams (no model change):
+
+1. **Dense vector recall** - add an `Embedder` trait (default `bge-small`, offline
+   FTS-only when absent) + the **LanceDB** `MemoryStore` impl; fuse keyword + vector
+   with RRF. (Deferred from M0 only because LanceDB/Arrow compile + model download are
+   heavy; keyword recall already works.)
+2. **Bitemporal** - replace the soft-close (`valid_to_ms`) with a system+valid-time
+   versions model; as-of queries.
+3. **Runtime-signal rescoring** - access/importance/recency/maturity sidecar; reweight
+   recall modestly.
+4. **Save-discipline nudges** - SessionEnd/Stop hook that surfaces uncaptured decisions.
+5. **Server mode** - the same binary behind a network API; per-request tenant JWT over
+   the database-per-tenant store (`config::db_path`).
+
+Typed kinds with no guided tool yet (`resource_summary`, `persona`, `protocol`) and the
+MCP surface beyond the core four are easy follow-ons.
+
 ## Layout
 
 ```

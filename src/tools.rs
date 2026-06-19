@@ -88,6 +88,20 @@ impl Memory {
         self.save(Kind::Reminder, namespace, title, body, 55, vec!["reminder".into()])
     }
 
+    pub fn log_runbook(&self, title: &str, steps: &str, namespace: &str) -> Result<String> {
+        require(title, "title")?;
+        require(steps, "steps")?;
+        let body = format!("# {}\n\n**Runbook:** {}\n", title, steps);
+        self.save(Kind::Runbook, namespace, title, body, 60, vec!["runbook".into()])
+    }
+
+    pub fn log_convention(&self, title: &str, rule: &str, namespace: &str) -> Result<String> {
+        require(title, "title")?;
+        require(rule, "rule")?;
+        let body = format!("# {}\n\n**Convention:** {}\n", title, rule);
+        self.save(Kind::Convention, namespace, title, body, 65, vec!["convention".into()])
+    }
+
     /// Count of live records per kind (for `dm status`).
     pub fn counts(&self) -> Result<Vec<(String, usize)>> {
         let all = self.store.recent(1_000_000)?;

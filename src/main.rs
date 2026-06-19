@@ -97,6 +97,24 @@ enum Cmd {
         #[arg(long, default_value = "agent/reminders")]
         namespace: String,
     },
+    /// Save a typed Runbook (a procedure worth repeating).
+    LogRunbook {
+        #[arg(long)]
+        title: String,
+        #[arg(long)]
+        steps: String,
+        #[arg(long, default_value = "resources/runbooks")]
+        namespace: String,
+    },
+    /// Save a typed Convention (a standing rule).
+    LogConvention {
+        #[arg(long)]
+        title: String,
+        #[arg(long)]
+        rule: String,
+        #[arg(long, default_value = "resources/conventions")]
+        namespace: String,
+    },
     /// Show store + wiring status.
     Status,
     /// Run as an MCP stdio server (recall + typed save tools for MCP-aware agents).
@@ -170,6 +188,16 @@ fn run() -> Result<()> {
         }
         Cmd::AddReminder { title, text, namespace } => {
             let uri = Memory::open()?.add_reminder(&title, &text, &namespace)?;
+            println!("stored {}", uri);
+            Ok(())
+        }
+        Cmd::LogRunbook { title, steps, namespace } => {
+            let uri = Memory::open()?.log_runbook(&title, &steps, &namespace)?;
+            println!("stored {}", uri);
+            Ok(())
+        }
+        Cmd::LogConvention { title, rule, namespace } => {
+            let uri = Memory::open()?.log_convention(&title, &rule, &namespace)?;
             println!("stored {}", uri);
             Ok(())
         }
