@@ -85,10 +85,19 @@ enum Cmd {
         query: Vec<String>,
         #[arg(long, default_value_t = 6)]
         limit: usize,
+        /// Bitemporal: recall the store AS OF this epoch-ms (and facts valid then).
+        #[arg(long)]
+        as_of: Option<i64>,
     },
     /// Show recent high-importance memory.
     Recent {
         #[arg(long, default_value_t = 10)]
+        limit: usize,
+    },
+    /// Show the full version lineage of a record (append-only history).
+    History {
+        uri: String,
+        #[arg(long, default_value_t = 20)]
         limit: usize,
     },
     /// Save a typed Reminder.
@@ -171,9 +180,13 @@ fn run() -> Result<()> {
             println!("stored {}", uri);
             Ok(())
         }
-        Cmd::Recall { query, limit } => {
+        Cmd::Recall { query, limit, as_of } => {
             let q = query.join(" ");
-            let hits = Memory::open()?.recall(&q, limit)?;
+            let m = Memory::open()?;
+            let hits = match as_of {
+                Some(ts) => m.recall_as_of(&q, limit, ts, ts)?,
+                None => m.recall(&q, limit)?,
+            };
             if hits.is_empty() {
                 println!("(no matches for '{}')", q);
             } else {
@@ -186,6 +199,23 @@ fn run() -> Result<()> {
         Cmd::Recent { limit } => {
             for e in Memory::open()?.recent(limit)? {
                 println!("- ({}) {}  [{}]", e.kind.as_str(), e.title, e.uri);
+            }
+            Ok(())
+        }
+        Cmd::History { uri, limit } => {
+            let versions = Memory::open()?.history(&uri, limit)?;
+            if versions.is_empty() {
+                println!("(no record for '{}')", uri);
+            } else {
+                for (i, e) in versions.iter().enumerate() {
+                    let sys_to = e.system_to_ms.map(|t| t.to_string()).unwrap_or_else(|| "current".into());
+                    let val_to = e.valid_to_ms.map(|t| t.to_string()).unwrap_or_else(|| "open".into());
+                    println!(
+                        "- [v{}] ({}) {}  sys[{}..{}] valid[{}..{}]",
+                        versions.len() - i, e.kind.as_str(), e.title,
+                        e.system_from_ms, sys_to, e.valid_from_ms, val_to
+                    );
+                }
             }
             Ok(())
         }

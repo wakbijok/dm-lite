@@ -2,7 +2,7 @@
 //! validation) + recall. This is daimon's distinctive layer over the engine.
 
 use crate::config;
-use crate::entry::{make_uri, now_ms, Entry, Kind};
+use crate::entry::{make_uri, Entry, Kind};
 use crate::sqlite::SqliteStore;
 use crate::store::MemoryStore;
 use anyhow::{anyhow, Result};
@@ -63,22 +63,23 @@ impl Memory {
 
     fn save(&self, kind: Kind, namespace: &str, title: &str, body: String, importance: i64, tags: Vec<String>) -> Result<String> {
         let uri = make_uri(namespace, kind, title);
-        let e = Entry {
-            uri: uri.clone(),
+        let e = Entry::new_now(
+            uri.clone(),
             kind,
-            namespace: namespace.to_string(),
-            title: title.to_string(),
+            namespace.to_string(),
+            title.to_string(),
             body,
             tags,
             importance,
-            dedup_key: uri.clone(),
-            created_ms: now_ms(),
-            valid_to_ms: None,
-        };
+            uri.clone(),
+        );
         self.store.put(&e)?;
         #[cfg(feature = "zvec")]
         if let Some(vindex) = &self.vindex {
             // Fail open: a vector-index hiccup must never block the canonical SQLite save.
+            // Bitemporal invariant: the hashed-PK upsert overwrites the prior vector for this
+            // uri, so the index holds exactly the CURRENT valid version - no closed/historical
+            // version is ever embedded. As-of recall is keyword-only by design (see recall_as_of).
             let v = self.embedder.embed(&e.body);
             if let Err(err) = vindex.upsert(&e.uri, &v) {
                 eprintln!("dmem: vector index upsert failed for {} ({err:#}); keyword recall unaffected", e.uri);
@@ -194,6 +195,17 @@ impl Memory {
 
     pub fn recent(&self, limit: usize) -> Result<Vec<Entry>> {
         self.store.recent(limit)
+    }
+
+    /// Bitemporal recall: as the store existed AS OF system-time `as_of_ms`, for facts
+    /// VALID AT `valid_ms`. Keyword-only by design (vectors index only the current version).
+    pub fn recall_as_of(&self, query: &str, limit: usize, as_of_ms: i64, valid_ms: i64) -> Result<Vec<Entry>> {
+        self.store.recall_as_of(query, limit, as_of_ms, valid_ms)
+    }
+
+    /// Full version lineage of a uri, newest first (append-only history).
+    pub fn history(&self, uri: &str, limit: usize) -> Result<Vec<Entry>> {
+        self.store.history(uri, limit)
     }
 
     /// Which recall path is active (truthful: reflects whether zvec actually loaded).

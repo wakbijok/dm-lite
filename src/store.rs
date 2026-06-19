@@ -19,4 +19,12 @@ pub trait MemoryStore {
 
     /// All live records of a kind (for persona/protocol injection).
     fn by_kind(&self, kind: &str, limit: usize) -> Result<Vec<Entry>>;
+
+    /// Recall as the store existed AS OF system-time `as_of_ms`, for facts VALID AT
+    /// `valid_ms`. Keyword-only (the FTS + vector indexes hold only the current version);
+    /// a linear scan over history reconstructs the past slice. Best first.
+    fn recall_as_of(&self, query: &str, limit: usize, as_of_ms: i64, valid_ms: i64) -> Result<Vec<Entry>>;
+
+    /// All recorded versions of a uri, newest system-time first (full append-only lineage).
+    fn history(&self, uri: &str, limit: usize) -> Result<Vec<Entry>>;
 }
