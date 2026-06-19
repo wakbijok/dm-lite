@@ -58,12 +58,19 @@ fn signal_boost(importance: i64, access_count: i64, last_access_ms: i64, now_ms:
 }
 
 impl Memory {
+    /// Open the embedded-mode tenant ($DM_TENANT, else "default").
     pub fn open() -> Result<Self> {
-        let path = config::db_path(&config::tenant())?;
+        Self::open_tenant(&config::tenant())
+    }
+
+    /// Open a specific tenant's store explicitly. Server mode uses this per request so it
+    /// never mutates the process-global $DM_TENANT (which would race under concurrency).
+    pub fn open_tenant(tenant: &str) -> Result<Self> {
+        let path = config::db_path(tenant)?;
         let store = SqliteStore::open(&path)?;
         #[cfg(feature = "zvec")]
         {
-            let vdir = config::data_dir()?.join("vectors").join(config::tenant());
+            let vdir = config::data_dir()?.join("vectors").join(tenant);
             let vindex = match crate::zvec_index::ZvecIndex::open(&vdir) {
                 Ok(v) => Some(v),
                 Err(e) => {

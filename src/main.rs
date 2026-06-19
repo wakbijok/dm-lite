@@ -12,6 +12,8 @@ mod render;
 mod sqlite;
 mod store;
 mod tools;
+#[cfg(feature = "server")]
+mod server;
 #[cfg(feature = "zvec")]
 mod zvec_index;
 
@@ -131,6 +133,12 @@ enum Cmd {
     Status,
     /// Run as an MCP stdio server (recall + typed save tools for MCP-aware agents).
     Mcp,
+    /// Run the network API server (multi-token bearer -> tenant). Needs --features server.
+    #[cfg(feature = "server")]
+    Serve {
+        #[arg(long, default_value = "127.0.0.1:8077")]
+        addr: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -239,6 +247,8 @@ fn run() -> Result<()> {
         }
         Cmd::Status => status(),
         Cmd::Mcp => mcp::serve(),
+        #[cfg(feature = "server")]
+        Cmd::Serve { addr } => server::run_blocking(&addr),
     }
 }
 
