@@ -1,0 +1,22 @@
+[package]
+name = "dm-lite"
+version = "0.1.0"
+edition = "2021"
+description = "daimon-memory v2: a small embedded typed memory engine with hybrid recall, behind a MemoryStore trait"
+license = "MIT"
+
+[[bin]]
+name = "dm"
+path = "src/main.rs"
+
+[dependencies]
+rusqlite = { version = "0.32", features = ["bundled"] }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+dirs = "5"
+
+[profile.release]
+opt-level = 2
+strip = true
