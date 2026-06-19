@@ -1,11 +1,18 @@
-//! Embedder trait + a dependency-free placeholder. The vector store (zvec) stores and
-//! searches vectors; SOMETHING must turn text into a vector. `HashEmbedder` is a
-//! deterministic, offline bag-of-hashed-tokens vector - enough to WIRE and TEST the zvec
-//! vector path end-to-end with no model download. It approximates keyword overlap, NOT
-//! real semantics; a real model (bge-small via fastembed/candle, behind this same trait)
-//! is the next step. Kept honest: this is a placeholder embedder.
+//! Embedder trait + two impls behind it. The vector store (zvec) stores and searches
+//! vectors; SOMETHING must turn text into a vector.
+//! - `FastEmbedder` (feature `fastembed`): the real one - bge-small-en-v1.5 (384-d) via
+//!   ONNX. Produces genuine semantic vectors; this is what earns the vector half its keep.
+//! - `HashEmbedder` (default / fallback): a deterministic, offline bag-of-hashed-tokens
+//!   vector (256-d). It approximates keyword overlap, NOT real semantics - used when
+//!   `fastembed` is off or the model can't load, so the vector path stays wired and tested
+//!   with no model download. Kept honest: the hash path is a placeholder, the bge path is real.
 #![allow(dead_code)]
 
+/// Embedding dimension. Tied to the active model so the zvec collection schema matches:
+/// bge-small-en-v1.5 is 384-d; the placeholder uses 256.
+#[cfg(feature = "fastembed")]
+pub const DIM: usize = 384;
+#[cfg(not(feature = "fastembed"))]
 pub const DIM: usize = 256;
 
 pub trait Embedder {
@@ -57,6 +64,38 @@ impl Embedder for HashEmbedder {
             }
         }
         v
+    }
+}
+
+/// Real semantic embedder: bge-small-en-v1.5 (384-d) via fastembed/ONNX. Downloads the
+/// model to the fastembed cache on first construction (needs network once).
+#[cfg(feature = "fastembed")]
+pub struct FastEmbedder {
+    model: fastembed::TextEmbedding,
+}
+
+#[cfg(feature = "fastembed")]
+impl FastEmbedder {
+    pub fn new() -> anyhow::Result<Self> {
+        use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
+        let model = TextEmbedding::try_new(InitOptions::new(EmbeddingModel::BGESmallENV15))?;
+        Ok(Self { model })
+    }
+}
+
+#[cfg(feature = "fastembed")]
+impl Embedder for FastEmbedder {
+    fn dim(&self) -> usize {
+        DIM
+    }
+    fn embed(&self, text: &str) -> Vec<f32> {
+        match self.model.embed(vec![text], None) {
+            Ok(mut v) => v.pop().unwrap_or_else(|| vec![0.0; DIM]),
+            Err(e) => {
+                eprintln!("dmem: fastembed embed failed: {e:?}");
+                vec![0.0; DIM]
+            }
+        }
     }
 }
 

@@ -12,7 +12,20 @@ pub struct Memory {
     #[cfg(feature = "zvec")]
     vindex: Option<crate::zvec_index::ZvecIndex>,
     #[cfg(feature = "zvec")]
-    embedder: crate::embedder::HashEmbedder,
+    embedder: Box<dyn crate::embedder::Embedder>,
+}
+
+/// Pick the embedder: real bge-small (fastembed) if it loads, else the placeholder.
+#[cfg(feature = "zvec")]
+fn make_embedder() -> Box<dyn crate::embedder::Embedder> {
+    #[cfg(feature = "fastembed")]
+    {
+        match crate::embedder::FastEmbedder::new() {
+            Ok(e) => return Box::new(e),
+            Err(err) => eprintln!("dmem: fastembed model unavailable ({err:#}); using placeholder embedder"),
+        }
+    }
+    Box::new(crate::embedder::HashEmbedder::new())
 }
 
 fn require(value: &str, field: &str) -> Result<()> {
@@ -42,7 +55,7 @@ impl Memory {
                     None
                 }
             };
-            return Ok(Self { store, vindex, embedder: crate::embedder::HashEmbedder::new() });
+            return Ok(Self { store, vindex, embedder: make_embedder() });
         }
         #[cfg(not(feature = "zvec"))]
         Ok(Self { store })
@@ -65,9 +78,11 @@ impl Memory {
         self.store.put(&e)?;
         #[cfg(feature = "zvec")]
         if let Some(vindex) = &self.vindex {
-            use crate::embedder::Embedder;
+            // Fail open: a vector-index hiccup must never block the canonical SQLite save.
             let v = self.embedder.embed(&e.body);
-            let _ = vindex.upsert(&e.uri, &v); // best-effort; keyword recall still works if it fails
+            if let Err(err) = vindex.upsert(&e.uri, &v) {
+                eprintln!("dmem: vector index upsert failed for {} ({err:#}); keyword recall unaffected", e.uri);
+            }
         }
         Ok(uri)
     }
@@ -147,12 +162,17 @@ impl Memory {
     /// Hybrid recall: SQLite FTS (keyword) + zvec (dense vector), fused by RRF.
     #[cfg(feature = "zvec")]
     fn recall_hybrid(&self, query: &str, limit: usize, vindex: &crate::zvec_index::ZvecIndex) -> Result<Vec<Entry>> {
-        use crate::embedder::Embedder;
         use std::collections::HashMap;
         let pool = limit.max(10);
         let kw: Vec<String> = self.store.recall(query, pool)?.into_iter().map(|e| e.uri).collect();
         let qv = self.embedder.embed(query);
-        let vec: Vec<String> = vindex.search(&qv, pool).unwrap_or_default();
+        let vec: Vec<String> = match vindex.search(&qv, pool) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("dmem: vector search failed ({e:#}); using keyword results only");
+                Vec::new()
+            }
+        };
         let k = 60.0_f64;
         let mut score: HashMap<String, f64> = HashMap::new();
         for (rank, uri) in kw.iter().enumerate() {

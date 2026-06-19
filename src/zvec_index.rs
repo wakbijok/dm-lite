@@ -15,6 +15,27 @@ fn ze<E: std::fmt::Debug>(e: E) -> anyhow::Error {
     anyhow!("zvec: {:?}", e)
 }
 
+/// zvec's primary key is capped at 64 bytes and rejects `:` / `/` (it reports both as
+/// "contains invalid characters"), so a daimon:// URI can't be the PK directly. We derive a
+/// short, fixed-length, charset-safe PK by hashing the URI; the real URI is stored in the
+/// "uri" string field (string field values are unrestricted) and read back on search. The
+/// hash is deterministic, so re-saving the same URI supersedes its prior vector.
+fn pk_for(uri: &str) -> String {
+    // 128-bit FNV-1a (two independent streams) -> 32 hex chars. Well under the 64-byte cap;
+    // collision-free at our scale (tens-to-hundreds of records per tenant).
+    fn fnv1a(seed: u64, s: &str) -> u64 {
+        let mut h: u64 = seed;
+        for b in s.bytes() {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        h
+    }
+    let a = fnv1a(0xcbf29ce484222325, uri);
+    let b = fnv1a(0x84222325cbf29ce4, uri);
+    format!("{a:016x}{b:016x}")
+}
+
 pub struct ZvecIndex {
     collection: Collection,
 }
@@ -48,25 +69,35 @@ impl ZvecIndex {
         Ok(Self { collection })
     }
 
-    /// Upsert (supersede) the vector for a uri.
+    /// Upsert (supersede) the vector for a uri. PK is the hashed uri; the real uri is a field.
     pub fn upsert(&self, uri: &str, vector: &[f32]) -> Result<()> {
-        let _ = self.collection.delete(&[uri]); // best-effort close prior
+        let pk = pk_for(uri);
+        let _ = self.collection.delete(&[pk.as_str()]); // best-effort close prior
         let mut doc = Doc::new().map_err(ze)?;
-        doc.set_pk(uri);
+        doc.set_pk(&pk);
         doc.add_string("uri", uri).map_err(ze)?;
         doc.add_vector_f32("embedding", vector).map_err(ze)?;
         self.collection.insert(&[&doc]).map_err(ze)?;
         Ok(())
     }
 
-    /// Nearest uris to the query vector, best first.
+    /// Nearest uris to the query vector, best first (reads the real uri from the field).
     pub fn search(&self, vector: &[f32], k: usize) -> Result<Vec<String>> {
-        let q = SearchQuery::new("embedding", vector, k as i32).map_err(ze)?;
+        let q = SearchQuery::builder()
+            .field_name("embedding")
+            .vector(vector)
+            .topk(k as i32)
+            .output_fields(&["uri"])
+            .build()
+            .map_err(ze)?;
         let results = self.collection.query(&q).map_err(ze)?;
-        Ok(results
-            .iter()
-            .filter_map(|r| r.get_pk().map(|s| s.to_string()))
-            .collect())
+        let mut out = Vec::new();
+        for r in &results {
+            if let Ok(Some(uri)) = r.get_string("uri") {
+                out.push(uri);
+            }
+        }
+        Ok(out)
     }
 }
 
@@ -111,5 +142,21 @@ mod tests {
             "reopened index should still find uri-a, got {:?}",
             hits
         );
+    }
+
+    #[test]
+    fn long_daimon_uri_roundtrips() {
+        // the real failure: a daimon:// URI is >64 chars and has : and / — so it can't be the
+        // PK (zvec caps PK at 64 bytes). Hashed PK + uri field must round-trip the full URI.
+        let dir = std::env::temp_dir().join(format!("zveclonguri-{}", crate::entry::now_ms()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let idx = ZvecIndex::open(&dir).expect("open");
+        let uri = "daimon://resources/notes/memory/the-postgres-database-server-was-oom-killed-during-migration";
+        assert!(uri.len() > 64, "fixture must exceed the 64-byte PK cap");
+        let mut v = vec![0f32; DIM];
+        v[7] = 1.0;
+        idx.upsert(uri, &v).expect("upsert long daimon uri");
+        let hits = idx.search(&v, 5).expect("search");
+        assert_eq!(hits.first().map(|s| s.as_str()), Some(uri), "got {:?}", hits);
     }
 }

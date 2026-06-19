@@ -74,6 +74,7 @@ impl SqliteStore {
     }
 
     /// Fetch the live entry for a uri (used by RRF fusion to hydrate vector hits).
+    #[cfg_attr(not(feature = "zvec"), allow(dead_code))]
     pub fn get(&self, uri: &str) -> Result<Option<Entry>> {
         let mut stmt = self.conn.prepare(
             "SELECT uri,kind,namespace,title,body,tags,importance,dedup_key,created_ms,valid_to_ms \
