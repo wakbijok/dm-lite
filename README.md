@@ -42,15 +42,14 @@ fail open - a memory hiccup never blocks your turn. (Old config backed up to
 | Typed `Entry` model: kinds, `daimon://` URIs, namespaces | done |
 | Guided save tools with per-kind required-field validation | done (`log_decision`/`log_lesson`/`log_incident`/`remember`) |
 | `MemoryStore` trait + **SQLite** impl (FTS5 keyword recall, dedup/supersede, close-not-delete) | done |
-| Hybrid recall: keyword now; **dense vector + RRF** next | keyword done; vector pending |
+| Hybrid recall: keyword (FTS5) + **dense vector (zvec) + RRF** | done (vector behind `--features zvec`) |
 | CC-compatible hooks + `bootstrap` (Devin, Claude Code) | done |
-| **LanceDB** impl (GA vector + built-in hybrid) behind the trait | next |
-| Server mode + database-per-tenant; MCP tool surface | next |
+| Bitemporal store, signal rescoring, SessionEnd nudge, server mode | done (M1, see below) |
 
-The architecture is engine-swappable on purpose: SQLite ships M0 today (offline,
-keyword-only, zero models); **LanceDB** is the locked production engine that drops in
-behind the same trait for dense vector recall. Source text is canonical; vectors are a
-rebuildable index. Embedder is a commodity swap behind an `Embedder` trait.
+The architecture is engine-swappable on purpose: the pure-Rust SQLite store ships by default
+(offline, keyword-only, zero models); the **zvec** dense-vector substrate (Wak's choice over
+LanceDB) drops in behind the same `MemoryStore`/`Embedder` seams under `--features zvec`.
+Source text is canonical; vectors are a rebuildable index.
 
 ## Dense vector recall (zvec, optional feature)
 
@@ -86,35 +85,69 @@ zvec vector via RRF. Add `fastembed` for real semantics (without it the offline
   downloads once to `.fastembed_cache/` on first use; if it can't load, dmem logs the
   fallback and uses the `HashEmbedder` placeholder so saves/recall never block.
 
-## Next (M1, toward complete v2)
+## M1 (complete)
 
-In priority order, each behind the existing seams (no model change):
+All five M1 items shipped, each behind the existing seams:
 
-1. ~~**Real embedder for semantic recall**~~ - **done** (bge-small via fastembed/ONNX behind
-   the `Embedder` trait; `--features zvec,fastembed`). The zvec store + RRF fusion were
-   already wired; this swapped the placeholder for a real model, unlocking true semantic
-   recall (verified: `kw=0 vec=3` finds a semantically-related memory with no shared words).
-2. **Bitemporal** - replace the soft-close (`valid_to_ms`) with a system+valid-time
-   versions model; as-of queries.
-3. **Runtime-signal rescoring** - access/importance/recency/maturity sidecar; reweight
-   recall modestly.
-4. **Save-discipline nudges** - SessionEnd/Stop hook that surfaces uncaptured decisions.
-5. **Server mode** - the same binary behind a network API; per-request tenant JWT over
-   the database-per-tenant store (`config::db_path`).
+1. **Real embedder for semantic recall** - bge-small-en-v1.5 (fastembed/ONNX) behind the
+   `Embedder` trait (`--features zvec,fastembed`). Verified: `kw=0 vec=3` finds a
+   semantically-related memory with no shared words.
+2. **Full bitemporal** - two independent time axes: valid time (true-in-world) and system
+   time (recorded-at). The store is append-only (supersede closes the prior version in
+   system time, never deletes). As-of queries reconstruct any past slice.
+   - `dmem recall "<q>" --as-of <epoch_ms>` - recall the store as it existed then.
+   - `dmem history <uri>` - the full version lineage (newest first).
+3. **Runtime-signal rescoring** - a `signals` sidecar (access/recency/importance) applied as
+   a modest, clamped (<=1.25x) multiplier AFTER RRF, so it only reorders near-ties and never
+   overrides relevance. Bumped best-effort on every recall.
+4. **Save-discipline nudges** - a `SessionEnd` hook surfaces uncaptured work (fail-open;
+   nudges only when nothing was saved or the last save is stale). Installed by `bootstrap`.
+5. **Server mode** - `--features server`: an axum + tokio network API over the database-
+   per-tenant store, with multi-token bearer -> tenant auth. See below.
 
 Typed kinds with no guided tool yet (`resource_summary`, `persona`, `protocol`) and the
 MCP surface beyond the core four are easy follow-ons.
 
+## Server mode (`--features server`, optional)
+
+A small axum + tokio HTTP API over the per-tenant store. Strictly feature-gated, so the
+default embedded build pulls no tokio/axum.
+
+```bash
+cargo build --release --features server   # add zvec,fastembed too for semantic recall
+# auth: each DM_TOKEN_<TENANT> env var registers a bearer token -> that tenant
+export DM_TOKEN_ACME=<secret>
+dmem serve --addr 127.0.0.1:8077          # Ctrl-C for graceful shutdown
+```
+
+Routes (all but `/healthz` require `Authorization: Bearer <token>`; the token selects the
+tenant per request, over `config::db_path`):
+
+| Method + path | body | returns |
+|---|---|---|
+| `GET /healthz` | - | `{"status":"ok"}` (open, no auth) |
+| `POST /recall` | `{query, limit?}` | array of records |
+| `POST /remember` | `{text, namespace?}` | `{uri}` |
+| `POST /log_decision` | `{title, context?, decision, rationale?, namespace?}` | `{uri}` |
+| `POST /add_reminder` | `{title, text, namespace?}` | `{uri}` |
+
+Auth goes through an `Authenticator` seam (bearer now; JWT can drop in later without
+touching handlers). At this scale (tens-to-~100 users over per-tenant SQLite) the server
+opens the tenant store per request; a per-tenant cache is a noted follow-on.
+
 ## Layout
 
 ```
-src/entry.rs      typed model (Kind, Entry, daimon:// URI)
-src/store.rs      MemoryStore trait (the engine seam)
-src/sqlite.rs     SQLite impl: FTS5 recall, dedup/supersede
-src/tools.rs      guided typed save tools + recall (daimon's layer)
-src/render.rs     <daimon-memory> / <daimon-persona> context blocks
-src/hooks.rs      session_start / user_prompt_submit handlers
+src/entry.rs      typed model (Kind, Entry, daimon:// URI, bitemporal fields)
+src/store.rs      MemoryStore trait (the engine seam): put/recall/recall_as_of/history
+src/sqlite.rs     SQLite impl: FTS5 recall, append-only bitemporal store, v0->v1 migration, signals
+src/tools.rs      guided typed save tools + recall + signal rescoring (daimon's layer)
+src/embedder.rs   Embedder trait: HashEmbedder (default) / FastEmbedder (bge-small, fastembed)
+src/zvec_index.rs zvec dense-vector index (feature zvec)
+src/render.rs     <daimon-memory> / <daimon-persona> / save-nudge context blocks
+src/hooks.rs      session_start / user_prompt_submit / session_end handlers
 src/bootstrap.rs  install hooks into agent configs
+src/server.rs     axum network API + bearer->tenant auth (feature server)
 src/config.rs     data dir + database-per-tenant paths
 poc/              the throwaway Node PoC that proved the seam
 ```
