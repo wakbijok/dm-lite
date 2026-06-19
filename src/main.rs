@@ -6,6 +6,7 @@ mod bootstrap;
 mod config;
 mod entry;
 mod hooks;
+mod mcp;
 mod render;
 mod sqlite;
 mod store;
@@ -87,6 +88,8 @@ enum Cmd {
         #[arg(long, default_value_t = 10)]
         limit: usize,
     },
+    /// Run as an MCP stdio server (recall + typed save tools for MCP-aware agents).
+    Mcp,
 }
 
 #[derive(Subcommand)]
@@ -154,5 +157,6 @@ fn run() -> Result<()> {
             }
             Ok(())
         }
+        Cmd::Mcp => mcp::serve(),
     }
 }
