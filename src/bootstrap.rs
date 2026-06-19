@@ -50,6 +50,7 @@ fn install_into(config_path: &Path, dm: &str) -> Result<()> {
     let events = [
         ("SessionStart", hook_entry(dm, "hook session_start", 10)),
         ("UserPromptSubmit", hook_entry(dm, "hook user_prompt_submit", 8)),
+        ("SessionEnd", hook_entry(dm, "hook session_end", 8)),
     ];
     for (event, our_entry) in events {
         // keep existing entries that are not ours (command does not reference the dm binary)
@@ -109,7 +110,7 @@ pub fn run(devin: bool, claude: bool) -> Result<()> {
 
     if did_any {
         println!();
-        println!("Done. dmem is wired in (SessionStart -> persona/recent, UserPromptSubmit -> recall).");
+        println!("Done. dmem is wired in (SessionStart -> persona/recent, UserPromptSubmit -> recall, SessionEnd -> save nudge).");
         println!("Binary: {}", dm);
         println!("Test on Devin: start a devin session; the first prompt should surface a <daimon-memory> block.");
         println!("Seed a memory first, e.g.:  dmem log_decision --title \"hello\" --decision \"it works\"");
@@ -117,4 +118,24 @@ pub fn run(devin: bool, claude: bool) -> Result<()> {
         println!("Nothing wired. Pass --devin and/or --claude (or --all), and ensure the agent is installed.");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn installs_session_end_hook_idempotently() {
+        let dir = std::env::temp_dir().join(format!("dmboot-{}-{}", std::process::id(), crate::entry::now_ms()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = dir.join("config.json");
+        install_into(&cfg, "/path/to/dmem").unwrap();
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&cfg).unwrap()).unwrap();
+        let cmd = v["hooks"]["SessionEnd"][0]["hooks"][0]["command"].as_str().unwrap();
+        assert!(cmd.contains("hook session_end"), "got: {cmd}");
+        // re-run: still exactly one dm-owned entry (idempotent)
+        install_into(&cfg, "/path/to/dmem").unwrap();
+        let v2: Value = serde_json::from_str(&std::fs::read_to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(v2["hooks"]["SessionEnd"].as_array().unwrap().len(), 1);
+    }
 }

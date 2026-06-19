@@ -140,6 +140,8 @@ enum HookCmd {
     SessionStart,
     /// UserPromptSubmit: recall for the prompt (read from stdin JSON or arg).
     UserPromptSubmit { prompt: Vec<String> },
+    /// SessionEnd: nudge to capture uncaptured decisions before the session ends.
+    SessionEnd,
 }
 
 fn main() {
@@ -160,6 +162,7 @@ fn run() -> Result<()> {
             let arg = if prompt.is_empty() { None } else { Some(prompt.join(" ")) };
             hooks::user_prompt_submit(arg)
         }
+        Cmd::Hook(HookCmd::SessionEnd) => hooks::session_end(),
         Cmd::LogDecision { title, context, decision, rationale, namespace } => {
             let uri = Memory::open()?.log_decision(&title, &context, &decision, &rationale, &namespace)?;
             println!("stored {}", uri);

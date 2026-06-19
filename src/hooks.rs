@@ -37,6 +37,32 @@ pub fn session_start() -> Result<()> {
     Ok(())
 }
 
+/// Quiet window after which an unsaved session looks like uncaptured work worth nudging.
+const NUDGE_GAP_MS: i64 = 30 * 60_000; // 30 minutes
+
+/// Whether to emit a save-discipline nudge at session end: nudge if nothing has been saved
+/// at all, or the most recent save is older than the quiet window. Pure + deterministic.
+fn should_nudge(latest_save_ms: Option<i64>, now_ms: i64) -> bool {
+    match latest_save_ms {
+        None => true,
+        Some(ts) => now_ms.saturating_sub(ts) > NUDGE_GAP_MS,
+    }
+}
+
+/// SessionEnd/Stop: surface a save-discipline nudge if this session's work looks uncaptured.
+/// Fail-open: on any error, or when there is nothing to nudge, emit nothing and proceed.
+pub fn session_end() -> Result<()> {
+    let m = match Memory::open() {
+        Ok(m) => m,
+        Err(_) => return Ok(()),
+    };
+    let latest = m.recent(1).ok().and_then(|v| v.first().map(|e| e.created_ms));
+    if should_nudge(latest, crate::entry::now_ms()) {
+        emit("SessionEnd", &render::render_nudge());
+    }
+    Ok(())
+}
+
 /// UserPromptSubmit: recall relevant memory for the submitted prompt (from stdin, or arg).
 pub fn user_prompt_submit(arg: Option<String>) -> Result<()> {
     let prompt = arg
@@ -51,4 +77,17 @@ pub fn user_prompt_submit(arg: Option<String>) -> Result<()> {
     let hits = m.recall(&prompt, 6).unwrap_or_default();
     emit("UserPromptSubmit", &render::render_recall(&hits));
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nudges_when_nothing_saved_or_stale() {
+        let now = 100 * 60_000; // 100 min in
+        assert!(should_nudge(None, now), "no saves -> nudge");
+        assert!(should_nudge(Some(now - 31 * 60_000), now), "stale (>30m) -> nudge");
+        assert!(!should_nudge(Some(now - 5 * 60_000), now), "fresh (<30m) -> no nudge");
+    }
 }

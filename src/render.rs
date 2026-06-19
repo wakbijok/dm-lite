@@ -33,6 +33,22 @@ pub fn render_recall(entries: &[Entry]) -> String {
     s
 }
 
+/// The save-discipline nudge (SessionEnd/Stop): a back-stop reminding the agent to capture
+/// durable decisions/lessons/incidents before the session ends. Names the exact tool.
+pub fn render_nudge() -> String {
+    String::from(
+        "<daimon-memory>\n[Save-discipline check before this session ends.]\n\
+         If this session produced durable decisions, lessons, incidents, or follow-ups not \
+         yet saved, capture them now (one distilled record each):\n\
+         - a non-obvious choice -> `dmem log_decision`\n\
+         - something that broke or was reverted -> `dmem log_incident`\n\
+         - a reusable lesson or corrected mistake -> `dmem log_lesson`\n\
+         - a dated follow-up -> `dmem add_reminder`\n\
+         Skip if everything important is already captured.\n\
+         </daimon-memory>",
+    )
+}
+
 /// The session-start block: persona/protocol (full bodies) + recent context.
 pub fn render_session(persona: &[Entry], recent: &[Entry]) -> String {
     let mut parts: Vec<String> = Vec::new();
@@ -69,4 +85,20 @@ pub fn render_session(persona: &[Entry], recent: &[Entry]) -> String {
         parts.push(recent_block);
     }
     parts.join("\n\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn render_nudge_names_a_save_tool() {
+        let n = render_nudge();
+        assert!(n.contains("<daimon-memory>") && n.contains("log_decision"));
+    }
+
+    #[test]
+    fn render_recall_empty_is_empty() {
+        assert!(render_recall(&[]).is_empty());
+    }
 }
