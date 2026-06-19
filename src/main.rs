@@ -88,6 +88,17 @@ enum Cmd {
         #[arg(long, default_value_t = 10)]
         limit: usize,
     },
+    /// Save a typed Reminder.
+    AddReminder {
+        #[arg(long)]
+        title: String,
+        #[arg(long)]
+        text: String,
+        #[arg(long, default_value = "agent/reminders")]
+        namespace: String,
+    },
+    /// Show store + wiring status.
+    Status,
     /// Run as an MCP stdio server (recall + typed save tools for MCP-aware agents).
     Mcp,
 }
@@ -157,6 +168,40 @@ fn run() -> Result<()> {
             }
             Ok(())
         }
+        Cmd::AddReminder { title, text, namespace } => {
+            let uri = Memory::open()?.add_reminder(&title, &text, &namespace)?;
+            println!("stored {}", uri);
+            Ok(())
+        }
+        Cmd::Status => status(),
         Cmd::Mcp => mcp::serve(),
     }
+}
+
+fn wired(config_path: &std::path::Path, needle: &str) -> &'static str {
+    match std::fs::read_to_string(config_path) {
+        Ok(s) if s.contains(needle) => "wired",
+        Ok(_) => "present, not wired",
+        Err(_) => "not found",
+    }
+}
+
+fn status() -> Result<()> {
+    let tenant = config::tenant();
+    let db = config::db_path(&tenant)?;
+    println!("dm {} - daimon-memory v2 (embedded)", env!("CARGO_PKG_VERSION"));
+    println!("tenant : {}", tenant);
+    println!("store  : {}", db.display());
+    let m = Memory::open()?;
+    let counts = m.counts()?;
+    let total: usize = counts.iter().map(|(_, n)| n).sum();
+    println!("records: {} live", total);
+    for (k, n) in counts {
+        println!("  {:<18} {}", k, n);
+    }
+    if let Some(h) = dirs::home_dir() {
+        println!("devin  : {}", wired(&h.join(".config/devin/config.json"), "dm hook"));
+        println!("claude : {}", wired(&h.join(".claude/settings.json"), "dm hook"));
+    }
+    Ok(())
 }

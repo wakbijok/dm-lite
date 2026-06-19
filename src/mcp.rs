@@ -36,6 +36,15 @@ fn tool_schemas() -> Value {
                 "rationale":{"type":"string"},
                 "namespace":{"type":"string"}
             },"required":["title","decision"]}
+        },
+        {
+            "name": "add_reminder",
+            "description": "Store a typed Reminder (a dated or pending follow-up).",
+            "inputSchema": {"type":"object","properties":{
+                "title":{"type":"string"},
+                "text":{"type":"string"},
+                "namespace":{"type":"string"}
+            },"required":["title","text"]}
         }
     ])
 }
@@ -63,6 +72,11 @@ fn call_tool(mem: &Memory, name: &str, args: &Value) -> std::result::Result<Stri
             let uri = mem
                 .log_decision(s(args, "title"), s(args, "context"), s(args, "decision"), s(args, "rationale"), ns)
                 .map_err(|e| e.to_string())?;
+            Ok(format!("stored {}", uri))
+        }
+        "add_reminder" => {
+            let ns = if s(args, "namespace").is_empty() { "agent/reminders" } else { s(args, "namespace") };
+            let uri = mem.add_reminder(s(args, "title"), s(args, "text"), ns).map_err(|e| e.to_string())?;
             Ok(format!("stored {}", uri))
         }
         other => Err(format!("unknown tool: {}", other)),

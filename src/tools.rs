@@ -81,6 +81,23 @@ impl Memory {
         self.save(Kind::Memory, namespace, &title, text.to_string(), 50, vec![])
     }
 
+    pub fn add_reminder(&self, title: &str, text: &str, namespace: &str) -> Result<String> {
+        require(title, "title")?;
+        require(text, "text")?;
+        let body = format!("# {}\n\n**Reminder:** {}\n", title, text);
+        self.save(Kind::Reminder, namespace, title, body, 55, vec!["reminder".into()])
+    }
+
+    /// Count of live records per kind (for `dm status`).
+    pub fn counts(&self) -> Result<Vec<(String, usize)>> {
+        let all = self.store.recent(1_000_000)?;
+        let mut map: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+        for e in &all {
+            *map.entry(e.kind.as_str().to_string()).or_default() += 1;
+        }
+        Ok(map.into_iter().collect())
+    }
+
     pub fn recall(&self, query: &str, limit: usize) -> Result<Vec<Entry>> {
         self.store.recall(query, limit)
     }
