@@ -73,11 +73,14 @@ jobs:
         run: |
           set -euo pipefail
           name="dmem-${GITHUB_REF_NAME}-${{ matrix.target }}"
-          cd dist
+          # archive the files at the ROOT (no enclosing folder) so `dmem upgrade` (self_update
+          # looks for the bin at the archive root) and the README `tar xzf && install dmem`
+          # both find dmem directly.
+          cd "dist/$name"
           if [ "${{ matrix.archive }}" = "zip" ]; then
-            7z a "${name}.zip" "$name" >/dev/null
+            7z a "../${name}.zip" ./* >/dev/null
           else
-            tar czf "${name}.tar.gz" "$name"
+            tar czf "../${name}.tar.gz" *
           fi
 
       - uses: actions/upload-artifact@v4
