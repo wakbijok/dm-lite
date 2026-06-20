@@ -20,6 +20,8 @@ mod tools;
 mod iam;
 #[cfg(feature = "server")]
 mod server;
+#[cfg(feature = "server")]
+mod service;
 #[cfg(feature = "wizard")]
 mod setup;
 #[cfg(feature = "self-update")]
@@ -196,6 +198,10 @@ enum Cmd {
         #[arg(long = "tls-generate")]
         tls_generate: bool,
     },
+    /// Manage the local `dmem serve` daemon as an OS service (launchd/systemd). Needs --features server.
+    #[cfg(feature = "server")]
+    #[command(subcommand)]
+    Service(ServiceCmd),
     /// Update dmem in place from GitHub Releases. Needs --features self-update.
     #[cfg(feature = "self-update")]
     Upgrade {
@@ -220,6 +226,27 @@ enum Cmd {
     #[cfg(feature = "client")]
     #[command(subcommand)]
     Admin(AdminCmd),
+}
+
+#[cfg(feature = "server")]
+#[derive(Subcommand)]
+#[command(rename_all = "snake_case")]
+enum ServiceCmd {
+    /// Install + start `dmem serve` as a login service (writes the launchd/systemd unit + [server] config)
+    Install {
+        #[arg(long, default_value = "127.0.0.1:8077")]
+        addr: String,
+    },
+    /// Stop + remove the service unit
+    Uninstall,
+    /// Start the service
+    Start,
+    /// Stop the service (reclaims the model RAM)
+    Stop,
+    /// Restart the service
+    Restart,
+    /// Show whether the service is running
+    Status,
 }
 
 #[cfg(feature = "client")]
@@ -425,6 +452,15 @@ fn run() -> Result<()> {
             &addr,
             server::TlsOpts { cert: tls_cert, key: tls_key, generate: tls_generate },
         ),
+        #[cfg(feature = "server")]
+        Cmd::Service(s) => match s {
+            ServiceCmd::Install { addr } => service::install(&addr),
+            ServiceCmd::Uninstall => service::uninstall(),
+            ServiceCmd::Start => service::start(),
+            ServiceCmd::Stop => service::stop(),
+            ServiceCmd::Restart => service::restart(),
+            ServiceCmd::Status => service::status(),
+        },
         #[cfg(feature = "self-update")]
         Cmd::Upgrade { pre } => upgrade::run(pre),
         #[cfg(feature = "client")]
