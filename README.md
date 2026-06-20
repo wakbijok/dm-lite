@@ -1,6 +1,6 @@
 # dm-lite
 
-daimon-memory v2: a small typed memory engine for AI agents. One binary, two modes (embedded client and network server), with hybrid recall (keyword and dense vector), bitemporal history, and multitenant storage (one database per tenant).
+daimon-memory v2: a small typed memory engine for AI agents. One binary, three modes (embedded, server, or a client connected to a server), with hybrid recall (keyword and dense vector), bitemporal history, and multitenant storage (one database per tenant).
 
 ## Install
 
@@ -71,22 +71,39 @@ dmem mcp
 
 ## Run as a server
 
-The same binary serves many tenants over HTTP, one bearer token per tenant.
+The same binary serves many tenants over HTTP(S), one bearer token per tenant. TLS is built in (no reverse proxy assumed).
 
 ```bash
 export DM_TOKEN_ACME=<secret>          # this token maps to tenant "acme"
-dmem serve --addr 0.0.0.0:8077
+
+dmem serve --addr 0.0.0.0:8077 --tls-generate                 # self-signed cert (saved under the data dir)
+dmem serve --addr 0.0.0.0:8077 --tls-cert cert.pem --tls-key key.pem   # your own cert
+dmem serve --addr 127.0.0.1:8077                              # plain HTTP (local only; warns)
 ```
 
 ```bash
-curl -s localhost:8077/healthz
-curl -s -X POST localhost:8077/recall \
+curl -sk https://localhost:8077/healthz
+curl -sk -X POST https://localhost:8077/recall \
   -H 'authorization: Bearer <secret>' \
   -H 'content-type: application/json' \
   -d '{"query":"vector store","limit":5}'
 ```
 
-Routes: `POST /recall`, `/remember`, `/log_decision`, `/add_reminder`, and an open `GET /healthz`. Each tenant gets its own database file.
+Routes: `POST /recall`, `/recent`, `/history`, `/forget`, `/remember`, `/log_decision`, `/log_lesson`, `/log_incident`, `/log_runbook`, `/log_convention`, `/add_reminder`, `/persona`, and an open `GET /healthz`. Each tenant gets its own database file.
+
+## Connect to a server (remote client)
+
+Point this dmem (CLI and the agent hooks) at a remote server. Run `dmem setup` and choose "connect to a memory server", or write `~/.config/dmem/config.toml`:
+
+```toml
+[server]
+url   = "https://memory.myhost.tld:8077"
+token = "<secret>"
+# insecure = true          # accept a self-signed cert, OR:
+# ca_cert  = "/path/cert.pem"   # trust a specific cert/CA
+```
+
+With that in place, `dmem recall` / `dmem remember` and the hooks all talk to the server over TLS with your token, instead of local memory. `dmem status` shows the connection.
 
 ## Keep it updated
 
@@ -105,6 +122,6 @@ cargo build --release --features zvec,fastembed   # add dense vector plus bge-sm
 cargo build --release --features dist             # the full release binary (all of the below)
 ```
 
-The default build is offline and light. `zvec` adds the dense vector store (downloads a prebuilt native lib). `fastembed` adds real bge-small embeddings (downloads the model once). `server` adds the axum HTTP API. `wizard` adds `dmem setup`. `self-update` adds `dmem upgrade`. `dist` bundles all of them, which is what the release binaries ship.
+The default build is offline and light. `zvec` adds the dense vector store (downloads a prebuilt native lib). `fastembed` adds real bge-small embeddings (downloads the model once). `server` adds the axum HTTP API with built-in TLS. `client` adds remote-client mode. `wizard` adds `dmem setup`. `self-update` adds `dmem upgrade`. `dist` bundles all of them, which is what the release binaries ship.
 
 License: MIT.
