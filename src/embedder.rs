@@ -15,7 +15,7 @@ pub const DIM: usize = 384;
 #[cfg(not(any(feature = "fastembed", feature = "candle")))]
 pub const DIM: usize = 256;
 
-pub trait Embedder {
+pub trait Embedder: Send + Sync {
     fn dim(&self) -> usize;
     fn embed(&self, text: &str) -> Vec<f32>;
 }

@@ -488,6 +488,22 @@ pub fn run_blocking(addr: &str, tls: TlsOpts) -> Result<()> {
              or set DM_TOKEN_<tenant>=<secret> for a quick static token."
         );
     }
+    // Embedder idle-eviction: drop the cached model after a quiet window (DM_EMBEDDER_IDLE_SECS,
+    // default 300s) so the daemon falls back to ~5MB between work sessions; the next recall
+    // reloads it transparently. Server-only - the daemon is the one long-running process.
+    #[cfg(feature = "zvec")]
+    {
+        let idle_ms = std::env::var("DM_EMBEDDER_IDLE_SECS")
+            .ok()
+            .and_then(|s| s.parse::<i64>().ok())
+            .unwrap_or(300)
+            * 1000;
+        std::thread::spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_secs(60));
+            crate::tools::evict_embedder_if_idle(idle_ms);
+        });
+    }
+
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async move {
         let app = router(Arc::new(auth));

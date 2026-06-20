@@ -13,34 +13,78 @@ pub struct LocalMemory {
     #[cfg(feature = "zvec")]
     vindex: Option<crate::zvec_index::ZvecIndex>,
     #[cfg(feature = "zvec")]
-    embedder: Box<dyn crate::embedder::Embedder>,
+    embedder: std::sync::Arc<dyn crate::embedder::Embedder>,
 }
 
-/// Pick the embedder: real bge-small (fastembed) if it loads, else the placeholder.
+/// Shared embedder cache. The server opens a tenant store per request; without caching it would
+/// re-mmap + rebuild the model on every recall (the "daemon RSS bouncing to ~250MB" symptom).
+/// We load it once, share it (Arc) while there is activity, and let `evict_embedder_if_idle`
+/// DROP it after a quiet window so the daemon falls back to ~5MB between work sessions; the next
+/// recall transparently reloads. Stable + warm when active, near-free when idle.
 #[cfg(feature = "zvec")]
-fn make_embedder() -> Box<dyn crate::embedder::Embedder> {
+fn embedder_cell() -> &'static std::sync::Mutex<Option<std::sync::Arc<dyn crate::embedder::Embedder>>> {
+    static CELL: std::sync::OnceLock<std::sync::Mutex<Option<std::sync::Arc<dyn crate::embedder::Embedder>>>> =
+        std::sync::OnceLock::new();
+    CELL.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+#[cfg(feature = "zvec")]
+static EMBEDDER_LAST_USED_MS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+#[cfg(feature = "zvec")]
+fn make_embedder() -> std::sync::Arc<dyn crate::embedder::Embedder> {
+    use std::sync::atomic::Ordering;
+    EMBEDDER_LAST_USED_MS.store(now_ms(), Ordering::Relaxed);
+    let mut guard = embedder_cell().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(e) = guard.as_ref() {
+        return std::sync::Arc::clone(e);
+    }
+    let e = build_embedder();
+    *guard = Some(std::sync::Arc::clone(&e));
+    e
+}
+
+/// Drop the cached embedder if it has been idle longer than `max_idle_ms`, freeing the model
+/// RAM (the daemon returns to ~5MB). The server calls this on a timer; the next recall reloads
+/// transparently. No-op if never loaded or still warm. Safe to call concurrently.
+#[cfg(feature = "zvec")]
+pub fn evict_embedder_if_idle(max_idle_ms: i64) {
+    use std::sync::atomic::Ordering;
+    let last = EMBEDDER_LAST_USED_MS.load(Ordering::Relaxed);
+    if last == 0 || now_ms() - last <= max_idle_ms {
+        return;
+    }
+    if let Ok(mut guard) = embedder_cell().lock() {
+        *guard = None;
+    }
+}
+
+/// Construct the best available embedder (called once, behind the `make_embedder` cache).
+#[cfg(feature = "zvec")]
+fn build_embedder() -> std::sync::Arc<dyn crate::embedder::Embedder> {
+    use std::sync::Arc;
     #[cfg(feature = "fastembed")]
     {
         match crate::embedder::FastEmbedder::new() {
-            Ok(e) => return Box::new(e),
+            Ok(e) => return Arc::new(e),
             Err(err) => eprintln!("dmem: fastembed model unavailable ({err:#}); using placeholder embedder"),
         }
     }
     #[cfg(all(feature = "candle", not(feature = "fastembed")))]
     {
         match crate::embedder::CandleEmbedder::new() {
-            Ok(e) => return Box::new(e),
+            Ok(e) => return Arc::new(e),
             Err(err) => eprintln!("dmem: candle model unavailable ({err:#}); using placeholder embedder"),
         }
     }
     #[cfg(all(feature = "model2vec", not(feature = "fastembed"), not(feature = "candle")))]
     {
         match crate::embedder::Model2VecEmbedder::new() {
-            Ok(e) => return Box::new(e),
+            Ok(e) => return Arc::new(e),
             Err(err) => eprintln!("dmem: model2vec model unavailable ({err:#}); using placeholder embedder"),
         }
     }
-    Box::new(crate::embedder::HashEmbedder::new())
+    Arc::new(crate::embedder::HashEmbedder::new())
 }
 
 fn require(value: &str, field: &str) -> Result<()> {
