@@ -37,7 +37,7 @@ fn require(value: &str, field: &str) -> Result<()> {
     }
 }
 
-fn first_line(text: &str) -> String {
+pub(crate) fn first_line(text: &str) -> String {
     let line = text.trim().lines().next().unwrap_or("").trim();
     line.chars().take(80).collect::<String>()
 }

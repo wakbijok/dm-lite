@@ -20,9 +20,11 @@ fn tool_schemas() -> Value {
         },
         {
             "name": "remember",
-            "description": "Store a free-form memory record.",
+            "description": "Store a memory record. Free-form by default; pass `kind` (and ideally `title`) to store a TYPED record: runbook, project_convention, service_topology, known_failure_mode, remediation_pattern, resource_summary, persona, protocol, reminder, memory.",
             "inputSchema": {"type":"object","properties":{
-                "text":{"type":"string"},
+                "text":{"type":"string","description":"the content / body of the record"},
+                "kind":{"type":"string","description":"optional typed kind (omit for a plain memory)"},
+                "title":{"type":"string","description":"title for a typed record (defaults to the first line of `text`)"},
                 "namespace":{"type":"string","description":"e.g. resources/notes or agent/lessons"}
             },"required":["text"]}
         },
@@ -36,6 +38,25 @@ fn tool_schemas() -> Value {
                 "rationale":{"type":"string"},
                 "namespace":{"type":"string"}
             },"required":["title","decision"]}
+        },
+        {
+            "name": "log_lesson",
+            "description": "Store a typed AgentLesson (a reusable insight or a corrected mistake, phrased to prevent repeating it).",
+            "inputSchema": {"type":"object","properties":{
+                "title":{"type":"string"},
+                "lesson":{"type":"string"},
+                "namespace":{"type":"string","description":"defaults to agent/lessons"}
+            },"required":["title","lesson"]}
+        },
+        {
+            "name": "log_incident",
+            "description": "Store a typed IncidentSummary (something failed/broke/reverted: its impact and resolution).",
+            "inputSchema": {"type":"object","properties":{
+                "title":{"type":"string"},
+                "impact":{"type":"string"},
+                "resolution":{"type":"string"},
+                "namespace":{"type":"string"}
+            },"required":["title","impact"]}
         },
         {
             "name": "add_reminder",
@@ -77,13 +98,34 @@ fn call_tool(mem: &Memory, name: &str, args: &Value) -> std::result::Result<Stri
         }
         "remember" => {
             let ns = if s(args, "namespace").is_empty() { "resources/notes" } else { s(args, "namespace") };
-            let uri = mem.remember(s(args, "text"), ns).map_err(|e| e.to_string())?;
+            let text = s(args, "text");
+            let kind_str = s(args, "kind");
+            let uri = if kind_str.is_empty() {
+                mem.remember(text, ns).map_err(|e| e.to_string())?
+            } else {
+                let kind = crate::entry::Kind::from_str(kind_str)
+                    .ok_or_else(|| format!("unknown kind: {kind_str}"))?;
+                let title = if s(args, "title").is_empty() { crate::tools::first_line(text) } else { s(args, "title").to_string() };
+                mem.import_record(kind, ns, &title, text).map_err(|e| e.to_string())?
+            };
             Ok(format!("stored {}", uri))
         }
         "log_decision" => {
             let ns = if s(args, "namespace").is_empty() { "resources/decisions" } else { s(args, "namespace") };
             let uri = mem
                 .log_decision(s(args, "title"), s(args, "context"), s(args, "decision"), s(args, "rationale"), ns)
+                .map_err(|e| e.to_string())?;
+            Ok(format!("stored {}", uri))
+        }
+        "log_lesson" => {
+            let ns = if s(args, "namespace").is_empty() { "agent/lessons" } else { s(args, "namespace") };
+            let uri = mem.log_lesson(s(args, "title"), s(args, "lesson"), ns).map_err(|e| e.to_string())?;
+            Ok(format!("stored {}", uri))
+        }
+        "log_incident" => {
+            let ns = if s(args, "namespace").is_empty() { "resources/incidents" } else { s(args, "namespace") };
+            let uri = mem
+                .log_incident(s(args, "title"), s(args, "impact"), s(args, "resolution"), ns)
                 .map_err(|e| e.to_string())?;
             Ok(format!("stored {}", uri))
         }
@@ -165,5 +207,17 @@ mod tests {
     fn server_info_reports_dmem() {
         assert_eq!(server_info()["name"], "dmem");
         assert_eq!(server_info()["version"], env!("CARGO_PKG_VERSION"));
+    }
+
+    #[test]
+    fn exposes_full_typed_save_surface() {
+        let tools = tool_schemas();
+        let names: Vec<&str> = tools.as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
+        for t in ["recall", "remember", "log_decision", "log_lesson", "log_incident", "add_reminder", "forget"] {
+            assert!(names.contains(&t), "MCP surface missing tool: {t}");
+        }
+        // remember is kind-aware so the governance's "remember kind=runbook/project_convention/..." works
+        let remember = tools.as_array().unwrap().iter().find(|t| t["name"] == "remember").unwrap();
+        assert!(remember["inputSchema"]["properties"].get("kind").is_some(), "remember must accept a kind");
     }
 }
