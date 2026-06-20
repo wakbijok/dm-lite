@@ -160,6 +160,12 @@ impl RemoteClient {
             json!({ "kind": kind.as_str(), "namespace": namespace, "title": title, "body": body }),
         )
     }
+    pub fn import_record_at(&self, kind: Kind, namespace: &str, title: &str, body: &str, created_ms: i64) -> Result<String> {
+        self.uri_of(
+            "/import",
+            json!({ "kind": kind.as_str(), "namespace": namespace, "title": title, "body": body, "created_ms": created_ms }),
+        )
+    }
 }
 
 /// `dmem login`: write the `[server]` block into the config (preserving other keys), 0600.

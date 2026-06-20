@@ -335,6 +335,9 @@ struct ImportReq {
     title: String,
     #[serde(default)]
     body: String,
+    /// original creation time (migration); 0/absent = now
+    #[serde(default)]
+    created_ms: i64,
 }
 
 async fn import_h(State(st): State<AppState>, headers: HeaderMap, Json(req): Json<ImportReq>) -> ApiResp {
@@ -342,7 +345,12 @@ async fn import_h(State(st): State<AppState>, headers: HeaderMap, Json(req): Jso
         let kind = crate::entry::Kind::from_str(&req.kind)
             .ok_or_else(|| anyhow::anyhow!("unknown kind: {}", req.kind))?;
         let ns = if req.namespace.is_empty() { "resources/notes" } else { &req.namespace };
-        Ok(json!({ "uri": m.import_record(kind, ns, &req.title, &req.body)? }))
+        let uri = if req.created_ms > 0 {
+            m.import_record_at(kind, ns, &req.title, &req.body, req.created_ms)?
+        } else {
+            m.import_record(kind, ns, &req.title, &req.body)?
+        };
+        Ok(json!({ "uri": uri }))
     })
 }
 

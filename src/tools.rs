@@ -99,18 +99,45 @@ impl LocalMemory {
             importance,
             uri.clone(),
         );
-        self.store.put(&e)?;
+        self.save_entry(&e)?;
+        Ok(uri)
+    }
+
+    /// Put an entry and (under zvec) embed its body. Fail-open: a vector-index hiccup never
+    /// blocks the canonical SQLite save. Bitemporal invariant: the hashed-PK upsert overwrites
+    /// the prior vector, so the index holds exactly the current valid version.
+    fn save_entry(&self, e: &Entry) -> Result<()> {
+        self.store.put(e)?;
         #[cfg(feature = "zvec")]
         if let Some(vindex) = &self.vindex {
-            // Fail open: a vector-index hiccup must never block the canonical SQLite save.
-            // Bitemporal invariant: the hashed-PK upsert overwrites the prior vector for this
-            // uri, so the index holds exactly the CURRENT valid version - no closed/historical
-            // version is ever embedded. As-of recall is keyword-only by design (see recall_as_of).
             let v = self.embedder.embed(&e.body);
             if let Err(err) = vindex.upsert(&e.uri, &v) {
                 eprintln!("dmem: vector index upsert failed for {} ({err:#}); keyword recall unaffected", e.uri);
             }
         }
+        Ok(())
+    }
+
+    /// Import a record preserving its ORIGINAL creation/valid time (for v1->v2 migration).
+    /// System time stays "now" (when we recorded it); valid/created time is the original.
+    pub fn import_record_at(&self, kind: Kind, namespace: &str, title: &str, body: &str, created_ms: i64) -> Result<String> {
+        require(title, "title")?;
+        let uri = make_uri(namespace, kind, title);
+        let mut e = Entry::new_now(
+            uri.clone(),
+            kind,
+            namespace.to_string(),
+            title.to_string(),
+            body.to_string(),
+            vec![],
+            crate::entry::default_importance(kind),
+            uri.clone(),
+        );
+        if created_ms > 0 {
+            e.created_ms = created_ms;
+            e.valid_from_ms = created_ms;
+        }
+        self.save_entry(&e)?;
         Ok(uri)
     }
 
@@ -468,6 +495,13 @@ impl Memory {
             Memory::Local(l) => l.import_record(kind, namespace, title, body),
             #[cfg(feature = "client")]
             Memory::Remote(r) => r.import_record(kind, namespace, title, body),
+        }
+    }
+    pub fn import_record_at(&self, kind: Kind, namespace: &str, title: &str, body: &str, created_ms: i64) -> Result<String> {
+        match self {
+            Memory::Local(l) => l.import_record_at(kind, namespace, title, body, created_ms),
+            #[cfg(feature = "client")]
+            Memory::Remote(r) => r.import_record_at(kind, namespace, title, body, created_ms),
         }
     }
 }

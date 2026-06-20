@@ -5,6 +5,8 @@
 mod bootstrap;
 #[cfg(feature = "client")]
 mod client;
+#[cfg(feature = "client")]
+mod migrate;
 mod config;
 mod embedder;
 mod entry;
@@ -158,6 +160,19 @@ enum Cmd {
     /// Import a template/markdown file (or a directory of them) as memory records.
     Import {
         path: String,
+    },
+    /// Migrate a daimon-memory v1 export (JSONL) into dm-lite. Needs --features client.
+    #[cfg(feature = "client")]
+    Migrate {
+        /// JSONL export file (or - for stdin)
+        #[arg(long)]
+        file: Option<String>,
+        /// v1 server URL to pull GET /admin/export from
+        #[arg(long)]
+        url: Option<String>,
+        /// v1 admin token (with --url)
+        #[arg(long)]
+        token: Option<String>,
     },
     /// Template helpers (export the bundled defaults to edit).
     #[command(subcommand)]
@@ -391,6 +406,8 @@ fn run() -> Result<()> {
             println!("imported {ok}, skipped {skipped}");
             Ok(())
         }
+        #[cfg(feature = "client")]
+        Cmd::Migrate { file, url, token } => migrate::run(file, url, token),
         Cmd::Template(TemplateCmd::Export { dir }) => {
             let d = std::path::Path::new(&dir);
             std::fs::create_dir_all(d)?;
