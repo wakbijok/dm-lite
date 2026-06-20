@@ -26,14 +26,17 @@ server = ["dep:axum", "dep:tokio", "dep:tower"]
 wizard = ["dep:dialoguer"]
 # self-update: `dmem upgrade` in-place from GitHub Releases.
 self-update = ["dep:self_update", "dep:semver"]
+# client: remote-client mode - talk to a remote `dmem serve` over HTTPS (reqwest + rustls).
+client = ["dep:reqwest"]
 # dist: the friend-facing distribution build (what the release workflow ships).
-dist = ["zvec", "fastembed", "server", "wizard", "self-update"]
+dist = ["zvec", "fastembed", "server", "wizard", "self-update", "client"]
 
 [dependencies]
 rusqlite = { version = "0.32", features = ["bundled"] }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+toml = "0.8"
 anyhow = "1"
 dirs = "5"
 zvec = { git = "https://github.com/zvec-ai/zvec-rust.git", tag = "v0.5.0", optional = true }
@@ -44,6 +47,7 @@ tower = { version = "0.5", features = ["util"], optional = true }
 dialoguer = { version = "0.11", optional = true }
 self_update = { version = "0.41", default-features = false, features = ["rustls", "archive-tar", "archive-zip", "compression-flate2"], optional = true }
 semver = { version = "1", optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json"], optional = true }
 
 [profile.release]
 opt-level = 2

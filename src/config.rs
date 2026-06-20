@@ -1,12 +1,73 @@
-//! Paths + tenant resolution. Embedded mode = one tenant ("default"); server mode
-//! (later) selects the tenant per request, one database file per tenant.
+//! Paths, config file, and tenant resolution. Embedded mode = one local tenant; server mode
+//! selects the tenant per request; a `[server]` block in the config switches the binary into
+//! remote-client mode (it talks to a remote `dmem serve`). One database file per tenant.
 
 use anyhow::{anyhow, Result};
+use serde::Deserialize;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
-/// Base data dir: $DM_DATA_DIR, else ~/.local/share/dm (XDG-ish), else ~/.dm.
+/// The on-disk config (`~/.config/dmem/config.toml`, or `$DM_CONFIG`). All fields optional;
+/// an absent file means embedded mode with defaults.
+#[derive(Debug, Default, Deserialize)]
+pub struct Config {
+    pub data_dir: Option<String>,
+    pub tenant: Option<String>,
+    /// Presence of this block puts the binary in remote-client mode.
+    pub server: Option<ServerLink>,
+}
+
+/// How a client reaches a remote `dmem serve`. Fields are read by the remote-client path.
+#[derive(Debug, Clone, Deserialize)]
+#[cfg_attr(not(feature = "client"), allow(dead_code))]
+pub struct ServerLink {
+    pub url: String,
+    pub token: String,
+    /// Accept a self-signed / invalid TLS cert (for trusted networks).
+    #[serde(default)]
+    pub insecure: bool,
+    /// Trust a specific CA / self-signed cert (PEM path) instead of the system roots.
+    pub ca_cert: Option<String>,
+}
+
+static CONFIG: OnceLock<Config> = OnceLock::new();
+
+/// Path to the config file: `$DM_CONFIG`, else `<config-dir>/dmem/config.toml`.
+pub fn config_path() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("DM_CONFIG") {
+        return Some(PathBuf::from(p));
+    }
+    dirs::config_dir().map(|d| d.join("dmem").join("config.toml"))
+}
+
+/// The loaded config (cached). Returns defaults if the file is absent or unparseable.
+pub fn config() -> &'static Config {
+    CONFIG.get_or_init(|| {
+        config_path()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .and_then(|s| match toml::from_str::<Config>(&s) {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    eprintln!("dmem: ignoring bad config ({e})");
+                    None
+                }
+            })
+            .unwrap_or_default()
+    })
+}
+
+/// The remote server link, if the config selects remote-client mode.
+#[cfg_attr(not(feature = "client"), allow(dead_code))]
+pub fn server_link() -> Option<&'static ServerLink> {
+    config().server.as_ref()
+}
+
+/// Base data dir: $DM_DATA_DIR, else config `data_dir`, else ~/.local/share/dm, else ~/.dm.
 pub fn data_dir() -> Result<PathBuf> {
     if let Ok(d) = std::env::var("DM_DATA_DIR") {
+        return Ok(PathBuf::from(d));
+    }
+    if let Some(d) = &config().data_dir {
         return Ok(PathBuf::from(d));
     }
     if let Some(d) = dirs::data_dir() {
@@ -49,7 +110,33 @@ pub fn vector_dir(tenant: &str) -> Result<PathBuf> {
     Ok(data_dir()?.join("vectors").join(canonical_tenant(tenant)))
 }
 
-/// Resolve the active tenant: $DM_TENANT, else "default".
+/// Resolve the active tenant: $DM_TENANT, else config `tenant`, else "default".
 pub fn tenant() -> String {
-    std::env::var("DM_TENANT").unwrap_or_else(|_| "default".to_string())
+    std::env::var("DM_TENANT")
+        .ok()
+        .or_else(|| config().tenant.clone())
+        .unwrap_or_else(|| "default".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_server_block() {
+        let cfg: Config = toml::from_str(
+            "tenant = \"acme\"\n[server]\nurl = \"https://x\"\ntoken = \"t\"\ninsecure = true\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.tenant.as_deref(), Some("acme"));
+        let s = cfg.server.unwrap();
+        assert_eq!(s.url, "https://x");
+        assert!(s.insecure && s.ca_cert.is_none());
+    }
+
+    #[test]
+    fn empty_config_is_default() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert!(cfg.server.is_none() && cfg.tenant.is_none() && cfg.data_dir.is_none());
+    }
 }
