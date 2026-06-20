@@ -49,9 +49,48 @@ impl RemoteClient {
         Ok(serde_json::from_str(&text).unwrap_or(Value::Null))
     }
 
+    fn get(&self, path: &str) -> Result<Value> {
+        let resp = self
+            .http
+            .get(format!("{}{}", self.base, path))
+            .bearer_auth(&self.token)
+            .send()
+            .map_err(|e| anyhow!("GET {path}: {e}"))?;
+        let status = resp.status();
+        let text = resp.text().unwrap_or_default();
+        if !status.is_success() {
+            anyhow::bail!("server {} on {}: {}", status.as_u16(), path, text.trim());
+        }
+        Ok(serde_json::from_str(&text).unwrap_or(Value::Null))
+    }
+
     fn list(&self, path: &str, body: Value) -> Result<Vec<Entry>> {
         let v = self.post(path, body)?;
         Ok(serde_json::from_value(v).unwrap_or_default())
+    }
+
+    // --- admin (root-token) operations ---
+
+    pub fn admin_add(&self, tenant: &str, label: &str, display: &str) -> Result<(String, String)> {
+        let v = self.post("/admin/tenant", json!({ "tenant": tenant, "label": label, "display": display }))?;
+        Ok((
+            v.get("tenant").and_then(|x| x.as_str()).unwrap_or_default().to_string(),
+            v.get("token").and_then(|x| x.as_str()).unwrap_or_default().to_string(),
+        ))
+    }
+
+    pub fn admin_list(&self) -> Result<Value> {
+        self.get("/admin/tenants")
+    }
+
+    pub fn admin_revoke(&self, target: &str) -> Result<i64> {
+        let v = self.post("/admin/revoke", json!({ "target": target }))?;
+        Ok(v.get("revoked").and_then(|x| x.as_i64()).unwrap_or(0))
+    }
+
+    pub fn admin_rm(&self, tenant: &str) -> Result<()> {
+        self.post("/admin/rm", json!({ "target": tenant }))?;
+        Ok(())
     }
 
     fn uri_of(&self, path: &str, body: Value) -> Result<String> {
@@ -115,4 +154,51 @@ impl RemoteClient {
     pub fn log_convention(&self, title: &str, rule: &str, namespace: &str) -> Result<String> {
         self.uri_of("/log_convention", json!({ "title": title, "rule": rule, "namespace": namespace }))
     }
+}
+
+/// `dmem login`: write the `[server]` block into the config (preserving other keys), 0600.
+pub fn login(url: &str, token: &str, insecure: bool, ca_cert: Option<String>) -> Result<()> {
+    let path = crate::config::config_path().ok_or_else(|| anyhow!("could not resolve a config dir"))?;
+    if let Some(p) = path.parent() {
+        std::fs::create_dir_all(p)?;
+    }
+    let mut doc: toml::Table = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| s.parse::<toml::Table>().ok())
+        .unwrap_or_default();
+    let mut server = toml::Table::new();
+    server.insert("url".into(), toml::Value::String(url.trim_end_matches('/').to_string()));
+    server.insert("token".into(), toml::Value::String(token.to_string()));
+    if insecure {
+        server.insert("insecure".into(), toml::Value::Boolean(true));
+    }
+    if let Some(ca) = ca_cert {
+        server.insert("ca_cert".into(), toml::Value::String(ca));
+    }
+    doc.insert("server".into(), toml::Value::Table(server));
+    std::fs::write(&path, toml::to_string(&doc)?)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+    println!("logged in to {url}\nconfig: {}", path.display());
+    Ok(())
+}
+
+/// `dmem logout`: drop the `[server]` block, keeping any other config.
+pub fn logout() -> Result<()> {
+    let path = crate::config::config_path().ok_or_else(|| anyhow!("could not resolve a config dir"))?;
+    if !path.exists() {
+        println!("not logged in");
+        return Ok(());
+    }
+    let mut doc: toml::Table = std::fs::read_to_string(&path)?.parse().unwrap_or_default();
+    if doc.remove("server").is_none() {
+        println!("not connected to a server");
+        return Ok(());
+    }
+    std::fs::write(&path, toml::to_string(&doc)?)?;
+    println!("logged out (server config removed)");
+    Ok(())
 }

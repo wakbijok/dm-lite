@@ -15,6 +15,8 @@ mod sqlite;
 mod store;
 mod tools;
 #[cfg(feature = "server")]
+mod iam;
+#[cfg(feature = "server")]
 mod server;
 #[cfg(feature = "wizard")]
 mod setup;
@@ -168,6 +170,43 @@ enum Cmd {
         #[arg(long)]
         pre: bool,
     },
+    /// Connect this dmem to a remote server (writes the [server] config). Needs --features client.
+    #[cfg(feature = "client")]
+    Login {
+        url: String,
+        token: String,
+        #[arg(long)]
+        insecure: bool,
+        #[arg(long = "ca-cert")]
+        ca_cert: Option<String>,
+    },
+    /// Disconnect from the remote server (clears [server]). Needs --features client.
+    #[cfg(feature = "client")]
+    Logout,
+    /// Admin (root token): manage tenants on a server. Needs --features client.
+    #[cfg(feature = "client")]
+    #[command(subcommand)]
+    Admin(AdminCmd),
+}
+
+#[cfg(feature = "client")]
+#[derive(Subcommand)]
+#[command(rename_all = "snake_case")]
+enum AdminCmd {
+    /// Create a tenant and issue a one-time token.
+    Add {
+        tenant: String,
+        #[arg(long, default_value = "")]
+        label: String,
+        #[arg(long, default_value = "")]
+        display: String,
+    },
+    /// List tenants and live token counts.
+    List,
+    /// Revoke a token (by value) or all of a tenant's tokens.
+    Revoke { target: String },
+    /// Suspend a tenant and revoke its tokens.
+    Rm { tenant: String },
 }
 
 #[derive(Subcommand)]
@@ -294,6 +333,43 @@ fn run() -> Result<()> {
         ),
         #[cfg(feature = "self-update")]
         Cmd::Upgrade { pre } => upgrade::run(pre),
+        #[cfg(feature = "client")]
+        Cmd::Login { url, token, insecure, ca_cert } => client::login(&url, &token, insecure, ca_cert),
+        #[cfg(feature = "client")]
+        Cmd::Logout => client::logout(),
+        #[cfg(feature = "client")]
+        Cmd::Admin(a) => {
+            let link = config::server_link().ok_or_else(|| {
+                anyhow::anyhow!("no [server] in config; run `dmem login <url> <admin-token>` first")
+            })?;
+            let rc = client::RemoteClient::new(link)?;
+            match a {
+                AdminCmd::Add { tenant, label, display } => {
+                    let (t, tok) = rc.admin_add(&tenant, &label, &display)?;
+                    println!("created tenant '{t}'. one-time token (save it now, shown once):");
+                    println!("    {tok}");
+                    println!("the user runs:  dmem login {} {tok}", link.url);
+                }
+                AdminCmd::List => {
+                    if let Some(arr) = rc.admin_list()?.as_array() {
+                        for row in arr {
+                            println!(
+                                "- {:<20} {:<10} {} token(s)",
+                                row.get("tenant").and_then(|x| x.as_str()).unwrap_or("?"),
+                                row.get("status").and_then(|x| x.as_str()).unwrap_or("?"),
+                                row.get("tokens").and_then(|x| x.as_i64()).unwrap_or(0)
+                            );
+                        }
+                    }
+                }
+                AdminCmd::Revoke { target } => println!("revoked {} token(s)", rc.admin_revoke(&target)?),
+                AdminCmd::Rm { tenant } => {
+                    rc.admin_rm(&tenant)?;
+                    println!("removed tenant {tenant}");
+                }
+            }
+            Ok(())
+        }
     }
 }
 

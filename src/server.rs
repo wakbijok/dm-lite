@@ -103,10 +103,36 @@ fn bad_request(e: anyhow::Error) -> ApiResp {
     err(StatusCode::BAD_REQUEST, "invalid request")
 }
 
-/// Resolve the request's tenant from its Authorization header, or None (-> 401).
+/// Resolve the bearer token to an identity: the IAM token DB first, then the env fallback
+/// (which always yields a member). None = unknown/revoked/suspended.
+fn resolve_identity(st: &AppState, headers: &HeaderMap) -> Option<crate::iam::Identity> {
+    let h = headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok())?;
+    let token = parse_bearer(h)?;
+    if let Ok(iam) = crate::iam::Iam::open() {
+        if let Some(id) = iam.resolve(token) {
+            return Some(id);
+        }
+    }
+    st.auth
+        .tenant_for(Some(h))
+        .map(|t| crate::iam::Identity { tenant: Some(t), is_admin: false })
+}
+
+/// Resolve the request's member tenant (admin tokens have no tenant -> None -> 401 here).
 fn tenant_of(st: &AppState, headers: &HeaderMap) -> Option<String> {
-    let h = headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok());
-    st.auth.tenant_for(h)
+    resolve_identity(st, headers).and_then(|id| id.tenant)
+}
+
+/// Run `f` only for a valid ADMIN token (403 for a member, 401 for none).
+fn with_admin(st: &AppState, headers: &HeaderMap, f: impl FnOnce() -> Result<serde_json::Value>) -> ApiResp {
+    match resolve_identity(st, headers) {
+        Some(id) if id.is_admin => match f() {
+            Ok(v) => (StatusCode::OK, Json(v)),
+            Err(e) => internal(e),
+        },
+        Some(_) => err(StatusCode::FORBIDDEN, "admin token required"),
+        None => err(StatusCode::UNAUTHORIZED, "invalid or missing bearer token"),
+    }
 }
 
 #[derive(Deserialize)]
@@ -301,6 +327,57 @@ async fn reminder_h(State(st): State<AppState>, headers: HeaderMap, Json(req): J
     })
 }
 
+// --- admin (IAM) routes: require the root admin token ---
+
+#[derive(Deserialize)]
+struct AdminAddReq {
+    tenant: String,
+    #[serde(default)]
+    display: String,
+    #[serde(default)]
+    label: String,
+}
+
+#[derive(Deserialize)]
+struct AdminTargetReq {
+    target: String,
+}
+
+async fn admin_add_h(State(st): State<AppState>, headers: HeaderMap, Json(req): Json<AdminAddReq>) -> ApiResp {
+    with_admin(&st, &headers, || {
+        let iam = crate::iam::Iam::open()?;
+        let (tenant, token) = iam.create_tenant(&req.tenant, &req.display, &req.label)?;
+        Ok(json!({ "tenant": tenant, "token": token }))
+    })
+}
+
+async fn admin_list_h(State(st): State<AppState>, headers: HeaderMap) -> ApiResp {
+    with_admin(&st, &headers, || {
+        let iam = crate::iam::Iam::open()?;
+        let rows: Vec<_> = iam
+            .list()?
+            .into_iter()
+            .map(|(t, s, n)| json!({ "tenant": t, "status": s, "tokens": n }))
+            .collect();
+        Ok(json!(rows))
+    })
+}
+
+async fn admin_revoke_h(State(st): State<AppState>, headers: HeaderMap, Json(req): Json<AdminTargetReq>) -> ApiResp {
+    with_admin(&st, &headers, || {
+        let iam = crate::iam::Iam::open()?;
+        Ok(json!({ "revoked": iam.revoke(&req.target)? }))
+    })
+}
+
+async fn admin_rm_h(State(st): State<AppState>, headers: HeaderMap, Json(req): Json<AdminTargetReq>) -> ApiResp {
+    with_admin(&st, &headers, || {
+        let iam = crate::iam::Iam::open()?;
+        iam.remove_tenant(&req.target)?;
+        Ok(json!({ "removed": req.target }))
+    })
+}
+
 /// Assemble the router. `/healthz` is open; every other route requires a valid bearer token.
 pub fn router(auth: Arc<dyn Authenticator>) -> Router {
     Router::new()
@@ -317,6 +394,10 @@ pub fn router(auth: Arc<dyn Authenticator>) -> Router {
         .route("/log_runbook", post(runbook_h))
         .route("/log_convention", post(convention_h))
         .route("/add_reminder", post(reminder_h))
+        .route("/admin/tenant", post(admin_add_h))
+        .route("/admin/tenants", get(admin_list_h))
+        .route("/admin/revoke", post(admin_revoke_h))
+        .route("/admin/rm", post(admin_rm_h))
         .with_state(AppState { auth })
 }
 
@@ -356,10 +437,24 @@ pub fn run_blocking(addr: &str, tls: TlsOpts) -> Result<()> {
     // rustls 0.23 needs a process-wide crypto provider installed before any TLS work.
     let _ = rustls::crypto::ring::default_provider().install_default();
     let auth = BearerAuth::from_env()?;
+    // IAM: ensure a bootstrap root admin token; print it once if newly generated.
+    if let Ok(iam) = crate::iam::Iam::open() {
+        match iam.ensure_admin() {
+            Ok(Some(token)) => {
+                let dir = crate::config::data_dir().map(|d| d.display().to_string()).unwrap_or_default();
+                eprintln!("dmem serve: generated ROOT ADMIN token (save it, shown once):");
+                eprintln!("    {token}");
+                eprintln!("  also written to {dir}/admin.token (0600)");
+                eprintln!("  wire the admin client: dmem login {addr} {token}  then `dmem admin add <tenant>`");
+            }
+            Ok(None) => {}
+            Err(e) => eprintln!("dmem serve: IAM init warning ({e:#})"),
+        }
+    }
     if auth.is_empty() {
         eprintln!(
-            "dmem serve: no DM_TOKEN_<tenant> tokens in the environment; authed routes will 401 \
-             (only /healthz is open). Set e.g. DM_TOKEN_ACME=<secret> to grant tenant 'acme'."
+            "dmem serve: tip - create tenants with the admin token (`dmem admin add <tenant>`), \
+             or set DM_TOKEN_<tenant>=<secret> for a quick static token."
         );
     }
     let rt = tokio::runtime::Runtime::new()?;

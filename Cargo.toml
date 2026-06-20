@@ -21,7 +21,7 @@ zvec = ["dep:zvec"]
 fastembed = ["dep:fastembed", "zvec"]
 # server: network API (axum + tokio) with multi-token bearer -> tenant auth and built-in TLS,
 # over the database-per-tenant store. Off by default so the embedded binary stays lean.
-server = ["dep:axum", "dep:axum-server", "dep:rcgen", "dep:rustls", "dep:tokio", "dep:tower"]
+server = ["dep:axum", "dep:axum-server", "dep:rcgen", "dep:rustls", "dep:tokio", "dep:tower", "dep:getrandom", "dep:sha2"]
 # wizard: interactive `dmem setup` first-run flow (dialoguer).
 wizard = ["dep:dialoguer"]
 # self-update: `dmem upgrade` in-place from GitHub Releases.
@@ -51,6 +51,8 @@ dialoguer = { version = "0.11", optional = true }
 self_update = { version = "0.41", default-features = false, features = ["rustls", "archive-tar", "archive-zip", "compression-flate2"], optional = true }
 semver = { version = "1", optional = true }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json"], optional = true }
+getrandom = { version = "0.2", optional = true }
+sha2 = { version = "0.10", optional = true }
 
 [profile.release]
 opt-level = 2
