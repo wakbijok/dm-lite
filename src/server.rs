@@ -493,13 +493,16 @@ pub fn run_blocking(addr: &str, tls: TlsOpts) -> Result<()> {
     // reloads it transparently. Server-only - the daemon is the one long-running process.
     #[cfg(feature = "zvec")]
     {
-        let idle_ms = std::env::var("DM_EMBEDDER_IDLE_SECS")
+        let idle_secs = std::env::var("DM_EMBEDDER_IDLE_SECS")
             .ok()
             .and_then(|s| s.parse::<i64>().ok())
-            .unwrap_or(300)
-            * 1000;
+            .unwrap_or(120);
+        let idle_ms = idle_secs * 1000;
+        // Check ~4x per idle window so the daemon deflates promptly after the last request
+        // (clamped 2..=30s), instead of a coarse fixed minute.
+        let check_secs = (idle_secs / 4).clamp(2, 30) as u64;
         std::thread::spawn(move || loop {
-            std::thread::sleep(std::time::Duration::from_secs(60));
+            std::thread::sleep(std::time::Duration::from_secs(check_secs));
             crate::tools::evict_embedder_if_idle(idle_ms);
         });
     }
