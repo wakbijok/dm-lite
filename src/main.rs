@@ -14,6 +14,8 @@ mod store;
 mod tools;
 #[cfg(feature = "server")]
 mod server;
+#[cfg(feature = "self-update")]
+mod upgrade;
 #[cfg(feature = "zvec")]
 mod zvec_index;
 
@@ -143,6 +145,13 @@ enum Cmd {
         #[arg(long, default_value = "127.0.0.1:8077")]
         addr: String,
     },
+    /// Update dmem in place from GitHub Releases. Needs --features self-update.
+    #[cfg(feature = "self-update")]
+    Upgrade {
+        /// include pre-releases (rc/beta), not just stable
+        #[arg(long)]
+        pre: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -262,6 +271,8 @@ fn run() -> Result<()> {
         Cmd::Mcp => mcp::serve(),
         #[cfg(feature = "server")]
         Cmd::Serve { addr } => server::run_blocking(&addr),
+        #[cfg(feature = "self-update")]
+        Cmd::Upgrade { pre } => upgrade::run(pre),
     }
 }
 
