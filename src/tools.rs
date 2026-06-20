@@ -7,7 +7,8 @@ use crate::sqlite::SqliteStore;
 use crate::store::MemoryStore;
 use anyhow::{anyhow, Result};
 
-pub struct Memory {
+/// The local (embedded) memory engine: SQLite store + optional zvec vector index.
+pub struct LocalMemory {
     store: SqliteStore,
     #[cfg(feature = "zvec")]
     vindex: Option<crate::zvec_index::ZvecIndex>,
@@ -59,7 +60,7 @@ fn signal_boost(importance: i64, access_count: i64, last_access_ms: i64, now_ms:
     (1.0 + 0.05 * importance_norm + 0.05 * recency + 0.02 * freq).clamp(1.0, 1.25)
 }
 
-impl Memory {
+impl LocalMemory {
     /// Open the embedded-mode tenant ($DM_TENANT, else "default").
     pub fn open() -> Result<Self> {
         Self::open_tenant(&config::tenant())
@@ -311,7 +312,7 @@ impl Memory {
         Ok(out)
     }
 
-    /// Construct a Memory directly over a store (tests only; bypasses config/embedder).
+    /// Construct a LocalMemory directly over a store (tests only; bypasses config/embedder).
     #[cfg(test)]
     fn for_test(store: SqliteStore) -> Self {
         #[cfg(feature = "zvec")]
@@ -321,6 +322,139 @@ impl Memory {
         #[cfg(not(feature = "zvec"))]
         {
             Self { store }
+        }
+    }
+}
+
+/// The memory handle callers use: either the local engine or a remote `dmem serve` client,
+/// chosen at `open()` by whether a `[server]` block is configured. The two modes share the
+/// same surface, so callers (CLI, hooks, MCP) are mode-agnostic.
+pub enum Memory {
+    Local(LocalMemory),
+    #[cfg(feature = "client")]
+    Remote(crate::client::RemoteClient),
+}
+
+impl Memory {
+    /// Remote-client if a `[server]` block is configured (and the client feature is built),
+    /// else the local embedded engine.
+    pub fn open() -> Result<Self> {
+        #[cfg(feature = "client")]
+        if let Some(link) = config::server_link() {
+            return Ok(Memory::Remote(crate::client::RemoteClient::new(link)?));
+        }
+        Ok(Memory::Local(LocalMemory::open()?))
+    }
+
+    /// Open a specific LOCAL tenant (the server is always local-backed; never remote).
+    #[cfg_attr(not(feature = "server"), allow(dead_code))]
+    pub fn open_tenant(tenant: &str) -> Result<LocalMemory> {
+        LocalMemory::open_tenant(tenant)
+    }
+
+    pub fn recall(&self, query: &str, limit: usize) -> Result<Vec<Entry>> {
+        match self {
+            Memory::Local(l) => l.recall(query, limit),
+            #[cfg(feature = "client")]
+            Memory::Remote(r) => r.recall(query, limit),
+        }
+    }
+    pub fn recall_as_of(&self, query: &str, limit: usize, as_of_ms: i64, valid_ms: i64) -> Result<Vec<Entry>> {
+        match self {
+            Memory::Local(l) => l.recall_as_of(query, limit, as_of_ms, valid_ms),
+            #[cfg(feature = "client")]
+            Memory::Remote(r) => r.recall_as_of(query, limit, as_of_ms, valid_ms),
+        }
+    }
+    pub fn recent(&self, limit: usize) -> Result<Vec<Entry>> {
+        match self {
+            Memory::Local(l) => l.recent(limit),
+            #[cfg(feature = "client")]
+            Memory::Remote(r) => r.recent(limit),
+        }
+    }
+    pub fn history(&self, uri: &str, limit: usize) -> Result<Vec<Entry>> {
+        match self {
+            Memory::Local(l) => l.history(uri, limit),
+            #[cfg(feature = "client")]
+            Memory::Remote(r) => r.history(uri, limit),
+        }
+    }
+    pub fn forget(&self, uri: &str) -> Result<usize> {
+        match self {
+            Memory::Local(l) => l.forget(uri),
+            #[cfg(feature = "client")]
+            Memory::Remote(r) => r.forget(uri),
+        }
+    }
+    pub fn persona(&self) -> Result<Vec<Entry>> {
+        match self {
+            Memory::Local(l) => l.persona(),
+            #[cfg(feature = "client")]
+            Memory::Remote(r) => r.persona(),
+        }
+    }
+    pub fn counts(&self) -> Result<Vec<(String, usize)>> {
+        match self {
+            Memory::Local(l) => l.counts(),
+            #[cfg(feature = "client")]
+            Memory::Remote(r) => r.counts(),
+        }
+    }
+    pub fn recall_mode(&self) -> &'static str {
+        match self {
+            Memory::Local(l) => l.recall_mode(),
+            #[cfg(feature = "client")]
+            Memory::Remote(r) => r.recall_mode(),
+        }
+    }
+    pub fn remember(&self, text: &str, namespace: &str) -> Result<String> {
+        match self {
+            Memory::Local(l) => l.remember(text, namespace),
+            #[cfg(feature = "client")]
+            Memory::Remote(r) => r.remember(text, namespace),
+        }
+    }
+    pub fn log_decision(&self, title: &str, context: &str, decision: &str, rationale: &str, namespace: &str) -> Result<String> {
+        match self {
+            Memory::Local(l) => l.log_decision(title, context, decision, rationale, namespace),
+            #[cfg(feature = "client")]
+            Memory::Remote(r) => r.log_decision(title, context, decision, rationale, namespace),
+        }
+    }
+    pub fn log_lesson(&self, title: &str, lesson: &str, namespace: &str) -> Result<String> {
+        match self {
+            Memory::Local(l) => l.log_lesson(title, lesson, namespace),
+            #[cfg(feature = "client")]
+            Memory::Remote(r) => r.log_lesson(title, lesson, namespace),
+        }
+    }
+    pub fn log_incident(&self, title: &str, impact: &str, resolution: &str, namespace: &str) -> Result<String> {
+        match self {
+            Memory::Local(l) => l.log_incident(title, impact, resolution, namespace),
+            #[cfg(feature = "client")]
+            Memory::Remote(r) => r.log_incident(title, impact, resolution, namespace),
+        }
+    }
+    pub fn add_reminder(&self, title: &str, text: &str, namespace: &str) -> Result<String> {
+        match self {
+            Memory::Local(l) => l.add_reminder(title, text, namespace),
+            #[cfg(feature = "client")]
+            Memory::Remote(r) => r.add_reminder(title, text, namespace),
+        }
+    }
+    pub fn log_runbook(&self, title: &str, steps: &str, namespace: &str) -> Result<String> {
+        match self {
+            Memory::Local(l) => l.log_runbook(title, steps, namespace),
+            #[cfg(feature = "client")]
+            Memory::Remote(r) => r.log_runbook(title, steps, namespace),
+        }
+    }
+    pub fn log_convention(&self, title: &str, rule: &str, namespace: &str) -> Result<String> {
+        match self {
+            Memory::Local(l) => l.log_convention(title, rule, namespace),
+            #[cfg(feature = "client")]
+            Memory::Remote(r) => r.log_convention(title, rule, namespace),
         }
     }
 }
@@ -361,7 +495,7 @@ mod tests {
         for _ in 0..1000 {
             store.bump_signal("daimon://freq", now_ms()).unwrap();
         }
-        let m = Memory::for_test(store);
+        let m = LocalMemory::for_test(store);
         let hits = vec![
             ent("daimon://strong", "Strong"), // rank 0 (base 1.0)
             ent("daimon://h1", "h1"),

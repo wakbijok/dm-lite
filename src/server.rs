@@ -9,7 +9,7 @@
 //! SQLite, whose writes serialize anyway) that is correct and simple. A per-tenant Memory
 //! cache is a deliberate follow-on, not needed for correctness.
 
-use crate::tools::Memory;
+use crate::tools::{LocalMemory, Memory};
 use anyhow::Result;
 use axum::{
     extract::State,
@@ -208,7 +208,7 @@ fn with_tenant(
     st: &AppState,
     headers: &HeaderMap,
     client_err: bool,
-    f: impl FnOnce(&Memory) -> Result<serde_json::Value>,
+    f: impl FnOnce(&LocalMemory) -> Result<serde_json::Value>,
 ) -> ApiResp {
     let tenant = match tenant_of(st, headers) {
         Some(t) => t,
@@ -243,6 +243,10 @@ async fn recall_h(State(st): State<AppState>, headers: HeaderMap, Json(req): Jso
 
 async fn recent_h(State(st): State<AppState>, headers: HeaderMap, Json(req): Json<RecentReq>) -> ApiResp {
     with_tenant(&st, &headers, false, |m| Ok(json!(m.recent(req.limit.unwrap_or(10))?)))
+}
+
+async fn persona_h(State(st): State<AppState>, headers: HeaderMap) -> ApiResp {
+    with_tenant(&st, &headers, false, |m| Ok(json!(m.persona()?)))
 }
 
 async fn history_h(State(st): State<AppState>, headers: HeaderMap, Json(req): Json<HistoryReq>) -> ApiResp {
@@ -303,6 +307,7 @@ pub fn router(auth: Arc<dyn Authenticator>) -> Router {
         .route("/healthz", get(healthz))
         .route("/recall", post(recall_h))
         .route("/recent", post(recent_h))
+        .route("/persona", post(persona_h))
         .route("/history", post(history_h))
         .route("/forget", post(forget_h))
         .route("/remember", post(remember_h))

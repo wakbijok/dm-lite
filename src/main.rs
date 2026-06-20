@@ -3,6 +3,8 @@
 //! hooks. LanceDB + dense vectors layer in next behind the same trait.
 
 mod bootstrap;
+#[cfg(feature = "client")]
+mod client;
 mod config;
 mod embedder;
 mod entry;
@@ -292,9 +294,18 @@ fn wired(config_path: &std::path::Path, needle: &str) -> &'static str {
 }
 
 fn status() -> Result<()> {
+    println!("dmem {} - daimon-memory v2", env!("CARGO_PKG_VERSION"));
+    #[cfg(feature = "client")]
+    if let Some(link) = config::server_link() {
+        let m = Memory::open()?;
+        println!("mode   : remote client");
+        println!("server : {}", link.url);
+        println!("recall : {}", m.recall_mode());
+        return Ok(());
+    }
     let tenant = config::tenant();
     let db = config::db_path(&tenant)?;
-    println!("dmem {} - daimon-memory v2 (embedded)", env!("CARGO_PKG_VERSION"));
+    println!("mode   : embedded");
     println!("tenant : {}", tenant);
     println!("store  : {}", db.display());
     let m = Memory::open()?;
