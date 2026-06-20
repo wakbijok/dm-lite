@@ -62,7 +62,54 @@ pub fn run() -> Result<()> {
     }
     println!("\nwrote config to {}", path.display());
 
-    // 2. wire the agents you pick (hooks call this same binary, in whichever mode you chose)
+    // 2. name the AI and the user, then set up the default persona + governance (these are
+    //    aliases - the persona identity - separate from the tenant/account).
+    let agent_name: String = Input::with_theme(&theme)
+        .with_prompt("What should I call your AI?")
+        .default("Assistant".to_string())
+        .interact_text()?;
+    let user_name: String = Input::with_theme(&theme)
+        .with_prompt("And your name (who am I working with)?")
+        .allow_empty(true)
+        .interact_text()?;
+    let user_name = if user_name.trim().is_empty() { "you".to_string() } else { user_name.trim().to_string() };
+
+    if Confirm::with_theme(&theme)
+        .with_prompt("Set up the default persona and governance now?")
+        .default(true)
+        .interact()?
+    {
+        match crate::tools::Memory::open() {
+            Ok(m) => {
+                let persona_body = format!(
+                    "I am {agent_name}, {user_name}'s collaborative partner. We share one memory \
+                     across the tools {user_name} uses; it is our work, so I say \"we\".\n\n\
+                     ## Voice\nDirect, concise, technical. I challenge a weak plan, then commit.\n\n\
+                     ## What I do not do\nFiller openers, hedging when I know the answer, inventing \
+                     past context.\n\n## Boundaries\nNever read or exfiltrate secrets; persist durable \
+                     memory only through this system."
+                );
+                let title = format!("{agent_name} for {user_name}");
+                match m.import_record(crate::entry::Kind::Persona, "agent/persona", &title, &persona_body) {
+                    Ok(_) => println!("  persona set: {agent_name} working with {user_name}"),
+                    Err(e) => eprintln!("  persona not set ({e:#})"),
+                }
+                for tpl in [
+                    include_str!("../templates/save-discipline.md"),
+                    include_str!("../templates/behavioral-discipline.md"),
+                ] {
+                    if let Ok((kind, ns, t, body)) = crate::entry::parse_frontmatter(tpl) {
+                        if m.import_record(kind, &ns, &t, &body).is_ok() {
+                            println!("  governance: {t}");
+                        }
+                    }
+                }
+            }
+            Err(e) => eprintln!("  could not open memory to set persona ({e:#})"),
+        }
+    }
+
+    // 3. wire the agents you pick (hooks call this same binary, in whichever mode you chose)
     let home = dirs::home_dir().ok_or_else(|| anyhow!("no home directory"))?;
     let devin_present = home.join(".config/devin").exists();
     let claude_present = home.join(".claude").exists();

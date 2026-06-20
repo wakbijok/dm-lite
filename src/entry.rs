@@ -139,6 +139,48 @@ pub fn make_uri(namespace: &str, kind: Kind, title: &str) -> String {
     format!("daimon://{}/{}/{}", namespace.trim_matches('/'), kind.as_str(), slug(title))
 }
 
+/// Parse a template markdown file with a YAML-ish frontmatter header into
+/// (kind, namespace, title, body). Only `kind`, `namespace`, `title` keys are read.
+pub fn parse_frontmatter(text: &str) -> Result<(Kind, String, String, String), String> {
+    let t = text.trim_start();
+    let rest = t.strip_prefix("---").ok_or("missing frontmatter (expected a leading ---)")?;
+    let end = rest.find("\n---").ok_or("unterminated frontmatter (expected a closing ---)")?;
+    let header = &rest[..end];
+    let body = rest[end + 4..].trim_start_matches(['\n', '\r']).to_string();
+
+    let mut kind: Option<Kind> = None;
+    let mut namespace = String::new();
+    let mut title = String::new();
+    for line in header.lines() {
+        if let Some((k, v)) = line.split_once(':') {
+            let val = v.trim().trim_matches('"').trim_matches('\'').to_string();
+            match k.trim() {
+                "kind" => kind = Kind::from_str(&val),
+                "namespace" => namespace = val,
+                "title" => title = val,
+                _ => {}
+            }
+        }
+    }
+    let kind = kind.ok_or("frontmatter `kind` is missing or not a known kind")?;
+    if title.trim().is_empty() {
+        return Err("frontmatter `title` is required".into());
+    }
+    if namespace.trim().is_empty() {
+        namespace = "resources/notes".into();
+    }
+    Ok((kind, namespace, title, body))
+}
+
+/// Default importance for an imported record by kind (persona/protocol rank highest).
+pub fn default_importance(kind: Kind) -> i64 {
+    match kind {
+        Kind::Persona | Kind::Protocol => 95,
+        Kind::Convention => 70,
+        _ => 60,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

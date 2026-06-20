@@ -327,6 +327,25 @@ async fn reminder_h(State(st): State<AppState>, headers: HeaderMap, Json(req): J
     })
 }
 
+#[derive(Deserialize)]
+struct ImportReq {
+    kind: String,
+    #[serde(default)]
+    namespace: String,
+    title: String,
+    #[serde(default)]
+    body: String,
+}
+
+async fn import_h(State(st): State<AppState>, headers: HeaderMap, Json(req): Json<ImportReq>) -> ApiResp {
+    with_tenant(&st, &headers, true, |m| {
+        let kind = crate::entry::Kind::from_str(&req.kind)
+            .ok_or_else(|| anyhow::anyhow!("unknown kind: {}", req.kind))?;
+        let ns = if req.namespace.is_empty() { "resources/notes" } else { &req.namespace };
+        Ok(json!({ "uri": m.import_record(kind, ns, &req.title, &req.body)? }))
+    })
+}
+
 // --- admin (IAM) routes: require the root admin token ---
 
 #[derive(Deserialize)]
@@ -394,6 +413,7 @@ pub fn router(auth: Arc<dyn Authenticator>) -> Router {
         .route("/log_runbook", post(runbook_h))
         .route("/log_convention", post(convention_h))
         .route("/add_reminder", post(reminder_h))
+        .route("/import", post(import_h))
         .route("/admin/tenant", post(admin_add_h))
         .route("/admin/tenants", get(admin_list_h))
         .route("/admin/revoke", post(admin_revoke_h))

@@ -29,6 +29,14 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use tools::Memory;
 
+/// The default template set, embedded so `dmem template export` is self-contained.
+const TPL_FILES: &[(&str, &str)] = &[
+    ("README.md", include_str!("../templates/README.md")),
+    ("persona.md", include_str!("../templates/persona.md")),
+    ("save-discipline.md", include_str!("../templates/save-discipline.md")),
+    ("behavioral-discipline.md", include_str!("../templates/behavioral-discipline.md")),
+];
+
 #[derive(Parser)]
 #[command(name = "dmem", version, about = "daimon-memory v2: small embedded typed memory with hybrid recall")]
 struct Cli {
@@ -144,6 +152,13 @@ enum Cmd {
         #[arg(long, default_value = "resources/conventions")]
         namespace: String,
     },
+    /// Import a template/markdown file (or a directory of them) as memory records.
+    Import {
+        path: String,
+    },
+    /// Template helpers (export the bundled defaults to edit).
+    #[command(subcommand)]
+    Template(TemplateCmd),
     /// Show store + wiring status.
     Status,
     /// Run as an MCP stdio server (recall + typed save tools for MCP-aware agents).
@@ -207,6 +222,13 @@ enum AdminCmd {
     Revoke { target: String },
     /// Suspend a tenant and revoke its tokens.
     Rm { tenant: String },
+}
+
+#[derive(Subcommand)]
+#[command(rename_all = "snake_case")]
+enum TemplateCmd {
+    /// Write the bundled default templates to a directory to edit.
+    Export { dir: String },
 }
 
 #[derive(Subcommand)]
@@ -322,6 +344,44 @@ fn run() -> Result<()> {
             } else {
                 println!("forgot {} ({} version{} retired, history kept)", uri, n, if n == 1 { "" } else { "s" });
             }
+            Ok(())
+        }
+        Cmd::Import { path } => {
+            let m = Memory::open()?;
+            let p = std::path::Path::new(&path);
+            let mut files: Vec<std::path::PathBuf> = if p.is_dir() {
+                std::fs::read_dir(p)?
+                    .filter_map(|e| e.ok().map(|e| e.path()))
+                    .filter(|f| f.extension().map(|x| x == "md").unwrap_or(false))
+                    .collect()
+            } else {
+                vec![p.to_path_buf()]
+            };
+            files.sort();
+            if files.is_empty() {
+                println!("no .md files at {}", p.display());
+                return Ok(());
+            }
+            for f in files {
+                let text = std::fs::read_to_string(&f)?;
+                match entry::parse_frontmatter(&text) {
+                    Ok((kind, ns, title, body)) => {
+                        let uri = m.import_record(kind, &ns, &title, &body)?;
+                        println!("imported {} ({}) -> {}", f.file_name().and_then(|n| n.to_str()).unwrap_or("?"), kind.as_str(), uri);
+                    }
+                    Err(e) => eprintln!("skip {}: {e}", f.display()),
+                }
+            }
+            Ok(())
+        }
+        Cmd::Template(TemplateCmd::Export { dir }) => {
+            let d = std::path::Path::new(&dir);
+            std::fs::create_dir_all(d)?;
+            for (name, content) in TPL_FILES {
+                std::fs::write(d.join(name), content)?;
+            }
+            println!("wrote {} templates to {}", TPL_FILES.len(), d.display());
+            println!("edit persona.md (fill the <PLACEHOLDERS>), then:  dmem import {}", d.display());
             Ok(())
         }
         Cmd::Status => status(),

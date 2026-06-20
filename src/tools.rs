@@ -168,6 +168,12 @@ impl LocalMemory {
         self.save(Kind::Convention, namespace, title, body, 65, vec!["convention".into()])
     }
 
+    /// Import a record of any kind from a template/file (the write path for persona/protocol).
+    pub fn import_record(&self, kind: Kind, namespace: &str, title: &str, body: &str) -> Result<String> {
+        require(title, "title")?;
+        self.save(kind, namespace, title, body.to_string(), crate::entry::default_importance(kind), vec![])
+    }
+
     /// Count of live records per kind (for `dm status`).
     pub fn counts(&self) -> Result<Vec<(String, usize)>> {
         let all = self.store.recent(1_000_000)?;
@@ -455,6 +461,13 @@ impl Memory {
             Memory::Local(l) => l.log_convention(title, rule, namespace),
             #[cfg(feature = "client")]
             Memory::Remote(r) => r.log_convention(title, rule, namespace),
+        }
+    }
+    pub fn import_record(&self, kind: Kind, namespace: &str, title: &str, body: &str) -> Result<String> {
+        match self {
+            Memory::Local(l) => l.import_record(kind, namespace, title, body),
+            #[cfg(feature = "client")]
+            Memory::Remote(r) => r.import_record(kind, namespace, title, body),
         }
     }
 }

@@ -4,7 +4,7 @@
 //! a specific CA. The server enforces tenant isolation; this client just carries the token.
 
 use crate::config::ServerLink;
-use crate::entry::Entry;
+use crate::entry::{Entry, Kind};
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
 
@@ -153,6 +153,12 @@ impl RemoteClient {
     }
     pub fn log_convention(&self, title: &str, rule: &str, namespace: &str) -> Result<String> {
         self.uri_of("/log_convention", json!({ "title": title, "rule": rule, "namespace": namespace }))
+    }
+    pub fn import_record(&self, kind: Kind, namespace: &str, title: &str, body: &str) -> Result<String> {
+        self.uri_of(
+            "/import",
+            json!({ "kind": kind.as_str(), "namespace": namespace, "title": title, "body": body }),
+        )
     }
 }
 
