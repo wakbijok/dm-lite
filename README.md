@@ -89,21 +89,48 @@ curl -sk -X POST https://localhost:8077/recall \
   -d '{"query":"vector store","limit":5}'
 ```
 
-Routes: `POST /recall`, `/recent`, `/history`, `/forget`, `/remember`, `/log_decision`, `/log_lesson`, `/log_incident`, `/log_runbook`, `/log_convention`, `/add_reminder`, `/persona`, and an open `GET /healthz`. Each tenant gets its own database file.
+Each tenant gets its own database file. Routes mirror the local tools: `POST /recall /recent /history /forget /remember /log_decision /log_lesson /log_incident /log_runbook /log_convention /add_reminder /import /persona`, plus admin routes and an open `GET /healthz`.
+
+## Multitenant admin (token-only, no passwords)
+
+On first start the server generates a **root admin token** (no tenant, no memory), prints it once, and writes it to `<data>/admin.token` (0600). The admin creates tenants and issues one-time tokens; each token isolates one tenant's memory.
+
+```bash
+# admin wires the admin token once, then manages tenants
+dmem login https://server:8077 <admin-token>
+dmem admin add acme --label laptop     # creates the silo + prints a one-time member token
+dmem admin list
+dmem admin revoke <token|tenant>
+dmem admin rm <tenant>
+```
+
+The admin hands the member token to the user. There are no passwords: the token is the credential and the isolation key. A lost token is revoked and reissued. `DM_TOKEN_<tenant>` env vars still work as a quick static fallback.
 
 ## Connect to a server (remote client)
 
-Point this dmem (CLI and the agent hooks) at a remote server. Run `dmem setup` and choose "connect to a memory server", or write `~/.config/dmem/config.toml`:
+The user installs their token and is done:
 
-```toml
-[server]
-url   = "https://memory.myhost.tld:8077"
-token = "<secret>"
-# insecure = true          # accept a self-signed cert, OR:
-# ca_cert  = "/path/cert.pem"   # trust a specific cert/CA
+```bash
+dmem login https://server:8077 <token>        # --insecure or --ca-cert <pem> for self-signed
+dmem recall "..."                              # now served by the remote, in the user's tenant
+dmem logout                                    # disconnect
 ```
 
-With that in place, `dmem recall` / `dmem remember` and the hooks all talk to the server over TLS with your token, instead of local memory. `dmem status` shows the connection.
+`dmem login` writes `~/.config/dmem/config.toml` (`[server]` block, 0600). From then on the CLI and the agent hooks all talk to the server over TLS with that token instead of local memory. `dmem status` shows the connection. `dmem setup` can do this interactively.
+
+## Persona and governance
+
+The agent's identity and capture rules live in memory (injected each session), not in dotfiles.
+
+```bash
+dmem template export ~/dmem-templates   # persona skeleton + two generic governance protocols
+# edit persona.md (fill the <PLACEHOLDERS>)
+dmem import ~/dmem-templates/           # load them as records
+```
+
+`dmem setup` also asks your AI's name and your name and sets a default persona plus the generic governance for you. Nothing personal ships in the binary; the templates are blank skeletons.
+
+## Keep it updated
 
 ## Keep it updated
 
