@@ -14,6 +14,8 @@ mod store;
 mod tools;
 #[cfg(feature = "server")]
 mod server;
+#[cfg(feature = "wizard")]
+mod setup;
 #[cfg(feature = "self-update")]
 mod upgrade;
 #[cfg(feature = "zvec")]
@@ -33,6 +35,9 @@ struct Cli {
 #[derive(Subcommand)]
 #[command(rename_all = "snake_case")]
 enum Cmd {
+    /// Interactive first-run setup: detect agents, wire hooks, seed memory. Needs --features wizard.
+    #[cfg(feature = "wizard")]
+    Setup,
     /// Detect agents and install dm's lifecycle hooks (Devin, Claude Code).
     Bootstrap {
         #[arg(long)]
@@ -175,6 +180,8 @@ fn main() {
 fn run() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
+        #[cfg(feature = "wizard")]
+        Cmd::Setup => setup::run(),
         Cmd::Bootstrap { devin, claude, all } => {
             bootstrap::run(devin || all, claude || all)
         }
