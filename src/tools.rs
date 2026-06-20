@@ -26,6 +26,20 @@ fn make_embedder() -> Box<dyn crate::embedder::Embedder> {
             Err(err) => eprintln!("dmem: fastembed model unavailable ({err:#}); using placeholder embedder"),
         }
     }
+    #[cfg(all(feature = "candle", not(feature = "fastembed")))]
+    {
+        match crate::embedder::CandleEmbedder::new() {
+            Ok(e) => return Box::new(e),
+            Err(err) => eprintln!("dmem: candle model unavailable ({err:#}); using placeholder embedder"),
+        }
+    }
+    #[cfg(all(feature = "model2vec", not(feature = "fastembed"), not(feature = "candle")))]
+    {
+        match crate::embedder::Model2VecEmbedder::new() {
+            Ok(e) => return Box::new(e),
+            Err(err) => eprintln!("dmem: model2vec model unavailable ({err:#}); using placeholder embedder"),
+        }
+    }
     Box::new(crate::embedder::HashEmbedder::new())
 }
 

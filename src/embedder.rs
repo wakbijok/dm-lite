@@ -10,9 +10,9 @@
 
 /// Embedding dimension. Tied to the active model so the zvec collection schema matches:
 /// bge-small-en-v1.5 is 384-d; the placeholder uses 256.
-#[cfg(feature = "fastembed")]
+#[cfg(any(feature = "fastembed", feature = "candle"))]
 pub const DIM: usize = 384;
-#[cfg(not(feature = "fastembed"))]
+#[cfg(not(any(feature = "fastembed", feature = "candle")))]
 pub const DIM: usize = 256;
 
 pub trait Embedder {
@@ -93,6 +93,108 @@ impl Embedder for FastEmbedder {
             Ok(mut v) => v.pop().unwrap_or_else(|| vec![0.0; DIM]),
             Err(e) => {
                 eprintln!("dmem: fastembed embed failed: {e:?}");
+                vec![0.0; DIM]
+            }
+        }
+    }
+}
+
+/// Tiny STATIC embedder: a Model2Vec token->vector table (NO neural net, NO ONNX runtime).
+/// Loaded via model2vec-rs from a `.safetensors` model; embedding is tokenize + mean-pool
+/// lookup over `ndarray`. The model id is overridable via `DM_M2V_MODEL` so we can benchmark
+/// variants (potion-base-8M, retrieval, multilingual) without recompiling. Output is
+/// L2-normalized (normalize=true) so dot product == cosine, matching the recall fusion.
+#[cfg(feature = "model2vec")]
+pub struct Model2VecEmbedder {
+    model: model2vec_rs::model::StaticModel,
+}
+
+#[cfg(feature = "model2vec")]
+impl Model2VecEmbedder {
+    pub fn new() -> anyhow::Result<Self> {
+        let repo = std::env::var("DM_M2V_MODEL").unwrap_or_else(|_| "minishlab/potion-base-8M".to_string());
+        let model = model2vec_rs::model::StaticModel::from_pretrained(repo.as_str(), None, Some(true), None)
+            .map_err(|e| anyhow::anyhow!("model2vec load {repo}: {e:#}"))?;
+        Ok(Self { model })
+    }
+}
+
+#[cfg(feature = "model2vec")]
+impl Embedder for Model2VecEmbedder {
+    fn dim(&self) -> usize {
+        DIM
+    }
+    fn embed(&self, text: &str) -> Vec<f32> {
+        let mut v = self.model.encode_single(text);
+        // Benchmark guard: a model whose native dim != DIM still measures RAM correctly; for the
+        // chosen end-to-end model (potion-base-8M = 256-d = DIM) the dims match and this is a no-op.
+        if v.len() != DIM {
+            v.resize(DIM, 0.0);
+        }
+        v
+    }
+}
+
+/// Same model as FastEmbedder (bge-small-en-v1.5, 384-d) but run on **Candle** (pure-Rust ML),
+/// NOT ONNX Runtime. Identical weights -> identical accuracy; the point is dropping the heavy
+/// ONNX C++ runtime to cut RAM while keeping a real transformer. CLS pooling + L2 normalize
+/// (bge's documented pooling). Model id overridable via DM_CANDLE_MODEL for benchmarking.
+#[cfg(feature = "candle")]
+pub struct CandleEmbedder {
+    model: candle_transformers::models::bert::BertModel,
+    tokenizer: tokenizers::Tokenizer,
+    device: candle_core::Device,
+}
+
+#[cfg(feature = "candle")]
+impl CandleEmbedder {
+    pub fn new() -> anyhow::Result<Self> {
+        use candle_nn::VarBuilder;
+        use candle_transformers::models::bert::{BertModel, Config, DTYPE};
+        use hf_hub::api::sync::Api;
+        let repo = std::env::var("DM_CANDLE_MODEL").unwrap_or_else(|_| "BAAI/bge-small-en-v1.5".to_string());
+        let r = Api::new()?.model(repo);
+        let config: Config = serde_json::from_str(&std::fs::read_to_string(r.get("config.json")?)?)?;
+        let tokenizer = tokenizers::Tokenizer::from_file(r.get("tokenizer.json")?)
+            .map_err(|e| anyhow::anyhow!("tokenizer: {e}"))?;
+        let device = candle_core::Device::Cpu;
+        let weights = r.get("model.safetensors")?;
+        // DM_CANDLE_F16=1 loads weights as f16 (half the model RAM). from_mmaped keeps the file's
+        // f32 bytes zero-copy, so we load buffered and convert to the target dtype instead.
+        let dtype = if std::env::var("DM_CANDLE_F16").is_ok() { candle_core::DType::F16 } else { DTYPE };
+        let vb = if dtype == DTYPE {
+            unsafe { VarBuilder::from_mmaped_safetensors(&[weights], DTYPE, &device)? }
+        } else {
+            let bytes = std::fs::read(&weights)?;
+            VarBuilder::from_buffered_safetensors(bytes, dtype, &device)?
+        };
+        let model = BertModel::load(vb, &config)?;
+        Ok(Self { model, tokenizer, device })
+    }
+
+    fn embed_inner(&self, text: &str) -> anyhow::Result<Vec<f32>> {
+        use candle_core::{IndexOp, Tensor};
+        let enc = self.tokenizer.encode(text, true).map_err(|e| anyhow::anyhow!("encode: {e}"))?;
+        let ids = Tensor::new(enc.get_ids(), &self.device)?.unsqueeze(0)?;
+        let type_ids = ids.zeros_like()?;
+        let mask = Tensor::new(enc.get_attention_mask(), &self.device)?.unsqueeze(0)?;
+        let out = self.model.forward(&ids, &type_ids, Some(&mask))?; // [1, seq, hidden]
+        let cls: Vec<f32> = out.i((0, 0))?.to_vec1()?; // CLS token
+        let norm = cls.iter().map(|x| x * x).sum::<f32>().sqrt();
+        Ok(if norm > 0.0 { cls.iter().map(|x| x / norm).collect() } else { cls })
+    }
+}
+
+#[cfg(feature = "candle")]
+impl Embedder for CandleEmbedder {
+    fn dim(&self) -> usize {
+        DIM
+    }
+    fn embed(&self, text: &str) -> Vec<f32> {
+        match self.embed_inner(text) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("dmem: candle embed failed: {e:?}");
                 vec![0.0; DIM]
             }
         }
