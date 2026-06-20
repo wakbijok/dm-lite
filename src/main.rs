@@ -352,29 +352,43 @@ fn run() -> Result<()> {
         Cmd::Import { path } => {
             let m = Memory::open()?;
             let p = std::path::Path::new(&path);
-            let mut files: Vec<std::path::PathBuf> = if p.is_dir() {
-                std::fs::read_dir(p)?
-                    .filter_map(|e| e.ok().map(|e| e.path()))
-                    .filter(|f| f.extension().map(|x| x == "md").unwrap_or(false))
-                    .collect()
+            let (root, mut files) = if p.is_dir() {
+                let mut v = Vec::new();
+                collect_md(p, &mut v)?;
+                (p.to_path_buf(), v)
             } else {
-                vec![p.to_path_buf()]
+                (p.parent().map(|x| x.to_path_buf()).unwrap_or_default(), vec![p.to_path_buf()])
             };
             files.sort();
             if files.is_empty() {
                 println!("no .md files at {}", p.display());
                 return Ok(());
             }
-            for f in files {
-                let text = std::fs::read_to_string(&f)?;
-                match entry::parse_frontmatter(&text) {
-                    Ok((kind, ns, title, body)) => {
-                        let uri = m.import_record(kind, &ns, &title, &body)?;
+            let (mut ok, mut skipped) = (0usize, 0usize);
+            for f in &files {
+                let text = match std::fs::read_to_string(f) {
+                    Ok(t) => t,
+                    Err(_) => { skipped += 1; continue; }
+                };
+                // our templates carry frontmatter; arbitrary markdown (an Obsidian vault) does
+                // not, so fall back to inferring kind/namespace/title from the file.
+                let (kind, ns, title, body) = match entry::parse_frontmatter(&text) {
+                    Ok(r) => r,
+                    Err(_) => infer_record(&root, f, &text),
+                };
+                if title.trim().is_empty() {
+                    skipped += 1;
+                    continue;
+                }
+                match m.import_record(kind, &ns, &title, &body) {
+                    Ok(uri) => {
+                        ok += 1;
                         println!("imported {} ({}) -> {}", f.file_name().and_then(|n| n.to_str()).unwrap_or("?"), kind.as_str(), uri);
                     }
-                    Err(e) => eprintln!("skip {}: {e}", f.display()),
+                    Err(e) => { skipped += 1; eprintln!("skip {}: {e}", f.display()); }
                 }
             }
+            println!("imported {ok}, skipped {skipped}");
             Ok(())
         }
         Cmd::Template(TemplateCmd::Export { dir }) => {
@@ -434,6 +448,46 @@ fn run() -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// Recursively collect `.md` files under `dir`, skipping hidden dirs (e.g. `.obsidian`).
+fn collect_md(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) -> Result<()> {
+    for e in std::fs::read_dir(dir)? {
+        let p = e?.path();
+        if p.is_dir() {
+            let hidden = p.file_name().and_then(|n| n.to_str()).map(|n| n.starts_with('.')).unwrap_or(false);
+            if !hidden {
+                collect_md(&p, out)?;
+            }
+        } else if p.extension().map(|x| x == "md").unwrap_or(false) {
+            out.push(p);
+        }
+    }
+    Ok(())
+}
+
+/// Infer a record from a plain markdown file (no frontmatter): title from the first `# H1`
+/// (else the filename), namespace from the folder path under `root`, kind defaults to memory.
+fn infer_record(root: &std::path::Path, file: &std::path::Path, content: &str) -> (entry::Kind, String, String, String) {
+    let title = content
+        .lines()
+        .find_map(|l| l.strip_prefix("# ").map(|s| s.trim().to_string()))
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| file.file_stem().and_then(|s| s.to_str()).unwrap_or("untitled").to_string());
+    let folders = file
+        .strip_prefix(root)
+        .ok()
+        .and_then(|p| p.parent())
+        .map(|p| p.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_default();
+    let folders = folders
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_lowercase().replace(' ', "-"))
+        .collect::<Vec<_>>()
+        .join("/");
+    let ns = if folders.is_empty() { "resources/notes".to_string() } else { format!("resources/{folders}") };
+    (entry::Kind::Memory, ns, title, content.to_string())
 }
 
 fn wired(config_path: &std::path::Path, needle: &str) -> &'static str {
