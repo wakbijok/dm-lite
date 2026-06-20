@@ -102,6 +102,10 @@ enum Cmd {
         #[arg(long, default_value_t = 20)]
         limit: usize,
     },
+    /// Retract a record by uri: drop it from recall, keep its history.
+    Forget {
+        uri: String,
+    },
     /// Save a typed Reminder.
     AddReminder {
         #[arg(long)]
@@ -243,6 +247,15 @@ fn run() -> Result<()> {
         Cmd::LogConvention { title, rule, namespace } => {
             let uri = Memory::open()?.log_convention(&title, &rule, &namespace)?;
             println!("stored {}", uri);
+            Ok(())
+        }
+        Cmd::Forget { uri } => {
+            let n = Memory::open()?.forget(&uri)?;
+            if n == 0 {
+                println!("nothing to forget for {}", uri);
+            } else {
+                println!("forgot {} ({} version{} retired, history kept)", uri, n, if n == 1 { "" } else { "s" });
+            }
             Ok(())
         }
         Cmd::Status => status(),

@@ -277,6 +277,17 @@ impl Memory {
         self.store.history(uri, limit)
     }
 
+    /// Retract a uri: drop it from recall (close current version, keep lineage) and remove
+    /// its vector. Returns how many current versions were closed.
+    pub fn forget(&self, uri: &str) -> Result<usize> {
+        let n = self.store.forget(uri)?;
+        #[cfg(feature = "zvec")]
+        if let Some(vindex) = &self.vindex {
+            let _ = vindex.remove(uri); // best-effort; source-of-truth is the SQLite close
+        }
+        Ok(n)
+    }
+
     /// Which recall path is active (truthful: reflects whether zvec actually loaded).
     pub fn recall_mode(&self) -> &'static str {
         #[cfg(feature = "zvec")]

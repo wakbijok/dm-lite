@@ -81,6 +81,12 @@ impl ZvecIndex {
         Ok(())
     }
 
+    /// Remove the vector for a uri (used by forget). Best-effort idempotent.
+    pub fn remove(&self, uri: &str) -> Result<()> {
+        self.collection.delete(&[pk_for(uri).as_str()]).map_err(ze)?;
+        Ok(())
+    }
+
     /// Nearest uris to the query vector, best first (reads the real uri from the field).
     pub fn search(&self, vector: &[f32], k: usize) -> Result<Vec<String>> {
         let q = SearchQuery::builder()

@@ -27,4 +27,8 @@ pub trait MemoryStore {
 
     /// All recorded versions of a uri, newest system-time first (full append-only lineage).
     fn history(&self, uri: &str, limit: usize) -> Result<Vec<Entry>>;
+
+    /// Retract a uri: close its current version(s) in system time so it drops out of recall,
+    /// keeping the lineage (append-only, never hard-deleted). Returns how many were closed.
+    fn forget(&self, uri: &str) -> Result<usize>;
 }

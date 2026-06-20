@@ -45,6 +45,13 @@ fn tool_schemas() -> Value {
                 "text":{"type":"string"},
                 "namespace":{"type":"string"}
             },"required":["title","text"]}
+        },
+        {
+            "name": "forget",
+            "description": "Retract a record by its daimon:// uri (drops it from recall, keeps history).",
+            "inputSchema": {"type":"object","properties":{
+                "uri":{"type":"string"}
+            },"required":["uri"]}
         }
     ])
 }
@@ -84,6 +91,10 @@ fn call_tool(mem: &Memory, name: &str, args: &Value) -> std::result::Result<Stri
             let ns = if s(args, "namespace").is_empty() { "agent/reminders" } else { s(args, "namespace") };
             let uri = mem.add_reminder(s(args, "title"), s(args, "text"), ns).map_err(|e| e.to_string())?;
             Ok(format!("stored {}", uri))
+        }
+        "forget" => {
+            let n = mem.forget(s(args, "uri")).map_err(|e| e.to_string())?;
+            Ok(if n == 0 { "nothing to forget".into() } else { format!("forgot {} ({} retired)", s(args, "uri"), n) })
         }
         other => Err(format!("unknown tool: {}", other)),
     }

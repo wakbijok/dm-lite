@@ -330,6 +330,23 @@ impl MemoryStore for SqliteStore {
             .collect();
         Ok(rows)
     }
+
+    fn forget(&self, uri: &str) -> Result<usize> {
+        let now = crate::entry::now_ms();
+        let tx = self.conn.unchecked_transaction()?;
+        let mut sel = tx.prepare("SELECT id FROM entries WHERE uri=?1 AND system_to_ms IS NULL")?;
+        let ids: Vec<i64> = sel
+            .query_map(params![uri], |r| r.get::<_, i64>(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+        drop(sel);
+        for id in &ids {
+            tx.execute("UPDATE entries SET system_to_ms=?1 WHERE id=?2", params![now, id])?;
+            tx.execute("DELETE FROM entries_fts WHERE idref=?1", params![id])?;
+        }
+        tx.commit()?;
+        Ok(ids.len())
+    }
 }
 
 #[cfg(test)]
@@ -410,6 +427,22 @@ mod tests {
         let hits = s.recall("alpha", 1).unwrap();
         assert_eq!(hits.len(), 1, "limit 1 must return a LIVE row, not be spent on the expired one");
         assert_eq!(hits[0].uri, live.uri);
+    }
+
+    #[test]
+    fn forget_drops_from_recall_but_keeps_history() {
+        let s = mem_store();
+        let e = mk(Kind::Memory, "ns", "secret note", "alpha bravo charlie");
+        s.put(&e).unwrap();
+        assert_eq!(s.recall("alpha", 5).unwrap().len(), 1);
+        // forget closes the current version
+        assert_eq!(s.forget(&e.uri).unwrap(), 1);
+        assert!(s.recall("alpha", 5).unwrap().is_empty(), "forgotten record is gone from recall");
+        assert!(s.recent(5).unwrap().is_empty(), "and from recent");
+        // but the lineage is retained (append-only)
+        assert_eq!(s.history(&e.uri, 5).unwrap().len(), 1, "history still holds the closed version");
+        // forgetting again is a no-op (nothing current)
+        assert_eq!(s.forget(&e.uri).unwrap(), 0);
     }
 
     #[test]
