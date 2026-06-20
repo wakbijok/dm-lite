@@ -15,6 +15,21 @@ dmem status
 
 On Windows: unzip, drop `dmem.exe` and `zvec_c_api.dll` in the same folder, add it to PATH.
 
+## First run
+
+The download is not code signed, so the OS flags it once:
+
+- macOS: clear the quarantine flag, `xattr -dr com.apple.quarantine ~/.local/bin/dmem ~/.local/bin/libzvec_c_api.dylib`
+- Windows: SmartScreen may warn; pick "More info", then "Run anyway"
+
+Then let the wizard set you up:
+
+```bash
+dmem setup
+```
+
+It detects your agents (Devin, Claude), wires the hooks you pick, and seeds a first memory.
+
 ## Save and recall
 
 ```bash
@@ -25,6 +40,7 @@ dmem add_reminder --title "ship rc"     --text "tag the release candidate"
 
 dmem recall "vector store decision"
 dmem recent
+dmem forget "daimon://resources/notes/memory/..."   # retract a record (keeps its history)
 ```
 
 Recall fuses keyword (SQLite FTS5) and dense vector (zvec with bge-small embeddings), ranked together. The release binaries ship both; a plain source build does keyword recall only.
@@ -72,14 +88,23 @@ curl -s -X POST localhost:8077/recall \
 
 Routes: `POST /recall`, `/remember`, `/log_decision`, `/add_reminder`, and an open `GET /healthz`. Each tenant gets its own database file.
 
+## Keep it updated
+
+```bash
+dmem upgrade           # latest stable release
+dmem upgrade --pre     # include release candidates (rc/beta)
+```
+
+It replaces the binary in place. Your data lives in a separate directory and is never touched; the schema migrates forward on the next run.
+
 ## Build from source
 
 ```bash
 cargo build --release                             # pure Rust, keyword recall, no models
 cargo build --release --features zvec,fastembed   # add dense vector plus bge-small semantics
-cargo build --release --features server           # add the HTTP server
+cargo build --release --features dist             # the full release binary (all of the below)
 ```
 
-The default build is offline and light. `zvec` adds the dense vector store (downloads a prebuilt native lib). `fastembed` adds real bge-small embeddings (downloads the model once). `server` adds the axum HTTP API.
+The default build is offline and light. `zvec` adds the dense vector store (downloads a prebuilt native lib). `fastembed` adds real bge-small embeddings (downloads the model once). `server` adds the axum HTTP API. `wizard` adds `dmem setup`. `self-update` adds `dmem upgrade`. `dist` bundles all of them, which is what the release binaries ship.
 
 License: MIT.

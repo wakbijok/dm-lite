@@ -41,9 +41,9 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
-      # full distribution binary: vector store + real embeddings + server mode
-      - name: Build (zvec + fastembed + server)
-        run: cargo build --release --features zvec,fastembed,server --target ${{ matrix.target }}
+      # full distribution binary: vector store + embeddings + server + wizard + self-update
+      - name: Build (dist)
+        run: cargo build --release --features dist --target ${{ matrix.target }}
 
       - name: Stage artifact (binary + native libs)
         shell: bash
