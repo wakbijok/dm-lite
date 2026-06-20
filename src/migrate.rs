@@ -75,8 +75,14 @@ fn namespace_of(r: &Value) -> String {
     "resources/notes".to_string()
 }
 
-/// Map one export record -> (kind, namespace, title, body, created_ms). None if unusable.
-fn map_record(r: &Value) -> Option<(Kind, String, String, String, i64)> {
+/// Original importance if the export carries one (0..=100), so migration preserves ranking
+/// weight instead of resetting to the kind default.
+fn importance_of(r: &Value) -> Option<i64> {
+    r.get("importance").and_then(|v| v.as_i64()).filter(|n| (0..=100).contains(n))
+}
+
+/// Map one export record -> (kind, namespace, title, body, created_ms, importance). None if unusable.
+fn map_record(r: &Value) -> Option<(Kind, String, String, String, i64, Option<i64>)> {
     let kind = map_kind(str_field(r, &["record_type", "kind", "type"]).unwrap_or("memory"));
     let ns = namespace_of(r);
     let body = str_field(r, &["body", "text", "content", "markdown", "abstract"])
@@ -88,7 +94,7 @@ fn map_record(r: &Value) -> Option<(Kind, String, String, String, i64)> {
     if title.trim().is_empty() {
         return None;
     }
-    Some((kind, ns, title, body, created_ms(r)))
+    Some((kind, ns, title, body, created_ms(r), importance_of(r)))
 }
 
 /// Import every JSONL line into `m`. Returns (imported, skipped).
@@ -104,7 +110,7 @@ pub fn import_jsonl(m: &Memory, text: &str) -> (usize, usize) {
             continue;
         };
         match map_record(&r) {
-            Some((kind, ns, title, body, created)) => match m.import_record_at(kind, &ns, &title, &body, created) {
+            Some((kind, ns, title, body, created, importance)) => match m.import_record_at(kind, &ns, &title, &body, created, importance) {
                 Ok(_) => ok += 1,
                 Err(_) => skip += 1,
             },
@@ -166,12 +172,13 @@ mod tests {
                 "created_at":"2026-06-14T09:30:00Z","importance":75}"#,
         )
         .unwrap();
-        let (kind, ns, title, body, created) = map_record(&r).unwrap();
+        let (kind, ns, title, body, created, importance) = map_record(&r).unwrap();
         assert_eq!(kind, Kind::AgentLesson); // agent_lesson -> AgentLesson (1:1 with v1)
         assert_eq!(ns, "resources/homelab");
         assert_eq!(title, "Ceph re-adoption");
         assert!(body.contains("auto re-adopt"));
         assert!(created > 1_780_000_000_000, "created_at parsed to epoch-ms: {created}");
+        assert_eq!(importance, Some(75)); // original importance preserved, not reset to kind default
     }
 
     #[test]
@@ -182,10 +189,11 @@ mod tests {
                 "text":"strip-and-rebuild scripts destroy finalized docs"}"#,
         )
         .unwrap();
-        let (kind, ns, title, _b, _c) = map_record(&r).unwrap();
+        let (kind, ns, title, _b, _c, importance) = map_record(&r).unwrap();
         assert_eq!(kind, Kind::KnownFailureMode); // 1:1, no longer flattened to Memory
         assert_eq!(ns, "resources/inpres");
         assert!(title.starts_with("strip-and-rebuild")); // title inferred from body
+        assert_eq!(importance, None); // no importance field -> fall back to kind default at write time
 
         // a genuinely unknown future kind still falls back to Memory, never dropped
         let r2: Value = serde_json::from_str(r#"{"record_type":"some_future_kind","title":"x","body":"y"}"#).unwrap();

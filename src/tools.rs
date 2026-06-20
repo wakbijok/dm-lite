@@ -120,7 +120,7 @@ impl LocalMemory {
 
     /// Import a record preserving its ORIGINAL creation/valid time (for v1->v2 migration).
     /// System time stays "now" (when we recorded it); valid/created time is the original.
-    pub fn import_record_at(&self, kind: Kind, namespace: &str, title: &str, body: &str, created_ms: i64) -> Result<String> {
+    pub fn import_record_at(&self, kind: Kind, namespace: &str, title: &str, body: &str, created_ms: i64, importance: Option<i64>) -> Result<String> {
         require(title, "title")?;
         let uri = make_uri(namespace, kind, title);
         let mut e = Entry::new_now(
@@ -130,7 +130,7 @@ impl LocalMemory {
             title.to_string(),
             body.to_string(),
             vec![],
-            crate::entry::default_importance(kind),
+            importance.unwrap_or_else(|| crate::entry::default_importance(kind)),
             uri.clone(),
         );
         if created_ms > 0 {
@@ -497,11 +497,11 @@ impl Memory {
             Memory::Remote(r) => r.import_record(kind, namespace, title, body),
         }
     }
-    pub fn import_record_at(&self, kind: Kind, namespace: &str, title: &str, body: &str, created_ms: i64) -> Result<String> {
+    pub fn import_record_at(&self, kind: Kind, namespace: &str, title: &str, body: &str, created_ms: i64, importance: Option<i64>) -> Result<String> {
         match self {
-            Memory::Local(l) => l.import_record_at(kind, namespace, title, body, created_ms),
+            Memory::Local(l) => l.import_record_at(kind, namespace, title, body, created_ms, importance),
             #[cfg(feature = "client")]
-            Memory::Remote(r) => r.import_record_at(kind, namespace, title, body, created_ms),
+            Memory::Remote(r) => r.import_record_at(kind, namespace, title, body, created_ms, importance),
         }
     }
 }

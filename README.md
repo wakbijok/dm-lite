@@ -141,7 +141,7 @@ dmem migrate --file export.jsonl          # or - for stdin
 dmem import ~/vault/                       # folder -> namespace, # H1 / filename -> title
 ```
 
-`migrate` carries each v1 record across 1:1 (dm-lite's kinds match v1 exactly) and keeps its creation time as the record's valid-time. `import` walks the tree, uses frontmatter when present and infers otherwise.
+`migrate` carries each v1 record across 1:1 (dm-lite's kinds match v1 exactly) and preserves its original creation time (as valid-time) and importance. `import` walks the tree, uses frontmatter when present and infers otherwise.
 
 ## Keep it updated
 
