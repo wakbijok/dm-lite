@@ -59,15 +59,19 @@ fn install_into(config_path: &Path, dm: &str, remove: bool) -> Result<()> {
     }
     let hooks_obj = hooks.as_object_mut().unwrap();
 
-    let events = [
-        ("SessionStart", hook_entry(dm, "hook session_start", 10)),
-        ("UserPromptSubmit", hook_entry(dm, "hook user_prompt_submit", 8)),
-        ("SessionEnd", hook_entry(dm, "hook session_end", 8)),
+    // SessionEnd is intentionally NOT installed: Claude Code forbids context injection on
+    // SessionEnd, so the save nudge rides UserPromptSubmit (see hooks.rs). It is still listed
+    // here (with None) so a stale SessionEnd hook from an older dmem version is cleaned on
+    // re-bootstrap.
+    let events: [(&str, Option<Value>); 3] = [
+        ("SessionStart", Some(hook_entry(dm, "hook session_start", 10))),
+        ("UserPromptSubmit", Some(hook_entry(dm, "hook user_prompt_submit", 8))),
+        ("SessionEnd", None),
     ];
-    for (event, our_entry) in events {
+    for (event, our_entry) in &events {
         // keep existing entries that are not ours (command does not reference the dm binary)
         let mut kept: Vec<Value> = hooks_obj
-            .get(event)
+            .get(*event)
             .and_then(|v| v.as_array())
             .map(|arr| {
                 arr.iter()
@@ -84,12 +88,14 @@ fn install_into(config_path: &Path, dm: &str, remove: bool) -> Result<()> {
             })
             .unwrap_or_default();
         if !remove {
-            kept.extend(our_entry.as_array().unwrap().iter().cloned());
+            if let Some(e) = our_entry {
+                kept.extend(e.as_array().unwrap().iter().cloned());
+            }
         }
         if kept.is_empty() {
-            hooks_obj.remove(event);
+            hooks_obj.remove(*event);
         } else {
-            hooks_obj.insert(event.to_string(), Value::Array(kept));
+            hooks_obj.insert((*event).to_string(), Value::Array(kept));
         }
     }
 
@@ -139,7 +145,7 @@ pub fn run_mode(devin: bool, claude: bool, remove: bool) -> Result<()> {
     if remove {
         println!("Done. dmem hooks removed (the agent's other hooks/plugins are untouched).");
     } else {
-        println!("Done. dmem is wired in (SessionStart -> persona/recent, UserPromptSubmit -> recall, SessionEnd -> save nudge).");
+        println!("Done. dmem is wired in (SessionStart -> persona/recent, UserPromptSubmit -> recall + save nudge).");
         println!("Undo any time with:  dmem bootstrap --remove --devin / --claude");
     }
     Ok(())
@@ -163,7 +169,9 @@ mod tests {
 
         install_into(&cfg, "/path/to/dmem", false).unwrap();
         let v: Value = serde_json::from_str(&std::fs::read_to_string(&cfg).unwrap()).unwrap();
-        assert!(v["hooks"]["SessionEnd"][0]["hooks"][0]["command"].as_str().unwrap().contains("hook session_end"));
+        // we install SessionStart + UserPromptSubmit; SessionEnd is intentionally NOT wired
+        assert!(v["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"].as_str().unwrap().contains("hook user_prompt_submit"));
+        assert!(v["hooks"].get("SessionEnd").is_none(), "SessionEnd must not be installed");
         // the unrelated hook + our hook both present
         assert_eq!(v["hooks"]["SessionStart"].as_array().unwrap().len(), 2);
 
@@ -178,5 +186,22 @@ mod tests {
         assert!(v3["hooks"].get("SessionEnd").is_none(), "dm-only event removed");
         assert_eq!(v3["hooks"]["SessionStart"].as_array().unwrap().len(), 1);
         assert_eq!(v3["hooks"]["SessionStart"][0]["hooks"][0]["command"], "/other/tool x");
+    }
+
+    #[test]
+    fn install_cleans_stale_session_end_from_older_versions() {
+        let dir = std::env::temp_dir().join(format!("dmboot2-{}-{}", std::process::id(), crate::entry::now_ms()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = dir.join("config.json");
+        // an older dmem wired a SessionEnd hook; a re-bootstrap must drop it (CC rejects it)
+        std::fs::write(
+            &cfg,
+            r#"{"hooks":{"SessionEnd":[{"matcher":"","hooks":[{"type":"command","command":"/path/to/dmem hook session_end","timeout":8}]}]}}"#,
+        )
+        .unwrap();
+        install_into(&cfg, "/path/to/dmem", false).unwrap();
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&cfg).unwrap()).unwrap();
+        assert!(v["hooks"].get("SessionEnd").is_none(), "stale dmem SessionEnd must be cleaned");
+        assert!(v["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"].as_str().unwrap().contains("hook user_prompt_submit"));
     }
 }

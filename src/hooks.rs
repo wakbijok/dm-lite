@@ -49,21 +49,17 @@ fn should_nudge(latest_save_ms: Option<i64>, now_ms: i64) -> bool {
     }
 }
 
-/// SessionEnd/Stop: surface a save-discipline nudge if this session's work looks uncaptured.
-/// Fail-open: on any error, or when there is nothing to nudge, emit nothing and proceed.
+/// SessionEnd: intentionally a no-op. Claude Code's SessionEnd schema forbids injecting
+/// context (the session is ending), so the save-discipline nudge rides UserPromptSubmit
+/// instead (see `user_prompt_submit`). Kept as a valid subcommand so any older wiring that
+/// still calls it exits cleanly with no output.
 pub fn session_end() -> Result<()> {
-    let m = match Memory::open() {
-        Ok(m) => m,
-        Err(_) => return Ok(()),
-    };
-    let latest = m.recent(1).ok().and_then(|v| v.first().map(|e| e.created_ms));
-    if should_nudge(latest, crate::entry::now_ms()) {
-        emit("SessionEnd", &render::render_nudge());
-    }
     Ok(())
 }
 
-/// UserPromptSubmit: recall relevant memory for the submitted prompt (from stdin, or arg).
+/// UserPromptSubmit: recall relevant memory for the submitted prompt (from stdin, or arg),
+/// and append a save-discipline nudge when this session's work looks uncaptured. Both ride
+/// one additionalContext payload (the only injection point both harnesses accept per turn).
 pub fn user_prompt_submit(arg: Option<String>) -> Result<()> {
     let prompt = arg
         .filter(|s| !s.trim().is_empty())
@@ -74,8 +70,17 @@ pub fn user_prompt_submit(arg: Option<String>) -> Result<()> {
         return Ok(());
     }
     let m = Memory::open()?;
-    let hits = m.recall(&prompt, 6).unwrap_or_default();
-    emit("UserPromptSubmit", &render::render_recall(&hits));
+    let mut blocks: Vec<String> = Vec::new();
+    let recall = render::render_recall(&m.recall(&prompt, 6).unwrap_or_default());
+    if !recall.trim().is_empty() {
+        blocks.push(recall);
+    }
+    // cadence backstop: if nothing has been saved recently, remind to capture durable work.
+    let latest = m.recent(1).ok().and_then(|v| v.first().map(|e| e.created_ms));
+    if should_nudge(latest, crate::entry::now_ms()) {
+        blocks.push(render::render_nudge());
+    }
+    emit("UserPromptSubmit", &blocks.join("\n"));
     Ok(())
 }
 
