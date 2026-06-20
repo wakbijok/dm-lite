@@ -145,8 +145,6 @@ dmem import ~/vault/                       # folder -> namespace, # H1 / filenam
 
 ## Keep it updated
 
-## Keep it updated
-
 ```bash
 dmem upgrade           # latest stable release
 dmem upgrade --pre     # include release candidates (rc/beta)
