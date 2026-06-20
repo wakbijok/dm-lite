@@ -374,7 +374,7 @@ mod tests {
     fn put_and_recall_roundtrip() {
         let s = mem_store();
         s.put(&mk(Kind::Decision, "resources/x", "Lock LanceDB substrate", "we chose LanceDB for v2 vector storage")).unwrap();
-        s.put(&mk(Kind::Lesson, "agent/lessons", "AVX2 gate", "the embedder needs AVX2 cpu instructions")).unwrap();
+        s.put(&mk(Kind::AgentLesson, "agent/lessons", "AVX2 gate", "the embedder needs AVX2 cpu instructions")).unwrap();
         let hits = s.recall("lancedb substrate", 5).unwrap();
         assert!(hits.iter().any(|e| e.title.contains("LanceDB")), "should recall the LanceDB decision");
         let hits2 = s.recall("avx2", 5).unwrap();

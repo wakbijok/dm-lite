@@ -155,7 +155,7 @@ impl LocalMemory {
         require(title, "title")?;
         require(lesson, "lesson")?;
         let body = format!("# {}\n\n**Lesson:** {}\n", title, lesson);
-        self.save(Kind::Lesson, namespace, title, body, 60, vec!["lesson".into()])
+        self.save(Kind::AgentLesson, namespace, title, body, 60, vec!["agent_lesson".into()])
     }
 
     pub fn log_incident(&self, title: &str, impact: &str, resolution: &str, namespace: &str) -> Result<String> {
@@ -165,7 +165,7 @@ impl LocalMemory {
             "# {}\n\n**Impact:** {}\n\n**Resolution:** {}\n",
             title, impact, resolution
         );
-        self.save(Kind::Incident, namespace, title, body, 65, vec!["incident".into()])
+        self.save(Kind::IncidentSummary, namespace, title, body, 65, vec!["incident_summary".into()])
     }
 
     pub fn remember(&self, text: &str, namespace: &str) -> Result<String> {
@@ -192,7 +192,7 @@ impl LocalMemory {
         require(title, "title")?;
         require(rule, "rule")?;
         let body = format!("# {}\n\n**Convention:** {}\n", title, rule);
-        self.save(Kind::Convention, namespace, title, body, 65, vec!["convention".into()])
+        self.save(Kind::ProjectConvention, namespace, title, body, 65, vec!["project_convention".into()])
     }
 
     /// Import a record of any kind from a template/file (the write path for persona/protocol).

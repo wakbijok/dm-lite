@@ -8,20 +8,10 @@ use crate::tools::Memory;
 use anyhow::{anyhow, Result};
 use serde_json::Value;
 
-/// daimon-memory `record_type` -> dm-lite Kind (unknown kinds fall back to Memory, never lost).
+/// daimon-memory `record_type` -> dm-lite Kind. dm-lite's kinds match v1 exactly, so this is a
+/// 1:1 pass-through via Kind::from_str; a genuinely unknown kind falls back to Memory (never lost).
 fn map_kind(s: &str) -> Kind {
-    match s {
-        "decision" => Kind::Decision,
-        "lesson" | "agent_lesson" => Kind::Lesson,
-        "incident" | "incident_summary" => Kind::Incident,
-        "runbook" => Kind::Runbook,
-        "convention" | "project_convention" => Kind::Convention,
-        "reminder" => Kind::Reminder,
-        "resource_summary" => Kind::ResourceSummary,
-        "persona" => Kind::Persona,
-        "protocol" => Kind::Protocol,
-        _ => Kind::Memory,
-    }
+    Kind::from_str(s).unwrap_or(Kind::Memory)
 }
 
 fn str_field<'a>(r: &'a Value, keys: &[&str]) -> Option<&'a str> {
@@ -177,7 +167,7 @@ mod tests {
         )
         .unwrap();
         let (kind, ns, title, body, created) = map_record(&r).unwrap();
-        assert_eq!(kind, Kind::Lesson); // agent_lesson -> Lesson
+        assert_eq!(kind, Kind::AgentLesson); // agent_lesson -> AgentLesson (1:1 with v1)
         assert_eq!(ns, "resources/homelab");
         assert_eq!(title, "Ceph re-adoption");
         assert!(body.contains("auto re-adopt"));
@@ -185,15 +175,20 @@ mod tests {
     }
 
     #[test]
-    fn unknown_kind_falls_back_and_namespace_from_uri() {
+    fn v1_kinds_pass_through_and_namespace_from_uri() {
+        // a v1 kind dm-lite now carries 1:1
         let r: Value = serde_json::from_str(
             r#"{"record_type":"known_failure_mode","uri":"daimon://resources/inpres/known_failure_mode/abc",
                 "text":"strip-and-rebuild scripts destroy finalized docs"}"#,
         )
         .unwrap();
         let (kind, ns, title, _b, _c) = map_record(&r).unwrap();
-        assert_eq!(kind, Kind::Memory); // unknown -> Memory, never dropped
+        assert_eq!(kind, Kind::KnownFailureMode); // 1:1, no longer flattened to Memory
         assert_eq!(ns, "resources/inpres");
         assert!(title.starts_with("strip-and-rebuild")); // title inferred from body
+
+        // a genuinely unknown future kind still falls back to Memory, never dropped
+        let r2: Value = serde_json::from_str(r#"{"record_type":"some_future_kind","title":"x","body":"y"}"#).unwrap();
+        assert_eq!(map_record(&r2).unwrap().0, Kind::Memory);
     }
 }

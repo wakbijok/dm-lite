@@ -4,18 +4,23 @@
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Memory record kinds. A closed set; the open `extra` lives in tags/body for now.
+/// Memory record kinds. The exact set from daimon-memory v1 (so migration is 1:1). serde
+/// emits the snake_case names, matching `as_str` and the v1 convention.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Kind {
     Decision,
-    Lesson,
-    Incident,
     Runbook,
-    Convention,
-    Reminder,
+    IncidentSummary,
+    ServiceTopology,
+    KnownFailureMode,
+    RemediationPattern,
+    ProjectConvention,
+    AgentLesson,
     ResourceSummary,
     Persona,
     Protocol,
+    Reminder,
     Memory,
 }
 
@@ -23,29 +28,37 @@ impl Kind {
     pub fn as_str(&self) -> &'static str {
         match self {
             Kind::Decision => "decision",
-            Kind::Lesson => "lesson",
-            Kind::Incident => "incident",
             Kind::Runbook => "runbook",
-            Kind::Convention => "convention",
-            Kind::Reminder => "reminder",
+            Kind::IncidentSummary => "incident_summary",
+            Kind::ServiceTopology => "service_topology",
+            Kind::KnownFailureMode => "known_failure_mode",
+            Kind::RemediationPattern => "remediation_pattern",
+            Kind::ProjectConvention => "project_convention",
+            Kind::AgentLesson => "agent_lesson",
             Kind::ResourceSummary => "resource_summary",
             Kind::Persona => "persona",
             Kind::Protocol => "protocol",
+            Kind::Reminder => "reminder",
             Kind::Memory => "memory",
         }
     }
 
+    /// Parse a kind. Accepts v1's canonical names (what dm-lite emits) plus the short aliases
+    /// dm-lite briefly used, so older records still resolve.
     pub fn from_str(s: &str) -> Option<Kind> {
         Some(match s {
             "decision" => Kind::Decision,
-            "lesson" => Kind::Lesson,
-            "incident" => Kind::Incident,
             "runbook" => Kind::Runbook,
-            "convention" => Kind::Convention,
-            "reminder" => Kind::Reminder,
+            "incident_summary" | "incident" => Kind::IncidentSummary,
+            "service_topology" => Kind::ServiceTopology,
+            "known_failure_mode" => Kind::KnownFailureMode,
+            "remediation_pattern" => Kind::RemediationPattern,
+            "project_convention" | "convention" => Kind::ProjectConvention,
+            "agent_lesson" | "lesson" => Kind::AgentLesson,
             "resource_summary" => Kind::ResourceSummary,
             "persona" => Kind::Persona,
             "protocol" => Kind::Protocol,
+            "reminder" => Kind::Reminder,
             "memory" => Kind::Memory,
             _ => return None,
         })
@@ -176,7 +189,7 @@ pub fn parse_frontmatter(text: &str) -> Result<(Kind, String, String, String), S
 pub fn default_importance(kind: Kind) -> i64 {
     match kind {
         Kind::Persona | Kind::Protocol => 95,
-        Kind::Convention => 70,
+        Kind::ProjectConvention => 70,
         _ => 60,
     }
 }
@@ -193,7 +206,7 @@ mod tests {
 
     #[test]
     fn kind_roundtrips() {
-        for k in [Kind::Decision, Kind::Lesson, Kind::Incident, Kind::Reminder, Kind::ResourceSummary] {
+        for k in [Kind::Decision, Kind::AgentLesson, Kind::IncidentSummary, Kind::ProjectConvention, Kind::ServiceTopology, Kind::KnownFailureMode, Kind::RemediationPattern, Kind::Reminder, Kind::ResourceSummary] {
             assert_eq!(Kind::from_str(k.as_str()), Some(k));
         }
         assert_eq!(Kind::from_str("nope"), None);
