@@ -130,6 +130,19 @@ dmem import ~/dmem-templates/           # load them as records
 
 `dmem setup` also asks your AI's name and your name and sets a default persona plus the generic governance for you. Nothing personal ships in the binary; the templates are blank skeletons.
 
+## Migrate in
+
+```bash
+# from daimon-memory v1 (JSONL export), preserving original timestamps:
+dmem migrate --url https://v1-host:8080 --token <admin-token>
+dmem migrate --file export.jsonl          # or - for stdin
+
+# from a folder of markdown (e.g. an Obsidian vault):
+dmem import ~/vault/                       # folder -> namespace, # H1 / filename -> title
+```
+
+`migrate` maps each v1 record (kind, namespace, title, body) and keeps its creation time as the record's valid-time. `import` walks the tree, uses frontmatter when present and infers otherwise.
+
 ## Keep it updated
 
 ## Keep it updated
