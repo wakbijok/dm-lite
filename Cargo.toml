@@ -1,6 +1,6 @@
 [package]
 name = "dm-lite"
-version = "0.1.0-rc.5"
+version = "0.1.0-rc.6"
 edition = "2021"
 description = "daimon-memory v2: a small embedded typed memory engine with hybrid recall, behind a MemoryStore trait"
 license = "MIT"

@@ -50,7 +50,7 @@ enum Cmd {
     /// Interactive first-run setup: detect agents, wire hooks, seed memory. Needs --features wizard.
     #[cfg(feature = "wizard")]
     Setup,
-    /// Detect agents and install dm's lifecycle hooks (Devin, Claude Code).
+    /// Wire (or with --remove, unwire) dm's lifecycle hooks (Devin, Claude Code).
     Bootstrap {
         #[arg(long)]
         devin: bool,
@@ -58,6 +58,9 @@ enum Cmd {
         claude: bool,
         #[arg(long)]
         all: bool,
+        /// remove dm's hooks instead of adding them
+        #[arg(long)]
+        remove: bool,
     },
     /// Lifecycle hook handlers (called by the agent; emit context on stdout).
     #[command(subcommand)]
@@ -254,8 +257,8 @@ fn run() -> Result<()> {
     match cli.cmd {
         #[cfg(feature = "wizard")]
         Cmd::Setup => setup::run(),
-        Cmd::Bootstrap { devin, claude, all } => {
-            bootstrap::run(devin || all, claude || all)
+        Cmd::Bootstrap { devin, claude, all, remove } => {
+            bootstrap::run_mode(devin || all, claude || all, remove)
         }
         Cmd::Hook(HookCmd::SessionStart) => hooks::session_start(),
         Cmd::Hook(HookCmd::UserPromptSubmit { prompt }) => {

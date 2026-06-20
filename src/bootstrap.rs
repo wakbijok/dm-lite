@@ -21,9 +21,21 @@ fn hook_entry(dm: &str, subcmd: &str, timeout: u64) -> Value {
     }])
 }
 
-/// Merge dm's hooks into a config file's `hooks` key. Idempotent: drops any prior dm
-/// entries (matched by the dm binary path in the command) before adding ours.
-fn install_into(config_path: &Path, dm: &str) -> Result<()> {
+/// True if the agent config already wires SOME memory system (any SessionStart hook), so the
+/// wizard can warn before touching it. Conservative: only inspects this config's own hooks.
+pub fn has_memory_hooks(config_path: &Path) -> bool {
+    let Ok(raw) = std::fs::read_to_string(config_path) else { return false };
+    let Ok(v) = serde_json::from_str::<Value>(&raw) else { return false };
+    v.get("hooks")
+        .and_then(|h| h.get("SessionStart"))
+        .and_then(|s| s.as_array())
+        .map(|a| !a.is_empty())
+        .unwrap_or(false)
+}
+
+/// Merge dm's hooks into a config file's `hooks` key (or, with `remove`, drop them). Idempotent:
+/// always drops any prior dm entries (matched by the dm binary path) first.
+fn install_into(config_path: &Path, dm: &str, remove: bool) -> Result<()> {
     let mut root: Value = if config_path.exists() {
         let raw = std::fs::read_to_string(config_path)
             .with_context(|| format!("read {}", config_path.display()))?;
@@ -71,8 +83,14 @@ fn install_into(config_path: &Path, dm: &str) -> Result<()> {
                     .collect()
             })
             .unwrap_or_default();
-        kept.extend(our_entry.as_array().unwrap().iter().cloned());
-        hooks_obj.insert(event.to_string(), Value::Array(kept));
+        if !remove {
+            kept.extend(our_entry.as_array().unwrap().iter().cloned());
+        }
+        if kept.is_empty() {
+            hooks_obj.remove(event);
+        } else {
+            hooks_obj.insert(event.to_string(), Value::Array(kept));
+        }
     }
 
     if let Some(parent) = config_path.parent() {
@@ -85,6 +103,11 @@ fn install_into(config_path: &Path, dm: &str) -> Result<()> {
 }
 
 pub fn run(devin: bool, claude: bool) -> Result<()> {
+    run_mode(devin, claude, false)
+}
+
+/// Wire or (with `remove`) unwire dm's hooks into the selected agents.
+pub fn run_mode(devin: bool, claude: bool, remove: bool) -> Result<()> {
     let dm = dm_bin()?;
     let h = home()?;
     let mut did_any = false;
@@ -103,19 +126,21 @@ pub fn run(devin: bool, claude: bool) -> Result<()> {
             println!("  skip {} (no {} found)", name, path.parent().map(|p| p.display().to_string()).unwrap_or_default());
             continue;
         }
-        install_into(path, &dm)?;
-        println!("  wired {} -> {}", name, path.display());
+        install_into(path, &dm, remove)?;
+        println!("  {} {} -> {}", if remove { "unwired" } else { "wired" }, name, path.display());
         did_any = true;
     }
 
-    if did_any {
-        println!();
-        println!("Done. dmem is wired in (SessionStart -> persona/recent, UserPromptSubmit -> recall, SessionEnd -> save nudge).");
-        println!("Binary: {}", dm);
-        println!("Test on Devin: start a devin session; the first prompt should surface a <daimon-memory> block.");
-        println!("Seed a memory first, e.g.:  dmem log_decision --title \"hello\" --decision \"it works\"");
+    if !did_any {
+        println!("Nothing changed. Pass --devin and/or --claude (or --all), and ensure the agent is installed.");
+        return Ok(());
+    }
+    println!();
+    if remove {
+        println!("Done. dmem hooks removed (the agent's other hooks/plugins are untouched).");
     } else {
-        println!("Nothing wired. Pass --devin and/or --claude (or --all), and ensure the agent is installed.");
+        println!("Done. dmem is wired in (SessionStart -> persona/recent, UserPromptSubmit -> recall, SessionEnd -> save nudge).");
+        println!("Undo any time with:  dmem bootstrap --remove --devin / --claude");
     }
     Ok(())
 }
@@ -125,17 +150,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn installs_session_end_hook_idempotently() {
+    fn install_is_idempotent_and_remove_restores() {
         let dir = std::env::temp_dir().join(format!("dmboot-{}-{}", std::process::id(), crate::entry::now_ms()));
         std::fs::create_dir_all(&dir).unwrap();
         let cfg = dir.join("config.json");
-        install_into(&cfg, "/path/to/dmem").unwrap();
+        // pre-existing UNRELATED hook must survive everything
+        std::fs::write(
+            &cfg,
+            r#"{"hooks":{"SessionStart":[{"matcher":"","hooks":[{"type":"command","command":"/other/tool x"}]}]}}"#,
+        )
+        .unwrap();
+
+        install_into(&cfg, "/path/to/dmem", false).unwrap();
         let v: Value = serde_json::from_str(&std::fs::read_to_string(&cfg).unwrap()).unwrap();
-        let cmd = v["hooks"]["SessionEnd"][0]["hooks"][0]["command"].as_str().unwrap();
-        assert!(cmd.contains("hook session_end"), "got: {cmd}");
-        // re-run: still exactly one dm-owned entry (idempotent)
-        install_into(&cfg, "/path/to/dmem").unwrap();
+        assert!(v["hooks"]["SessionEnd"][0]["hooks"][0]["command"].as_str().unwrap().contains("hook session_end"));
+        // the unrelated hook + our hook both present
+        assert_eq!(v["hooks"]["SessionStart"].as_array().unwrap().len(), 2);
+
+        // idempotent re-run: still one dm entry
+        install_into(&cfg, "/path/to/dmem", false).unwrap();
         let v2: Value = serde_json::from_str(&std::fs::read_to_string(&cfg).unwrap()).unwrap();
-        assert_eq!(v2["hooks"]["SessionEnd"].as_array().unwrap().len(), 1);
+        assert_eq!(v2["hooks"]["SessionStart"].as_array().unwrap().len(), 2);
+
+        // remove: our hooks gone, the unrelated one stays, empty events dropped
+        install_into(&cfg, "/path/to/dmem", true).unwrap();
+        let v3: Value = serde_json::from_str(&std::fs::read_to_string(&cfg).unwrap()).unwrap();
+        assert!(v3["hooks"].get("SessionEnd").is_none(), "dm-only event removed");
+        assert_eq!(v3["hooks"]["SessionStart"].as_array().unwrap().len(), 1);
+        assert_eq!(v3["hooks"]["SessionStart"][0]["hooks"][0]["command"], "/other/tool x");
     }
 }

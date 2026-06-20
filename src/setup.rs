@@ -109,26 +109,38 @@ pub fn run() -> Result<()> {
         }
     }
 
-    // 3. wire the agents you pick (hooks call this same binary, in whichever mode you chose)
+    // 3. wire the agents you EXPLICITLY pick. Nothing is pre-selected - wiring an agent that
+    //    already has its own memory system (e.g. a Claude Code daimon-memory plugin) would
+    //    double-inject, so the user must opt in, and we flag agents that look already-wired.
     let home = dirs::home_dir().ok_or_else(|| anyhow!("no home directory"))?;
+    let devin_cfg = home.join(".config/devin/config.json");
+    let claude_cfg = home.join(".claude/settings.json");
     let devin_present = home.join(".config/devin").exists();
     let claude_present = home.join(".claude").exists();
-    println!(
-        "\nDetected agents: Devin {}, Claude Code {}",
-        if devin_present { "yes" } else { "no" },
-        if claude_present { "yes" } else { "no" }
-    );
+    let label = |present: bool, cfg: &std::path::Path, name: &str| -> String {
+        if !present {
+            format!("{name} (not installed)")
+        } else if crate::bootstrap::has_memory_hooks(cfg) {
+            format!("{name} (already has memory hooks - leave unchecked unless replacing)")
+        } else {
+            name.to_string()
+        }
+    };
+    let items = [
+        label(devin_present, &devin_cfg, "Devin CLI"),
+        label(claude_present, &claude_cfg, "Claude Code"),
+    ];
     let chosen = MultiSelect::with_theme(&theme)
-        .with_prompt("Wire dmem into which agents? (space toggles, enter confirms)")
-        .items(&["Devin CLI", "Claude Code"])
-        .defaults(&[devin_present, claude_present])
+        .with_prompt("Wire dmem into which agents? (nothing is pre-selected; space toggles, enter confirms)")
+        .items(&items)
+        .defaults(&[false, false])
         .interact()?;
     let devin = chosen.contains(&0);
     let claude = chosen.contains(&1);
     if devin || claude {
         crate::bootstrap::run(devin, claude)?;
     } else {
-        println!("(skipped agent wiring)");
+        println!("(skipped agent wiring - undo any wiring later with `dmem bootstrap --remove`)");
     }
 
     // 3. seed a first memory (goes local or to the server, per the config just written)
