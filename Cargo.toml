@@ -19,9 +19,9 @@ zvec = ["dep:zvec"]
 # Implies `zvec`: the embedder is only consumed by the zvec vector path, so fastembed alone
 # would pull the heavy ort/onnx tree for zero behavioral change.
 fastembed = ["dep:fastembed", "zvec"]
-# server: network API (axum + tokio) with multi-token bearer -> tenant auth, over the
-# database-per-tenant store. Off by default so the embedded binary stays lean (no tokio).
-server = ["dep:axum", "dep:tokio", "dep:tower"]
+# server: network API (axum + tokio) with multi-token bearer -> tenant auth and built-in TLS,
+# over the database-per-tenant store. Off by default so the embedded binary stays lean.
+server = ["dep:axum", "dep:axum-server", "dep:rcgen", "dep:rustls", "dep:tokio", "dep:tower"]
 # wizard: interactive `dmem setup` first-run flow (dialoguer).
 wizard = ["dep:dialoguer"]
 # self-update: `dmem upgrade` in-place from GitHub Releases.
@@ -42,6 +42,9 @@ dirs = "5"
 zvec = { git = "https://github.com/zvec-ai/zvec-rust.git", tag = "v0.5.0", optional = true }
 fastembed = { version = "4", optional = true }
 axum = { version = "0.7", optional = true }
+axum-server = { version = "0.7", features = ["tls-rustls"], optional = true }
+rcgen = { version = "0.13", optional = true }
+rustls = { version = "0.23", features = ["ring"], optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"], optional = true }
 tower = { version = "0.5", features = ["util"], optional = true }
 dialoguer = { version = "0.11", optional = true }

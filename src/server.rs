@@ -320,8 +320,41 @@ pub fn router(auth: Arc<dyn Authenticator>) -> Router {
         .with_state(AppState { auth })
 }
 
-/// Bind `addr` and serve until Ctrl-C (graceful shutdown). Tokens come from the environment.
-pub fn run_blocking(addr: &str) -> Result<()> {
+/// TLS choice for the server: bring-your-own cert/key, or generate a self-signed pair.
+pub struct TlsOpts {
+    pub cert: Option<String>,
+    pub key: Option<String>,
+    pub generate: bool,
+}
+
+/// Generate a self-signed cert + key (PEM), persisting them under `<data>/tls/` so clients
+/// can trust the cert via `ca_cert`. SANs cover localhost and the bind host.
+fn generate_self_signed(addr: &str) -> Result<(String, String)> {
+    let host = addr.rsplit_once(':').map(|(h, _)| h).unwrap_or(addr);
+    let mut sans = vec!["localhost".to_string()];
+    if !host.is_empty() && host != "0.0.0.0" && host != "localhost" {
+        sans.push(host.to_string());
+    }
+    let ck = rcgen::generate_simple_self_signed(sans).map_err(|e| anyhow::anyhow!("rcgen: {e}"))?;
+    let cert_pem = ck.cert.pem();
+    let key_pem = ck.key_pair.serialize_pem();
+    if let Ok(dir) = crate::config::data_dir() {
+        let tdir = dir.join("tls");
+        let _ = std::fs::create_dir_all(&tdir);
+        let cpath = tdir.join("cert.pem");
+        let _ = std::fs::write(&cpath, &cert_pem);
+        let _ = std::fs::write(tdir.join("key.pem"), &key_pem);
+        eprintln!("dmem serve: generated self-signed cert at {}", cpath.display());
+        eprintln!("           clients: set `ca_cert` to that file (or `insecure = true`)");
+    }
+    Ok((cert_pem, key_pem))
+}
+
+/// Bind `addr` and serve. With TLS (cert/key or generate) it serves HTTPS; otherwise plain
+/// HTTP with a loud warning. Tokens come from the environment.
+pub fn run_blocking(addr: &str, tls: TlsOpts) -> Result<()> {
+    // rustls 0.23 needs a process-wide crypto provider installed before any TLS work.
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let auth = BearerAuth::from_env()?;
     if auth.is_empty() {
         eprintln!(
@@ -332,16 +365,49 @@ pub fn run_blocking(addr: &str) -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async move {
         let app = router(Arc::new(auth));
-        let listener = tokio::net::TcpListener::bind(addr)
-            .await
-            .map_err(|e| anyhow::anyhow!("bind {addr}: {e}"))?;
-        eprintln!("dmem serve: listening on http://{addr}");
-        axum::serve(listener, app)
-            .with_graceful_shutdown(async {
-                let _ = tokio::signal::ctrl_c().await;
-            })
-            .await
-            .map_err(|e| anyhow::anyhow!("serve: {e}"))?;
+        let sock: std::net::SocketAddr = addr
+            .parse()
+            .map_err(|e| anyhow::anyhow!("bad addr {addr}: {e}"))?;
+
+        let tls_config = if let (Some(c), Some(k)) = (&tls.cert, &tls.key) {
+            Some(
+                axum_server::tls_rustls::RustlsConfig::from_pem_file(c, k)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("load TLS cert/key: {e}"))?,
+            )
+        } else if tls.generate {
+            let (cert_pem, key_pem) = generate_self_signed(addr)?;
+            Some(
+                axum_server::tls_rustls::RustlsConfig::from_pem(cert_pem.into_bytes(), key_pem.into_bytes())
+                    .await
+                    .map_err(|e| anyhow::anyhow!("self-signed TLS: {e}"))?,
+            )
+        } else {
+            None
+        };
+
+        match tls_config {
+            Some(cfg) => {
+                eprintln!("dmem serve: listening on https://{addr}");
+                axum_server::bind_rustls(sock, cfg)
+                    .serve(app.into_make_service())
+                    .await
+                    .map_err(|e| anyhow::anyhow!("serve (tls): {e}"))?;
+            }
+            None => {
+                eprintln!("dmem serve: WARNING serving plain HTTP on http://{addr} (no TLS).");
+                eprintln!("           use --tls-cert/--tls-key or --tls-generate for HTTPS.");
+                let listener = tokio::net::TcpListener::bind(addr)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("bind {addr}: {e}"))?;
+                axum::serve(listener, app)
+                    .with_graceful_shutdown(async {
+                        let _ = tokio::signal::ctrl_c().await;
+                    })
+                    .await
+                    .map_err(|e| anyhow::anyhow!("serve: {e}"))?;
+            }
+        }
         Ok::<(), anyhow::Error>(())
     })
 }

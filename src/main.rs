@@ -151,6 +151,15 @@ enum Cmd {
     Serve {
         #[arg(long, default_value = "127.0.0.1:8077")]
         addr: String,
+        /// TLS certificate (PEM); pair with --tls-key for HTTPS
+        #[arg(long = "tls-cert")]
+        tls_cert: Option<String>,
+        /// TLS private key (PEM)
+        #[arg(long = "tls-key")]
+        tls_key: Option<String>,
+        /// generate a self-signed cert for HTTPS (saved under the data dir)
+        #[arg(long = "tls-generate")]
+        tls_generate: bool,
     },
     /// Update dmem in place from GitHub Releases. Needs --features self-update.
     #[cfg(feature = "self-update")]
@@ -279,7 +288,10 @@ fn run() -> Result<()> {
         Cmd::Status => status(),
         Cmd::Mcp => mcp::serve(),
         #[cfg(feature = "server")]
-        Cmd::Serve { addr } => server::run_blocking(&addr),
+        Cmd::Serve { addr, tls_cert, tls_key, tls_generate } => server::run_blocking(
+            &addr,
+            server::TlsOpts { cert: tls_cert, key: tls_key, generate: tls_generate },
+        ),
         #[cfg(feature = "self-update")]
         Cmd::Upgrade { pre } => upgrade::run(pre),
     }
