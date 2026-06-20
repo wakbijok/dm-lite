@@ -114,6 +114,9 @@ struct RecallReq {
     query: String,
     #[serde(default)]
     limit: Option<usize>,
+    /// bitemporal: recall the store as of this epoch-ms (and facts valid then)
+    #[serde(default)]
+    as_of: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -136,6 +139,40 @@ struct DecisionReq {
 }
 
 #[derive(Deserialize)]
+struct LessonReq {
+    title: String,
+    lesson: String,
+    #[serde(default)]
+    namespace: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct IncidentReq {
+    title: String,
+    impact: String,
+    #[serde(default)]
+    resolution: String,
+    #[serde(default)]
+    namespace: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RunbookReq {
+    title: String,
+    steps: String,
+    #[serde(default)]
+    namespace: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ConventionReq {
+    title: String,
+    rule: String,
+    #[serde(default)]
+    namespace: Option<String>,
+}
+
+#[derive(Deserialize)]
 struct ReminderReq {
     title: String,
     text: String,
@@ -143,8 +180,50 @@ struct ReminderReq {
     namespace: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct RecentReq {
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Deserialize)]
+struct HistoryReq {
+    uri: String,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Deserialize)]
+struct ForgetReq {
+    uri: String,
+}
+
 fn ns_or<'a>(ns: &'a Option<String>, default: &'a str) -> &'a str {
     ns.as_deref().filter(|s| !s.is_empty()).unwrap_or(default)
+}
+
+/// Auth, open the request's tenant store, run `f`, and JSON-encode its result. `client_err`
+/// maps a failure to 400 (treat as bad input) instead of 500.
+fn with_tenant(
+    st: &AppState,
+    headers: &HeaderMap,
+    client_err: bool,
+    f: impl FnOnce(&Memory) -> Result<serde_json::Value>,
+) -> ApiResp {
+    let tenant = match tenant_of(st, headers) {
+        Some(t) => t,
+        None => return err(StatusCode::UNAUTHORIZED, "invalid or missing bearer token"),
+    };
+    match Memory::open_tenant(&tenant).and_then(|m| f(&m)) {
+        Ok(v) => (StatusCode::OK, Json(v)),
+        Err(e) => {
+            if client_err {
+                bad_request(e)
+            } else {
+                internal(e)
+            }
+        }
+    }
 }
 
 async fn healthz() -> ApiResp {
@@ -152,53 +231,70 @@ async fn healthz() -> ApiResp {
 }
 
 async fn recall_h(State(st): State<AppState>, headers: HeaderMap, Json(req): Json<RecallReq>) -> ApiResp {
-    let tenant = match tenant_of(&st, &headers) {
-        Some(t) => t,
-        None => return err(StatusCode::UNAUTHORIZED, "invalid or missing bearer token"),
-    };
-    let limit = req.limit.unwrap_or(6);
-    match Memory::open_tenant(&tenant).and_then(|m| m.recall(&req.query, limit)) {
-        Ok(hits) => (StatusCode::OK, Json(json!(hits))),
-        Err(e) => internal(e),
-    }
+    with_tenant(&st, &headers, false, |m| {
+        let limit = req.limit.unwrap_or(6);
+        let hits = match req.as_of {
+            Some(ts) => m.recall_as_of(&req.query, limit, ts, ts)?,
+            None => m.recall(&req.query, limit)?,
+        };
+        Ok(json!(hits))
+    })
+}
+
+async fn recent_h(State(st): State<AppState>, headers: HeaderMap, Json(req): Json<RecentReq>) -> ApiResp {
+    with_tenant(&st, &headers, false, |m| Ok(json!(m.recent(req.limit.unwrap_or(10))?)))
+}
+
+async fn history_h(State(st): State<AppState>, headers: HeaderMap, Json(req): Json<HistoryReq>) -> ApiResp {
+    with_tenant(&st, &headers, false, |m| Ok(json!(m.history(&req.uri, req.limit.unwrap_or(20))?)))
+}
+
+async fn forget_h(State(st): State<AppState>, headers: HeaderMap, Json(req): Json<ForgetReq>) -> ApiResp {
+    with_tenant(&st, &headers, false, |m| Ok(json!({ "forgotten": m.forget(&req.uri)? })))
 }
 
 async fn remember_h(State(st): State<AppState>, headers: HeaderMap, Json(req): Json<RememberReq>) -> ApiResp {
-    let tenant = match tenant_of(&st, &headers) {
-        Some(t) => t,
-        None => return err(StatusCode::UNAUTHORIZED, "invalid or missing bearer token"),
-    };
-    let ns = ns_or(&req.namespace, "resources/notes").to_string();
-    match Memory::open_tenant(&tenant).and_then(|m| m.remember(&req.text, &ns)) {
-        Ok(uri) => (StatusCode::OK, Json(json!({ "uri": uri }))),
-        Err(e) => internal(e),
-    }
+    with_tenant(&st, &headers, false, |m| {
+        Ok(json!({ "uri": m.remember(&req.text, ns_or(&req.namespace, "resources/notes"))? }))
+    })
 }
 
 async fn decision_h(State(st): State<AppState>, headers: HeaderMap, Json(req): Json<DecisionReq>) -> ApiResp {
-    let tenant = match tenant_of(&st, &headers) {
-        Some(t) => t,
-        None => return err(StatusCode::UNAUTHORIZED, "invalid or missing bearer token"),
-    };
-    let ns = ns_or(&req.namespace, "resources/notes").to_string();
-    match Memory::open_tenant(&tenant)
-        .and_then(|m| m.log_decision(&req.title, &req.context, &req.decision, &req.rationale, &ns))
-    {
-        Ok(uri) => (StatusCode::OK, Json(json!({ "uri": uri }))),
-        Err(e) => bad_request(e),
-    }
+    with_tenant(&st, &headers, true, |m| {
+        let ns = ns_or(&req.namespace, "resources/notes");
+        Ok(json!({ "uri": m.log_decision(&req.title, &req.context, &req.decision, &req.rationale, ns)? }))
+    })
+}
+
+async fn lesson_h(State(st): State<AppState>, headers: HeaderMap, Json(req): Json<LessonReq>) -> ApiResp {
+    with_tenant(&st, &headers, true, |m| {
+        Ok(json!({ "uri": m.log_lesson(&req.title, &req.lesson, ns_or(&req.namespace, "agent/lessons"))? }))
+    })
+}
+
+async fn incident_h(State(st): State<AppState>, headers: HeaderMap, Json(req): Json<IncidentReq>) -> ApiResp {
+    with_tenant(&st, &headers, true, |m| {
+        let ns = ns_or(&req.namespace, "resources/incidents");
+        Ok(json!({ "uri": m.log_incident(&req.title, &req.impact, &req.resolution, ns)? }))
+    })
+}
+
+async fn runbook_h(State(st): State<AppState>, headers: HeaderMap, Json(req): Json<RunbookReq>) -> ApiResp {
+    with_tenant(&st, &headers, true, |m| {
+        Ok(json!({ "uri": m.log_runbook(&req.title, &req.steps, ns_or(&req.namespace, "resources/runbooks"))? }))
+    })
+}
+
+async fn convention_h(State(st): State<AppState>, headers: HeaderMap, Json(req): Json<ConventionReq>) -> ApiResp {
+    with_tenant(&st, &headers, true, |m| {
+        Ok(json!({ "uri": m.log_convention(&req.title, &req.rule, ns_or(&req.namespace, "resources/conventions"))? }))
+    })
 }
 
 async fn reminder_h(State(st): State<AppState>, headers: HeaderMap, Json(req): Json<ReminderReq>) -> ApiResp {
-    let tenant = match tenant_of(&st, &headers) {
-        Some(t) => t,
-        None => return err(StatusCode::UNAUTHORIZED, "invalid or missing bearer token"),
-    };
-    let ns = ns_or(&req.namespace, "agent/reminders").to_string();
-    match Memory::open_tenant(&tenant).and_then(|m| m.add_reminder(&req.title, &req.text, &ns)) {
-        Ok(uri) => (StatusCode::OK, Json(json!({ "uri": uri }))),
-        Err(e) => bad_request(e),
-    }
+    with_tenant(&st, &headers, true, |m| {
+        Ok(json!({ "uri": m.add_reminder(&req.title, &req.text, ns_or(&req.namespace, "agent/reminders"))? }))
+    })
 }
 
 /// Assemble the router. `/healthz` is open; every other route requires a valid bearer token.
@@ -206,8 +302,15 @@ pub fn router(auth: Arc<dyn Authenticator>) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/recall", post(recall_h))
+        .route("/recent", post(recent_h))
+        .route("/history", post(history_h))
+        .route("/forget", post(forget_h))
         .route("/remember", post(remember_h))
         .route("/log_decision", post(decision_h))
+        .route("/log_lesson", post(lesson_h))
+        .route("/log_incident", post(incident_h))
+        .route("/log_runbook", post(runbook_h))
+        .route("/log_convention", post(convention_h))
         .route("/add_reminder", post(reminder_h))
         .with_state(AppState { auth })
 }
