@@ -108,12 +108,73 @@ fn install_into(config_path: &Path, dm: &str, remove: bool) -> Result<()> {
     Ok(())
 }
 
-/// Codex: register `dmem mcp` as a stdio MCP server in ~/.codex/config.toml, and drop any stale
-/// v1 daimon HTTP-MCP. Format-preserving (toml_edit), backed up to config.toml.dmbak, and the
-/// edited document is re-parsed before it overwrites Codex's config so a bad edit can never
-/// corrupt it.
+/// Ensure `doc[key]` is a table (create an empty one if it is missing or a non-table).
+fn ensure_table(doc: &mut toml_edit::DocumentMut, key: &str) {
+    if doc.get(key).and_then(|x| x.as_table()).is_none() {
+        doc[key] = toml_edit::Item::Table(toml_edit::Table::new());
+    }
+}
+
+/// UTC RFC3339 timestamp without pulling in chrono - civil-date-from-days (H. Hinnant). Used for
+/// the marketplace `last_updated` field so Codex sees the same shape it writes itself.
+fn rfc3339_utc() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0) as i64;
+    let (days, rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
+    let (h, mi, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02}T{h:02}:{mi:02}:{s:02}Z")
+}
+
+/// Write the dm-lite Codex plugin tree (a local marketplace) whose hooks call the dmem binary.
+/// Codex shares Claude Code's hook output shape (hookSpecificOutput.additionalContext), so the
+/// same `dmem hook ...` commands drive persona on SessionStart and recall on UserPromptSubmit.
+fn codex_write_plugin(mp_dir: &Path, dm: &str) -> Result<()> {
+    let plug = mp_dir.join("plugins/dmem");
+    std::fs::create_dir_all(mp_dir.join(".claude-plugin"))?;
+    std::fs::create_dir_all(plug.join(".codex-plugin"))?;
+    std::fs::create_dir_all(plug.join("hooks"))?;
+    let market = json!({ "name": "dmem", "plugins": [ { "name": "dmem", "source": "./plugins/dmem" } ] });
+    std::fs::write(mp_dir.join(".claude-plugin/marketplace.json"), serde_json::to_string_pretty(&market)? + "\n")?;
+    let manifest = json!({
+        "name": "dmem",
+        "version": env!("CARGO_PKG_VERSION"),
+        "description": "Shared cross-tool memory for Codex, backed by dm-lite (dmem). Persona + recent context on session start, deterministic hybrid recall per prompt, and remember/recall memory tools.",
+        "license": "MIT",
+        "hooks": "./hooks/hooks.json"
+    });
+    std::fs::write(plug.join(".codex-plugin/plugin.json"), serde_json::to_string_pretty(&manifest)? + "\n")?;
+    let hooks = json!({
+        "hooks": {
+            "SessionStart": [ { "matcher": "*", "hooks": [
+                { "type": "command", "command": format!("{dm} hook session_start"), "timeout": 10 } ] } ],
+            "UserPromptSubmit": [ { "matcher": "*", "hooks": [
+                { "type": "command", "command": format!("{dm} hook user_prompt_submit"), "timeout": 8 } ] } ]
+        }
+    });
+    std::fs::write(plug.join("hooks/hooks.json"), serde_json::to_string_pretty(&hooks)? + "\n")?;
+    Ok(())
+}
+
+/// Codex: wire dmem as both an MCP server (tools) AND a hook plugin (persona + auto-recall) in
+/// ~/.codex/config.toml, and migrate off the v1 daimon-memory marketplace/plugin/HTTP-MCP.
+/// Format-preserving (toml_edit), backed up to config.toml.dmbak, and the edited document is
+/// re-parsed before it overwrites Codex's config so a bad edit can never corrupt it. Trust hashes
+/// are intentionally NOT forged: Codex prompts the user once to trust the hooks on first run.
 fn codex_install(dm: &str, remove: bool) -> Result<()> {
-    let cfg = home()?.join(".codex/config.toml");
+    let codex = home()?.join(".codex");
+    let cfg = codex.join("config.toml");
     if !cfg.exists() {
         println!("  skip Codex (no ~/.codex/config.toml)");
         return Ok(());
@@ -121,12 +182,13 @@ fn codex_install(dm: &str, remove: bool) -> Result<()> {
     let raw = std::fs::read_to_string(&cfg).with_context(|| format!("read {}", cfg.display()))?;
     let _ = std::fs::write(cfg.with_file_name("config.toml.dmbak"), &raw);
     let mut doc: toml_edit::DocumentMut = raw.parse().with_context(|| "parse ~/.codex/config.toml")?;
-    if doc.get("mcp_servers").and_then(|s| s.as_table()).is_none() {
-        doc["mcp_servers"] = toml_edit::Item::Table(toml_edit::Table::new());
-    }
+    let mp_dir = codex.join("dmem-marketplace");
+
+    // MCP tools: [mcp_servers.dmem] = `dmem mcp`; drop the v1 HTTP MCP.
+    ensure_table(&mut doc, "mcp_servers");
     let servers = doc["mcp_servers"].as_table_mut().unwrap();
-    servers.remove("dmem"); // idempotent re-run
-    servers.remove("daimon"); // migrate off the v1 HTTP MCP
+    servers.remove("dmem");
+    servers.remove("daimon");
     if !remove {
         let mut t = toml_edit::Table::new();
         t["command"] = toml_edit::value(dm);
@@ -135,16 +197,51 @@ fn codex_install(dm: &str, remove: bool) -> Result<()> {
         t["args"] = toml_edit::value(args);
         servers["dmem"] = toml_edit::Item::Table(t);
     }
+
+    // Hook plugin: register a local marketplace + enable the plugin; drop the v1 marketplace/plugin.
+    ensure_table(&mut doc, "marketplaces");
+    let markets = doc["marketplaces"].as_table_mut().unwrap();
+    markets.remove("daimon-memory");
+    markets.remove("dmem");
+    if !remove {
+        let mut t = toml_edit::Table::new();
+        t["source_type"] = toml_edit::value("local");
+        t["source"] = toml_edit::value(mp_dir.to_string_lossy().as_ref());
+        t["last_updated"] = toml_edit::value(rfc3339_utc());
+        markets["dmem"] = toml_edit::Item::Table(t);
+    }
+    ensure_table(&mut doc, "plugins");
+    let plugins = doc["plugins"].as_table_mut().unwrap();
+    plugins.remove("daimon-memory@daimon-memory");
+    plugins.remove("dmem@dmem");
+    if !remove {
+        let mut t = toml_edit::Table::new();
+        t["enabled"] = toml_edit::value(true);
+        plugins["dmem@dmem"] = toml_edit::Item::Table(t);
+        ensure_table(&mut doc, "features");
+        doc["features"]["plugin_hooks"] = toml_edit::value(true);
+    }
+
+    // Drop the v1 plugin's hook trust records so Codex does not keep stale daimon-memory state.
+    if let Some(state) = doc.get_mut("hooks").and_then(|h| h.get_mut("state")).and_then(|s| s.as_table_mut()) {
+        let stale: Vec<String> = state.iter().map(|(k, _)| k.to_string()).filter(|k| k.starts_with("daimon-memory@")).collect();
+        for k in stale {
+            state.remove(&k);
+        }
+    }
+
     let out = doc.to_string();
     out.parse::<toml_edit::DocumentMut>().with_context(|| "refusing to write: edited config.toml no longer parses")?;
     std::fs::write(&cfg, out).with_context(|| format!("write {}", cfg.display()))?;
-    println!(
-        "  {} Codex MCP -> {} (mcp_servers.dmem = `dmem mcp`)",
-        if remove { "unwired" } else { "wired" },
-        cfg.display()
-    );
-    if !remove {
-        println!("    note: Codex auto-recall hooks (persona/recall) land in the next build; the MCP save/recall tools work now.");
+
+    if remove {
+        let _ = std::fs::remove_dir_all(&mp_dir);
+        println!("  unwired Codex (MCP + hook plugin) -> {}", cfg.display());
+    } else {
+        codex_write_plugin(&mp_dir, dm)?;
+        println!("  wired Codex -> {} (MCP tools + dmem hook plugin)", cfg.display());
+        println!("    NOTE: on your next Codex session, Codex asks once to TRUST the dmem hooks");
+        println!("          (session_start + user_prompt_submit). Accept to enable persona + auto-recall.");
     }
     Ok(())
 }
@@ -194,7 +291,7 @@ pub fn run_mode(devin: bool, claude: bool, codex: bool, remove: bool) -> Result<
         println!("Done. dmem hooks removed (the agent's other hooks/plugins are untouched).");
     } else {
         println!("Done. dmem is wired in (SessionStart -> persona/recent, UserPromptSubmit -> recall + save nudge).");
-        println!("Undo any time with:  dmem bootstrap --remove --devin / --claude");
+        println!("Undo any time with:  dmem bootstrap --remove --devin / --claude / --codex");
     }
     Ok(())
 }
