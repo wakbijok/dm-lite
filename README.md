@@ -4,12 +4,12 @@ daimon-memory v2: a small typed memory engine for AI agents. One binary, client/
 
 ## Features
 
+- One memory across your AI tools: the same recall and capture in Claude Code, Codex, Hermes, and Devin, with the integration built in (one command per tool), not left for you to wire yourself. Switch tools, keep the same brain. Any other MCP client can connect too.
 - Typed, curated memory: decisions, lessons, incidents, runbooks, conventions, reminders, and more, each a first-class kind.
 - Hybrid recall: SQLite FTS5 keyword search fused with dense vectors (bge-small via zvec), ranked together.
 - Bitemporal: every save is a new version, nothing is overwritten; recall the store as of any point in time.
-- One binary, client/server: simple to run, with a real server mode. Local or remote is just a URL.
+- Client/server in one binary: run it locally, or host it on a VPS, homelab, or cloud box and point your machines at it. Local or remote is just a URL.
 - Multitenant: one database per tenant, token-only IAM (root admin plus per-tenant tokens), built-in TLS (no reverse proxy).
-- Wires into your agents in one command: Claude Code, Codex, Hermes, Devin (lifecycle hooks for persona and recall, plus the MCP save tools). Also speaks MCP over stdio for any other client.
 - Self-updating: `dmem upgrade` pulls the latest release in place.
 
 ## Quickstart
