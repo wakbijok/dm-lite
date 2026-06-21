@@ -235,13 +235,30 @@ fn codex_install(dm: &str, remove: bool) -> Result<()> {
     std::fs::write(&cfg, out).with_context(|| format!("write {}", cfg.display()))?;
 
     if remove {
+        // Let Codex clean its own plugin cache + state, then drop the local marketplace source.
+        let _ = std::process::Command::new("codex").args(["plugin", "remove", "dmem@dmem"]).output();
         let _ = std::fs::remove_dir_all(&mp_dir);
         println!("  unwired Codex (MCP + hook plugin) -> {}", cfg.display());
     } else {
         codex_write_plugin(&mp_dir, dm)?;
-        println!("  wired Codex -> {} (MCP tools + dmem hook plugin)", cfg.display());
-        println!("    NOTE: on your next Codex session, Codex asks once to TRUST the dmem hooks");
-        println!("          (session_start + user_prompt_submit). Accept to enable persona + auto-recall.");
+        // The config + marketplace source are not enough: Codex loads hook plugins from its
+        // install CACHE (~/.codex/plugins/cache/<mp>/<plugin>/<version>/), populated only by
+        // `codex plugin add`. Without this the plugin is "not installed" and no hooks fire.
+        match std::process::Command::new("codex").args(["plugin", "add", "dmem@dmem"]).output() {
+            Ok(o) if o.status.success() => {
+                println!("  wired Codex -> {} (MCP tools + dmem hook plugin, installed into Codex's cache)", cfg.display());
+            }
+            Ok(o) => {
+                println!("  wired Codex config -> {} (MCP tools + dmem hook plugin source)", cfg.display());
+                println!("    warn: `codex plugin add dmem@dmem` failed ({}). Run it manually to install the hooks.", String::from_utf8_lossy(&o.stderr).trim());
+            }
+            Err(_) => {
+                println!("  wired Codex config -> {} (MCP tools + dmem hook plugin source)", cfg.display());
+                println!("    NOTE: `codex` CLI not found - run `codex plugin add dmem@dmem` to install the hook plugin into Codex's cache.");
+            }
+        }
+        println!("    On your next Codex session, Codex asks once to TRUST the dmem hooks");
+        println!("    (session_start + user_prompt_submit). Accept to enable persona + auto-recall.");
     }
     Ok(())
 }
