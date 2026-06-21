@@ -93,8 +93,8 @@ pub fn session_end() -> Result<()> {
 /// UserPromptSubmit (Claude/Codex) / pre_llm_call (Hermes): recall relevant memory for the
 /// submitted prompt and append a save-discipline nudge when this session's work looks
 /// uncaptured. Claude/Codex put the prompt at top-level `prompt`; Hermes passes it as
-/// `extra.user_message` and also flags `extra.is_first_turn`, so on a Hermes first turn we
-/// prepend the persona block here (Hermes has no context-injecting SessionStart hook).
+/// `extra.user_message` (is_first_turn is still captured for diagnostics). For Hermes the
+/// persona/protocols are NOT injected here; they live in SOUL.md (always-on system prompt).
 pub fn user_prompt_submit(arg: Option<String>, hermes: bool) -> Result<()> {
     let (raw_in, input) = read_stdin();
     let prompt = arg
@@ -122,14 +122,9 @@ pub fn user_prompt_submit(arg: Option<String>, hermes: bool) -> Result<()> {
     }
     let m = Memory::open()?;
     let mut blocks: Vec<String> = Vec::new();
-    if first_turn {
-        let persona = m.persona().unwrap_or_default();
-        let recent = m.recent(5).unwrap_or_default();
-        let session = render::render_session(&persona, &recent);
-        if !session.trim().is_empty() {
-            blocks.push(session);
-        }
-    }
+    // Persona/protocols are NOT injected here for Hermes: they live in SOUL.md (the always-on
+    // system prompt, written by `dmem bootstrap --hermes`), so identity survives session resume
+    // and compaction. This hook carries only the dynamic per-prompt layer: recall + save nudge.
     let recall = render::render_recall(&m.recall(&prompt, 6).unwrap_or_default());
     if !recall.trim().is_empty() {
         blocks.push(recall);

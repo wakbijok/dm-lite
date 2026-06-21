@@ -309,10 +309,61 @@ fn hermes_allowlist(hook_cmd: &str, remove: bool) -> Result<()> {
     Ok(())
 }
 
-/// Hermes: wire dmem as an MCP server (tools) + a `pre_llm_call` shell hook (persona on the
-/// first turn, recall every turn - Hermes's on_session_start cannot inject context), allowlist
-/// just that one hook command, and migrate off the v1 daimon memory provider. Backed up to
-/// config.yaml.dmbak; the edited YAML is re-parsed before it overwrites the config.
+/// Markers fencing the dmem-managed block inside Hermes's SOUL.md. Anything outside them is the
+/// user's own content and is preserved across re-syncs.
+const SOUL_BEGIN: &str = "<!-- BEGIN dmem-managed: persona + protocols (source of truth = your daimon memory; refresh with `dmem bootstrap --hermes`) -->";
+const SOUL_END: &str = "<!-- END dmem-managed -->";
+/// Lead-in so the model treats the projected protocols as binding operating rules (not just
+/// personality/tone, which is SOUL.md's default framing) and knows the exact save tools.
+const SOUL_LEAD: &str = "You ARE the persona defined below, and the protocols below are your binding operating rules, not style notes. The Memory Save Discipline governs WHEN and HOW you persist memory; the Behavioral Discipline governs how you work. Persist durable memory with your memory tools (this harness exposes them as mcp_dmem_recall, mcp_dmem_remember, mcp_dmem_log_decision, mcp_dmem_log_lesson, mcp_dmem_log_incident, mcp_dmem_add_reminder, mcp_dmem_forget) exactly as the Memory Save Discipline directs.";
+
+/// Project the live dmem persona + protocols into a dmem-managed block in Hermes's SOUL.md (its
+/// always-on system-prompt identity), so Izu's identity + governance are present on every message
+/// - fresh session, resumed session, or after compaction - which the per-prompt user-message hook
+/// cannot guarantee. Recent/recalled memory stays on the hook. Content OUTSIDE the markers (the
+/// user's own SOUL.md edits) is preserved. SOUL.md is reloaded by Hermes each message (no restart).
+fn hermes_sync_soul(remove: bool) -> Result<()> {
+    let soul = home()?.join(".hermes/SOUL.md");
+    let existing = std::fs::read_to_string(&soul).unwrap_or_default();
+    // Drop any prior dmem-managed block, keep everything else verbatim.
+    let outside = match (existing.find(SOUL_BEGIN), existing.find(SOUL_END)) {
+        (Some(b), Some(e)) if e > b => {
+            let before = existing[..b].trim_end();
+            let after = existing[e + SOUL_END.len()..].trim_start_matches('\n');
+            if after.is_empty() {
+                before.to_string()
+            } else {
+                format!("{before}\n{after}")
+            }
+        }
+        _ => existing.trim_end().to_string(),
+    };
+    let new_content = if remove {
+        if outside.is_empty() { String::new() } else { format!("{outside}\n") }
+    } else {
+        let m = crate::tools::Memory::open().map_err(|e| anyhow!("open memory: {e:#}"))?;
+        let persona = m.persona().map_err(|e| anyhow!("read persona: {e:#}"))?;
+        if persona.is_empty() {
+            return Err(anyhow!("no persona/protocol records to project (seed them first, e.g. `dmem setup`)"));
+        }
+        let block = crate::render::render_soul(&persona);
+        if outside.is_empty() {
+            format!("{SOUL_BEGIN}\n{SOUL_LEAD}\n\n{block}\n{SOUL_END}\n")
+        } else {
+            format!("{outside}\n\n{SOUL_BEGIN}\n{SOUL_LEAD}\n\n{block}\n{SOUL_END}\n")
+        }
+    };
+    if let Some(p) = soul.parent() {
+        std::fs::create_dir_all(p)?;
+    }
+    std::fs::write(&soul, new_content).with_context(|| format!("write {}", soul.display()))?;
+    Ok(())
+}
+
+/// Hermes: wire dmem as an MCP server (tools) + a `pre_llm_call` shell hook (recall every turn),
+/// project persona/protocols into SOUL.md (always-on identity), allowlist just that one hook
+/// command, and migrate off the v1 daimon memory provider. Backed up to config.yaml.dmbak; the
+/// edited YAML is re-parsed before it overwrites the config.
 fn hermes_install(dm: &str, remove: bool) -> Result<()> {
     use serde_yaml_ng::{Mapping, Value as Y};
     let cfg = home()?.join(".hermes/config.yaml");
@@ -394,15 +445,22 @@ fn hermes_install(dm: &str, remove: bool) -> Result<()> {
     std::fs::write(&cfg, out).with_context(|| format!("write {}", cfg.display()))?;
 
     hermes_allowlist(&hook_cmd, remove)?;
+    let soul_status = match hermes_sync_soul(remove) {
+        Ok(()) if remove => "removed the dmem-managed block from ~/.hermes/SOUL.md".to_string(),
+        Ok(()) => "persona + protocols -> ~/.hermes/SOUL.md (always-on identity; reloaded each message)".to_string(),
+        Err(e) => format!("SOUL.md persona projection skipped ({e:#})"),
+    };
 
     if remove {
         println!("  unwired Hermes (MCP + pre_llm_call hook) -> {}", cfg.display());
+        println!("    {soul_status}");
     } else {
-        println!("  wired Hermes -> {} (MCP tools + pre_llm_call: persona on first turn, recall per prompt)", cfg.display());
+        println!("  wired Hermes -> {} (MCP tools + pre_llm_call recall; persona via SOUL.md)", cfg.display());
+        println!("    {soul_status}");
         println!("    allowlisted only the dmem hook in ~/.hermes/shell-hooks-allowlist.json (no global auto-accept).");
         println!("    migrated memory.provider off the v1 daimon plugin (set to unset) where it was 'daimon'.");
-        println!("    IMPORTANT: fully restart Hermes (quit the process, not just a new session). Hermes");
-        println!("               auto-reloads MCP on config change but registers shell hooks only at startup.");
+        println!("    note: SOUL.md is a projection of your dmem persona/protocols; re-run `dmem bootstrap --hermes` after you change them.");
+        println!("    restart Hermes once after wiring so it registers the recall hook (it hot-reloads MCP, but registers shell hooks only at startup).");
     }
     Ok(())
 }

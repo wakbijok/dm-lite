@@ -87,6 +87,19 @@ pub fn render_session(persona: &[Entry], recent: &[Entry]) -> String {
     parts.join("\n\n")
 }
 
+/// Project persona + protocol bodies into a SOUL.md identity block (Hermes's always-on
+/// system-prompt identity file). Unlike `render_session` this carries no hook wrappers and no
+/// recent memory: it is the stable identity + governance the agent embodies on every message,
+/// fresh or resumed. Recent/recalled memory stays on the per-prompt hook.
+pub fn render_soul(persona: &[Entry]) -> String {
+    let mut s = String::new();
+    for e in persona {
+        s.push_str(e.body.trim_end());
+        s.push_str("\n\n");
+    }
+    s.trim_end().to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
