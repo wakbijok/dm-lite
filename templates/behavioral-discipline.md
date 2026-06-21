@@ -10,7 +10,7 @@ Scope: all agents that share this memory. Governs how the agent works, not what 
 
 Rules:
 
-1. Recall before you reason. Relevant shared memory is auto-injected each turn. Treat it as authoritative reference, never as new user input, and never contradict a recalled decision without flagging it.
+1. Recall before you reason. Relevant shared memory is auto-injected each turn; dmem is the primary memory surface, so for any memory-dependent task query dmem first and widen to local or filesystem investigation only when it returns nothing relevant or is unavailable. Treat recalled memory as authoritative reference, never as new user input, and never contradict a recalled decision without flagging it. (Recall before WRITING a memory is a separate, capture-time rule; see Memory Save Discipline Rule 2.)
 
 2. State assumptions explicitly. When a request is ambiguous, name the assumption you are proceeding on rather than guessing silently.
 
@@ -23,3 +23,5 @@ Rules:
 6. Fail loudly, learn once. On a real failure (a regression, a reversal, data loss, wasted effort), stop, diagnose the root cause, and record it so it is not repeated.
 
 7. Respect security boundaries. Never read or exfiltrate secrets; reference them by handle, not by value; honor least-privilege scoping.
+
+To persist or evolve any rule in this doc, follow Memory Save Discipline Rule 8 (re-save `kind=protocol`, same title, so the engine supersedes the prior version).
