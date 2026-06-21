@@ -28,7 +28,7 @@ Then let the wizard set you up:
 dmem setup
 ```
 
-It detects your agents (Devin, Claude), wires the hooks you pick, and seeds a first memory.
+It detects your agents (Claude, Devin, Codex, Hermes), wires the ones you pick (nothing is pre-selected), and seeds a first memory.
 
 ## Save and recall
 
@@ -56,14 +56,24 @@ dmem recall "vector store" --as-of 1718000000000                  # the store as
 
 ## Wire it into your agent
 
-This installs lifecycle hooks, so the agent gets relevant memory injected each turn and a nudge to capture decisions at session end.
+One command per agent. It installs the lifecycle hooks (persona on session start, relevant memory recalled each turn, a save nudge) and registers the dmem MCP server (the remember / recall / log_* tools), then migrates off any older daimon wiring.
 
 ```bash
-dmem bootstrap --devin     # Devin CLI
 dmem bootstrap --claude    # Claude Code
+dmem bootstrap --devin     # Devin CLI
+dmem bootstrap --codex     # Codex
+dmem bootstrap --hermes    # Hermes
+dmem bootstrap --all       # every agent detected
+dmem bootstrap --remove --claude   # undo (per agent, or --all)
 ```
 
-dmem also speaks MCP over stdio:
+Each harness injects differently:
+
+- Claude, Devin: hooks live in the agent config (settings.json, config.json); the MCP server is added through `claude mcp add` / `devin mcp add`. Injection is silent.
+- Codex: MCP lives in `~/.codex/config.toml`; the hooks ship as a small plugin that bootstrap installs with `codex plugin add` (the `codex` CLI must be on PATH, else run `codex plugin add dmem@dmem` yourself). On the next session Codex asks once to TRUST the hooks, and echoes the injected context to the terminal (expected).
+- Hermes: MCP lives in `~/.hermes/config.yaml`; recall rides a `pre_llm_call` hook; persona and protocols are projected into `~/.hermes/SOUL.md` (Hermes's always-on identity), a snapshot you refresh by re-running `dmem bootstrap --hermes` after changing them. Restart Hermes once after wiring.
+
+For any other MCP client, dmem serves it over stdio:
 
 ```bash
 dmem mcp
@@ -90,6 +100,21 @@ curl -sk -X POST https://localhost:8077/recall \
 ```
 
 Each tenant gets its own database file. Routes mirror the local tools: `POST /recall /recent /history /forget /remember /log_decision /log_lesson /log_incident /log_runbook /log_convention /add_reminder /import /persona`, plus admin routes and an open `GET /healthz`.
+
+## Run as a managed service
+
+Run dmem as a login service (launchd on macOS, systemd `--user` on Linux) instead of `dmem serve` in a terminal. It starts on login; stopping it reclaims the model's RAM.
+
+```bash
+dmem service install     # write the unit + [server] block, then start it
+dmem service status
+dmem service stop
+dmem service start
+dmem service restart
+dmem service uninstall
+```
+
+`install` also points this machine's config at the daemon, so the CLI and agent hooks become thin clients of the running process.
 
 ## Multitenant admin (token-only, no passwords)
 
