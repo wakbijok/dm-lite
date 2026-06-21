@@ -61,6 +61,8 @@ enum Cmd {
         #[arg(long)]
         claude: bool,
         #[arg(long)]
+        codex: bool,
+        #[arg(long)]
         all: bool,
         /// remove dm's hooks instead of adding them
         #[arg(long)]
@@ -299,8 +301,8 @@ fn run() -> Result<()> {
     match cli.cmd {
         #[cfg(feature = "wizard")]
         Cmd::Setup => setup::run(),
-        Cmd::Bootstrap { devin, claude, all, remove } => {
-            bootstrap::run_mode(devin || all, claude || all, remove)
+        Cmd::Bootstrap { devin, claude, codex, all, remove } => {
+            bootstrap::run_mode(devin || all, claude || all, codex || all, remove)
         }
         Cmd::Hook(HookCmd::SessionStart) => hooks::session_start(),
         Cmd::Hook(HookCmd::UserPromptSubmit { prompt }) => {

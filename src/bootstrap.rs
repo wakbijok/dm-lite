@@ -108,12 +108,55 @@ fn install_into(config_path: &Path, dm: &str, remove: bool) -> Result<()> {
     Ok(())
 }
 
-pub fn run(devin: bool, claude: bool) -> Result<()> {
-    run_mode(devin, claude, false)
+/// Codex: register `dmem mcp` as a stdio MCP server in ~/.codex/config.toml, and drop any stale
+/// v1 daimon HTTP-MCP. Format-preserving (toml_edit), backed up to config.toml.dmbak, and the
+/// edited document is re-parsed before it overwrites Codex's config so a bad edit can never
+/// corrupt it.
+fn codex_install(dm: &str, remove: bool) -> Result<()> {
+    let cfg = home()?.join(".codex/config.toml");
+    if !cfg.exists() {
+        println!("  skip Codex (no ~/.codex/config.toml)");
+        return Ok(());
+    }
+    let raw = std::fs::read_to_string(&cfg).with_context(|| format!("read {}", cfg.display()))?;
+    let _ = std::fs::write(cfg.with_file_name("config.toml.dmbak"), &raw);
+    let mut doc: toml_edit::DocumentMut = raw.parse().with_context(|| "parse ~/.codex/config.toml")?;
+    if doc.get("mcp_servers").and_then(|s| s.as_table()).is_none() {
+        doc["mcp_servers"] = toml_edit::Item::Table(toml_edit::Table::new());
+    }
+    let servers = doc["mcp_servers"].as_table_mut().unwrap();
+    servers.remove("dmem"); // idempotent re-run
+    servers.remove("daimon"); // migrate off the v1 HTTP MCP
+    if !remove {
+        let mut t = toml_edit::Table::new();
+        t["command"] = toml_edit::value(dm);
+        let mut args = toml_edit::Array::new();
+        args.push("mcp");
+        t["args"] = toml_edit::value(args);
+        servers["dmem"] = toml_edit::Item::Table(t);
+    }
+    let out = doc.to_string();
+    out.parse::<toml_edit::DocumentMut>().with_context(|| "refusing to write: edited config.toml no longer parses")?;
+    std::fs::write(&cfg, out).with_context(|| format!("write {}", cfg.display()))?;
+    println!(
+        "  {} Codex MCP -> {} (mcp_servers.dmem = `dmem mcp`)",
+        if remove { "unwired" } else { "wired" },
+        cfg.display()
+    );
+    if !remove {
+        println!("    note: Codex auto-recall hooks (persona/recall) land in the next build; the MCP save/recall tools work now.");
+    }
+    Ok(())
 }
 
-/// Wire or (with `remove`) unwire dm's hooks into the selected agents.
-pub fn run_mode(devin: bool, claude: bool, remove: bool) -> Result<()> {
+pub fn run(devin: bool, claude: bool) -> Result<()> {
+    run_mode(devin, claude, false, false)
+}
+
+/// Wire or (with `remove`) unwire dmem into the selected agents. Devin + Claude Code use the
+/// generic Claude-compatible settings.json hook merge; Codex uses a bespoke `~/.codex/config.toml`
+/// MCP installer (more harnesses land here next).
+pub fn run_mode(devin: bool, claude: bool, codex: bool, remove: bool) -> Result<()> {
     let dm = dm_bin()?;
     let h = home()?;
     let mut did_any = false;
@@ -137,8 +180,13 @@ pub fn run_mode(devin: bool, claude: bool, remove: bool) -> Result<()> {
         did_any = true;
     }
 
+    if codex {
+        codex_install(&dm, remove)?;
+        did_any = true;
+    }
+
     if !did_any {
-        println!("Nothing changed. Pass --devin and/or --claude (or --all), and ensure the agent is installed.");
+        println!("Nothing changed. Pass --devin / --claude / --codex (or --all), and ensure the agent is installed.");
         return Ok(());
     }
     println!();
