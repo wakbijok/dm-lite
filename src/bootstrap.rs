@@ -482,6 +482,19 @@ fn hermes_install(dm: &str, remove: bool) -> Result<()> {
     Ok(())
 }
 
+/// Wire (or with `remove`, unwire) the dmem stdio MCP server through a CLI agent's own `mcp`
+/// subcommand (`claude mcp add` / `devin mcp add`), so the save tools register the canonical way
+/// - the same pattern as `codex plugin add`. Idempotent (drops any prior entry first). Returns
+/// true if wired (or cleanly removed); false if the agent CLI is missing or the add failed, so
+/// the caller can print the manual command. Best-effort: never aborts the whole bootstrap.
+fn agent_mcp(cli: &str, add_args: &[&str], rm_args: &[&str], remove: bool) -> bool {
+    let _ = std::process::Command::new(cli).args(rm_args).output();
+    if remove {
+        return true;
+    }
+    matches!(std::process::Command::new(cli).args(add_args).output(), Ok(o) if o.status.success())
+}
+
 pub fn run(devin: bool, claude: bool, codex: bool, hermes: bool) -> Result<()> {
     run_mode(devin, claude, codex, hermes, false)
 }
@@ -509,7 +522,21 @@ pub fn run_mode(devin: bool, claude: bool, codex: bool, hermes: bool, remove: bo
             continue;
         }
         install_into(path, &dm, remove)?;
-        println!("  {} {} -> {}", if remove { "unwired" } else { "wired" }, name, path.display());
+        // Parity with codex/hermes: also wire the MCP save tools via the agent's own `mcp` CLI.
+        // Hooks alone give persona + recall; the remember/log_* tools come from the MCP server.
+        let (cli, add, rm): (&str, Vec<&str>, Vec<&str>) = if i == 0 {
+            ("devin", vec!["mcp", "add", "dmem", "--", dm.as_str(), "mcp"], vec!["mcp", "remove", "dmem"])
+        } else {
+            ("claude", vec!["mcp", "add", "dmem", "--scope", "user", "--", dm.as_str(), "mcp"], vec!["mcp", "remove", "dmem", "--scope", "user"])
+        };
+        let mcp_ok = agent_mcp(cli, &add, &rm, remove);
+        if remove {
+            println!("  unwired {} -> {} (hooks + MCP)", name, path.display());
+        } else if mcp_ok {
+            println!("  wired {} -> {} (hooks + MCP save tools)", name, path.display());
+        } else {
+            println!("  wired {} -> {} (hooks only). MCP step failed; run manually: {} {}", name, path.display(), cli, add.join(" "));
+        }
         did_any = true;
     }
 
