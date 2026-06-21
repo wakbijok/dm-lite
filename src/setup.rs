@@ -115,9 +115,15 @@ pub fn run() -> Result<()> {
     let home = dirs::home_dir().ok_or_else(|| anyhow!("no home directory"))?;
     let devin_cfg = home.join(".config/devin/config.json");
     let claude_cfg = home.join(".claude/settings.json");
+    let codex_cfg = home.join(".codex/config.toml");
+    let hermes_cfg = home.join(".hermes/config.yaml");
     let devin_present = home.join(".config/devin").exists();
     let claude_present = home.join(".claude").exists();
-    let label = |present: bool, cfg: &std::path::Path, name: &str| -> String {
+    let codex_present = codex_cfg.exists();
+    let hermes_present = hermes_cfg.exists();
+    // Devin/Claude use the JSON SessionStart-hook probe; Codex/Hermes have no such shape, so a
+    // plain text probe flags a config that already references a daimon/dmem memory wiring.
+    let json_label = |present: bool, cfg: &std::path::Path, name: &str| -> String {
         if !present {
             format!("{name} (not installed)")
         } else if crate::bootstrap::has_memory_hooks(cfg) {
@@ -126,19 +132,33 @@ pub fn run() -> Result<()> {
             name.to_string()
         }
     };
+    let plain_label = |present: bool, cfg: &std::path::Path, name: &str| -> String {
+        let wired = std::fs::read_to_string(cfg).map(|s| s.contains("daimon") || s.contains("dmem")).unwrap_or(false);
+        if !present {
+            format!("{name} (not installed)")
+        } else if wired {
+            format!("{name} (already references daimon/dmem - leave unchecked unless replacing)")
+        } else {
+            name.to_string()
+        }
+    };
     let items = [
-        label(devin_present, &devin_cfg, "Devin CLI"),
-        label(claude_present, &claude_cfg, "Claude Code"),
+        json_label(devin_present, &devin_cfg, "Devin CLI"),
+        json_label(claude_present, &claude_cfg, "Claude Code"),
+        plain_label(codex_present, &codex_cfg, "Codex"),
+        plain_label(hermes_present, &hermes_cfg, "Hermes"),
     ];
     let chosen = MultiSelect::with_theme(&theme)
         .with_prompt("Wire dmem into which agents? (nothing is pre-selected; space toggles, enter confirms)")
         .items(&items)
-        .defaults(&[false, false])
+        .defaults(&[false, false, false, false])
         .interact()?;
     let devin = chosen.contains(&0);
     let claude = chosen.contains(&1);
-    if devin || claude {
-        crate::bootstrap::run(devin, claude)?;
+    let codex = chosen.contains(&2);
+    let hermes = chosen.contains(&3);
+    if devin || claude || codex || hermes {
+        crate::bootstrap::run(devin, claude, codex, hermes)?;
     } else {
         println!("(skipped agent wiring - undo any wiring later with `dmem bootstrap --remove`)");
     }

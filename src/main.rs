@@ -63,14 +63,21 @@ enum Cmd {
         #[arg(long)]
         codex: bool,
         #[arg(long)]
+        hermes: bool,
+        #[arg(long)]
         all: bool,
         /// remove dm's hooks instead of adding them
         #[arg(long)]
         remove: bool,
     },
     /// Lifecycle hook handlers (called by the agent; emit context on stdout).
-    #[command(subcommand)]
-    Hook(HookCmd),
+    Hook {
+        #[command(subcommand)]
+        event: HookCmd,
+        /// emit Hermes-shape output ({"context": ...}) and read Hermes hook-input fields
+        #[arg(long, global = true)]
+        hermes: bool,
+    },
     /// Save a typed Decision.
     LogDecision {
         #[arg(long)]
@@ -301,15 +308,17 @@ fn run() -> Result<()> {
     match cli.cmd {
         #[cfg(feature = "wizard")]
         Cmd::Setup => setup::run(),
-        Cmd::Bootstrap { devin, claude, codex, all, remove } => {
-            bootstrap::run_mode(devin || all, claude || all, codex || all, remove)
+        Cmd::Bootstrap { devin, claude, codex, hermes, all, remove } => {
+            bootstrap::run_mode(devin || all, claude || all, codex || all, hermes || all, remove)
         }
-        Cmd::Hook(HookCmd::SessionStart) => hooks::session_start(),
-        Cmd::Hook(HookCmd::UserPromptSubmit { prompt }) => {
-            let arg = if prompt.is_empty() { None } else { Some(prompt.join(" ")) };
-            hooks::user_prompt_submit(arg)
-        }
-        Cmd::Hook(HookCmd::SessionEnd) => hooks::session_end(),
+        Cmd::Hook { event, hermes } => match event {
+            HookCmd::SessionStart => hooks::session_start(hermes),
+            HookCmd::UserPromptSubmit { prompt } => {
+                let arg = if prompt.is_empty() { None } else { Some(prompt.join(" ")) };
+                hooks::user_prompt_submit(arg, hermes)
+            }
+            HookCmd::SessionEnd => hooks::session_end(),
+        },
         Cmd::LogDecision { title, context, decision, rationale, namespace } => {
             let uri = Memory::open()?.log_decision(&title, &context, &decision, &rationale, &namespace)?;
             println!("stored {}", uri);

@@ -246,14 +246,173 @@ fn codex_install(dm: &str, remove: bool) -> Result<()> {
     Ok(())
 }
 
-pub fn run(devin: bool, claude: bool) -> Result<()> {
-    run_mode(devin, claude, false, false)
+/// serde_yaml emits YAML 1.2, but Hermes loads its config with PyYAML (1.1), where the bare
+/// tokens off/on/yes/no/y/n are booleans. serde only ever emits those bare for STRING values
+/// (1.2 keeps them strings), so any such bare value in our output is a string PyYAML would
+/// silently misread (e.g. `mode: 'off'` round-tripped to `mode: off` -> False). Re-single-quote
+/// exactly those scalar values; keys and already-quoted/structured values are left untouched.
+/// This keeps the structural round-trip (which handles every config shape) safe for PyYAML.
+fn yaml_quote_pyyaml_unsafe(yaml: &str) -> String {
+    fn risky(v: &str) -> bool {
+        matches!(v.to_ascii_lowercase().as_str(), "y" | "n" | "yes" | "no" | "on" | "off")
+    }
+    let mut out = String::with_capacity(yaml.len() + 16);
+    for piece in yaml.split_inclusive('\n') {
+        let nl = piece.ends_with('\n');
+        let line = piece.trim_end_matches('\n');
+        let indent_len = line.len() - line.trim_start().len();
+        let (indent, rest) = line.split_at(indent_len);
+        let fixed = if let Some(pos) = rest.find(": ") {
+            let (k, v) = (&rest[..pos], rest[pos + 2..].trim());
+            if risky(v) { Some(format!("{indent}{k}: '{v}'")) } else { None }
+        } else if let Some(v) = rest.strip_prefix("- ") {
+            let v = v.trim();
+            if risky(v) { Some(format!("{indent}- '{v}'")) } else { None }
+        } else {
+            None
+        };
+        out.push_str(fixed.as_deref().unwrap_or(line));
+        if nl {
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// Merge (or, with `remove`, drop) a single scoped approval for our hook command into Hermes's
+/// shell-hooks allowlist. This is deliberately narrow - we allowlist ONLY `dmem`'s own command
+/// rather than flipping the global `hooks_auto_accept`, so dmem's hook registers without a TTY
+/// prompt while every other shell hook still requires the user's explicit consent.
+fn hermes_allowlist(hook_cmd: &str, remove: bool) -> Result<()> {
+    let path = home()?.join(".hermes/shell-hooks-allowlist.json");
+    let mut doc: Value = if path.exists() {
+        std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_else(|| json!({ "approvals": [] }))
+    } else {
+        json!({ "approvals": [] })
+    };
+    if !doc.get("approvals").map(|a| a.is_array()).unwrap_or(false) {
+        doc["approvals"] = json!([]);
+    }
+    let approvals = doc["approvals"].as_array_mut().unwrap();
+    approvals.retain(|e| e.get("command").and_then(|c| c.as_str()) != Some(hook_cmd));
+    if !remove {
+        approvals.push(json!({ "event": "pre_llm_call", "command": hook_cmd }));
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&path, serde_json::to_string_pretty(&doc)? + "\n")
+        .with_context(|| format!("write {}", path.display()))?;
+    Ok(())
+}
+
+/// Hermes: wire dmem as an MCP server (tools) + a `pre_llm_call` shell hook (persona on the
+/// first turn, recall every turn - Hermes's on_session_start cannot inject context), allowlist
+/// just that one hook command, and migrate off the v1 daimon memory provider. Backed up to
+/// config.yaml.dmbak; the edited YAML is re-parsed before it overwrites the config.
+fn hermes_install(dm: &str, remove: bool) -> Result<()> {
+    use serde_yaml_ng::{Mapping, Value as Y};
+    let cfg = home()?.join(".hermes/config.yaml");
+    if !cfg.exists() {
+        println!("  skip Hermes (no ~/.hermes/config.yaml)");
+        return Ok(());
+    }
+    let raw = std::fs::read_to_string(&cfg).with_context(|| format!("read {}", cfg.display()))?;
+    let _ = std::fs::write(cfg.with_file_name("config.yaml.dmbak"), &raw);
+    let mut doc: Y = serde_yaml_ng::from_str(&raw).with_context(|| "parse ~/.hermes/config.yaml")?;
+    let root = doc
+        .as_mapping_mut()
+        .ok_or_else(|| anyhow!("~/.hermes/config.yaml is not a YAML mapping"))?;
+    let hook_cmd = format!("{dm} hook user_prompt_submit --hermes");
+
+    // MCP tools: mcp_servers.dmem = { command, args:[mcp] }; drop the v1 daimon server.
+    let mcp = root
+        .entry(Y::from("mcp_servers"))
+        .or_insert_with(|| Y::Mapping(Mapping::new()));
+    if let Some(m) = mcp.as_mapping_mut() {
+        m.remove("dmem");
+        m.remove("daimon");
+        if !remove {
+            let mut e = Mapping::new();
+            e.insert(Y::from("command"), Y::from(dm));
+            e.insert(Y::from("args"), Y::Sequence(vec![Y::from("mcp")]));
+            m.insert(Y::from("dmem"), Y::Mapping(e));
+        }
+    }
+
+    // Hook: hooks.pre_llm_call - keep any non-dmem entries, (re)add ours.
+    let hooks = root
+        .entry(Y::from("hooks"))
+        .or_insert_with(|| Y::Mapping(Mapping::new()));
+    if let Some(h) = hooks.as_mapping_mut() {
+        let mut kept: Vec<Y> = h
+            .get("pre_llm_call")
+            .and_then(|v| v.as_sequence())
+            .map(|seq| {
+                seq.iter()
+                    .filter(|e| {
+                        !e.get("command")
+                            .and_then(|c| c.as_str())
+                            .map(|c| c.contains(dm))
+                            .unwrap_or(false)
+                    })
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !remove {
+            let mut e = Mapping::new();
+            e.insert(Y::from("command"), Y::from(hook_cmd.as_str()));
+            e.insert(Y::from("timeout"), Y::from(8));
+            kept.push(Y::Mapping(e));
+        }
+        if kept.is_empty() {
+            h.remove("pre_llm_call");
+        } else {
+            h.insert(Y::from("pre_llm_call"), Y::Sequence(kept));
+        }
+    }
+
+    // Migrate off v1: only when memory.provider is exactly "daimon" (do not touch other setups).
+    if !remove {
+        if let Some(prov) = root
+            .get_mut("memory")
+            .and_then(|m| m.as_mapping_mut())
+            .and_then(|m| m.get_mut("provider"))
+        {
+            if prov.as_str() == Some("daimon") {
+                *prov = Y::from("");
+            }
+        }
+    }
+
+    let out = yaml_quote_pyyaml_unsafe(&serde_yaml_ng::to_string(&doc).with_context(|| "serialize ~/.hermes/config.yaml")?);
+    serde_yaml_ng::from_str::<Y>(&out).with_context(|| "refusing to write: edited config.yaml no longer parses")?;
+    std::fs::write(&cfg, out).with_context(|| format!("write {}", cfg.display()))?;
+
+    hermes_allowlist(&hook_cmd, remove)?;
+
+    if remove {
+        println!("  unwired Hermes (MCP + pre_llm_call hook) -> {}", cfg.display());
+    } else {
+        println!("  wired Hermes -> {} (MCP tools + pre_llm_call: persona on first turn, recall per prompt)", cfg.display());
+        println!("    allowlisted only the dmem hook in ~/.hermes/shell-hooks-allowlist.json (no global auto-accept).");
+        println!("    migrated memory.provider off the v1 daimon plugin (set to unset) where it was 'daimon'.");
+    }
+    Ok(())
+}
+
+pub fn run(devin: bool, claude: bool, codex: bool, hermes: bool) -> Result<()> {
+    run_mode(devin, claude, codex, hermes, false)
 }
 
 /// Wire or (with `remove`) unwire dmem into the selected agents. Devin + Claude Code use the
 /// generic Claude-compatible settings.json hook merge; Codex uses a bespoke `~/.codex/config.toml`
-/// MCP installer (more harnesses land here next).
-pub fn run_mode(devin: bool, claude: bool, codex: bool, remove: bool) -> Result<()> {
+/// MCP+plugin installer; Hermes uses a `~/.hermes/config.yaml` MCP+shell-hook installer.
+pub fn run_mode(devin: bool, claude: bool, codex: bool, hermes: bool, remove: bool) -> Result<()> {
     let dm = dm_bin()?;
     let h = home()?;
     let mut did_any = false;
@@ -282,8 +441,13 @@ pub fn run_mode(devin: bool, claude: bool, codex: bool, remove: bool) -> Result<
         did_any = true;
     }
 
+    if hermes {
+        hermes_install(&dm, remove)?;
+        did_any = true;
+    }
+
     if !did_any {
-        println!("Nothing changed. Pass --devin / --claude / --codex (or --all), and ensure the agent is installed.");
+        println!("Nothing changed. Pass --devin / --claude / --codex / --hermes (or --all), and ensure the agent is installed.");
         return Ok(());
     }
     println!();
@@ -291,7 +455,7 @@ pub fn run_mode(devin: bool, claude: bool, codex: bool, remove: bool) -> Result<
         println!("Done. dmem hooks removed (the agent's other hooks/plugins are untouched).");
     } else {
         println!("Done. dmem is wired in (SessionStart -> persona/recent, UserPromptSubmit -> recall + save nudge).");
-        println!("Undo any time with:  dmem bootstrap --remove --devin / --claude / --codex");
+        println!("Undo any time with:  dmem bootstrap --remove --devin / --claude / --codex / --hermes");
     }
     Ok(())
 }

@@ -1,39 +1,43 @@
-//! Hook handlers invoked by the host agent (Devin, Claude Code) on lifecycle events.
-//! They emit a Claude-Code-compatible additionalContext payload on stdout, which Devin
-//! (CC-compatible hooks) and Claude Code both inject into the model context.
+//! Hook handlers invoked by the host agent (Devin, Claude Code, Codex, Hermes) on lifecycle
+//! events. By default they emit a Claude-Code-compatible additionalContext payload on stdout,
+//! which Devin, Claude Code, and Codex (same hook shape) inject into the model context. With
+//! `--hermes` they emit Hermes's `{"context": ...}` shape and read Hermes's hook-input fields
+//! instead - Hermes has no context-injecting SessionStart, so persona rides the first
+//! pre_llm_call (see `user_prompt_submit`).
 
 use crate::render;
 use crate::tools::Memory;
 use anyhow::Result;
 use std::io::Read;
 
-/// Emit a CC-compatible hook injection. Empty text = inject nothing (turn proceeds).
-fn emit(event: &str, text: &str) {
+/// Emit a hook injection in the host's shape. Empty text = inject nothing (turn proceeds).
+fn emit(event: &str, text: &str, hermes: bool) {
     if text.trim().is_empty() {
         return;
     }
-    let out = serde_json::json!({
-        "hookSpecificOutput": { "hookEventName": event, "additionalContext": text }
-    });
+    let out = if hermes {
+        serde_json::json!({ "context": text })
+    } else {
+        serde_json::json!({ "hookSpecificOutput": { "hookEventName": event, "additionalContext": text } })
+    };
     println!("{}", out);
 }
 
-/// Read the hook event JSON from stdin and pull out a field (best-effort).
-fn stdin_field(field: &str) -> Option<String> {
+/// Read the hook event JSON from stdin once (best-effort). Callers pull fields off the result.
+fn read_stdin_json() -> Option<serde_json::Value> {
     let mut raw = String::new();
     if std::io::stdin().read_to_string(&mut raw).is_err() {
         return None;
     }
-    let v: serde_json::Value = serde_json::from_str(raw.trim()).ok()?;
-    v.get(field).and_then(|x| x.as_str()).map(|s| s.to_string())
+    serde_json::from_str(raw.trim()).ok()
 }
 
 /// SessionStart: inject persona/protocol + recent context.
-pub fn session_start() -> Result<()> {
+pub fn session_start(hermes: bool) -> Result<()> {
     let m = Memory::open()?;
     let persona = m.persona().unwrap_or_default();
     let recent = m.recent(5).unwrap_or_default();
-    emit("SessionStart", &render::render_session(&persona, &recent));
+    emit("SessionStart", &render::render_session(&persona, &recent), hermes);
     Ok(())
 }
 
@@ -57,20 +61,44 @@ pub fn session_end() -> Result<()> {
     Ok(())
 }
 
-/// UserPromptSubmit: recall relevant memory for the submitted prompt (from stdin, or arg),
-/// and append a save-discipline nudge when this session's work looks uncaptured. Both ride
-/// one additionalContext payload (the only injection point both harnesses accept per turn).
-pub fn user_prompt_submit(arg: Option<String>) -> Result<()> {
+/// UserPromptSubmit (Claude/Codex) / pre_llm_call (Hermes): recall relevant memory for the
+/// submitted prompt and append a save-discipline nudge when this session's work looks
+/// uncaptured. Claude/Codex put the prompt at top-level `prompt`; Hermes passes it as
+/// `extra.user_message` and also flags `extra.is_first_turn`, so on a Hermes first turn we
+/// prepend the persona block here (Hermes has no context-injecting SessionStart hook).
+pub fn user_prompt_submit(arg: Option<String>, hermes: bool) -> Result<()> {
+    let input = read_stdin_json();
     let prompt = arg
         .filter(|s| !s.trim().is_empty())
-        .or_else(|| stdin_field("prompt"))
-        .or_else(|| stdin_field("user_prompt"))
+        .or_else(|| {
+            let v = input.as_ref()?;
+            if hermes {
+                v.pointer("/extra/user_message").and_then(|x| x.as_str()).map(|s| s.to_string())
+            } else {
+                v.get("prompt").or_else(|| v.get("user_prompt")).and_then(|x| x.as_str()).map(|s| s.to_string())
+            }
+        })
         .unwrap_or_default();
     if prompt.trim().len() < 3 {
         return Ok(());
     }
     let m = Memory::open()?;
     let mut blocks: Vec<String> = Vec::new();
+    // Hermes first turn: ride the persona/recent block here, since on_session_start cannot inject.
+    if hermes
+        && input
+            .as_ref()
+            .and_then(|v| v.pointer("/extra/is_first_turn"))
+            .and_then(|x| x.as_bool())
+            .unwrap_or(false)
+    {
+        let persona = m.persona().unwrap_or_default();
+        let recent = m.recent(5).unwrap_or_default();
+        let session = render::render_session(&persona, &recent);
+        if !session.trim().is_empty() {
+            blocks.push(session);
+        }
+    }
     let recall = render::render_recall(&m.recall(&prompt, 6).unwrap_or_default());
     if !recall.trim().is_empty() {
         blocks.push(recall);
@@ -80,7 +108,7 @@ pub fn user_prompt_submit(arg: Option<String>) -> Result<()> {
     if should_nudge(latest, crate::entry::now_ms()) {
         blocks.push(render::render_nudge());
     }
-    emit("UserPromptSubmit", &blocks.join("\n"));
+    emit("UserPromptSubmit", &blocks.join("\n"), hermes);
     Ok(())
 }
 
