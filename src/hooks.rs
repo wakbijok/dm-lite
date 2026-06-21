@@ -23,13 +23,42 @@ fn emit(event: &str, text: &str, hermes: bool) {
     println!("{}", out);
 }
 
-/// Read the hook event JSON from stdin once (best-effort). Callers pull fields off the result.
-fn read_stdin_json() -> Option<serde_json::Value> {
+/// Read the hook event JSON from stdin once (best-effort), returning both the raw text (for
+/// debug capture) and the parsed value. Callers pull fields off the parsed result.
+fn read_stdin() -> (String, Option<serde_json::Value>) {
     let mut raw = String::new();
     if std::io::stdin().read_to_string(&mut raw).is_err() {
-        return None;
+        return (raw, None);
     }
-    serde_json::from_str(raw.trim()).ok()
+    let parsed = serde_json::from_str(raw.trim()).ok();
+    (raw, parsed)
+}
+
+/// Gated ground-truth capture for hook debugging: when DM_HOOK_DEBUG is set, append one JSON
+/// line per invocation (raw stdin the host sent + what we parsed/emitted). DM_HOOK_DEBUG=1 logs
+/// to <tmp>/dmem-hook-debug.log; any other value is treated as the log file path. Off by default.
+fn debug_log(event: &str, hermes: bool, raw_stdin: &str, prompt: &str, first_turn: bool, emitted_len: usize) {
+    let Some(spec) = std::env::var("DM_HOOK_DEBUG").ok().filter(|s| !s.is_empty()) else {
+        return;
+    };
+    let path = if spec == "1" {
+        std::env::temp_dir().join("dmem-hook-debug.log")
+    } else {
+        std::path::PathBuf::from(spec)
+    };
+    let rec = serde_json::json!({
+        "ts_ms": crate::entry::now_ms(),
+        "event": event,
+        "hermes": hermes,
+        "raw_stdin": raw_stdin.chars().take(2000).collect::<String>(),
+        "parsed_prompt": prompt.chars().take(300).collect::<String>(),
+        "is_first_turn": first_turn,
+        "emitted_len": emitted_len,
+    });
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = writeln!(f, "{rec}");
+    }
 }
 
 /// SessionStart: inject persona/protocol + recent context.
@@ -67,7 +96,7 @@ pub fn session_end() -> Result<()> {
 /// `extra.user_message` and also flags `extra.is_first_turn`, so on a Hermes first turn we
 /// prepend the persona block here (Hermes has no context-injecting SessionStart hook).
 pub fn user_prompt_submit(arg: Option<String>, hermes: bool) -> Result<()> {
-    let input = read_stdin_json();
+    let (raw_in, input) = read_stdin();
     let prompt = arg
         .filter(|s| !s.trim().is_empty())
         .or_else(|| {
@@ -79,19 +108,21 @@ pub fn user_prompt_submit(arg: Option<String>, hermes: bool) -> Result<()> {
             }
         })
         .unwrap_or_default();
-    if prompt.trim().len() < 3 {
-        return Ok(());
-    }
-    let m = Memory::open()?;
-    let mut blocks: Vec<String> = Vec::new();
-    // Hermes first turn: ride the persona/recent block here, since on_session_start cannot inject.
-    if hermes
+    // Hermes flags the first turn so the persona/recent block can ride pre_llm_call (its
+    // on_session_start hook cannot inject context).
+    let first_turn = hermes
         && input
             .as_ref()
             .and_then(|v| v.pointer("/extra/is_first_turn"))
             .and_then(|x| x.as_bool())
-            .unwrap_or(false)
-    {
+            .unwrap_or(false);
+    if prompt.trim().len() < 3 {
+        debug_log("user_prompt_submit", hermes, &raw_in, &prompt, first_turn, 0);
+        return Ok(());
+    }
+    let m = Memory::open()?;
+    let mut blocks: Vec<String> = Vec::new();
+    if first_turn {
         let persona = m.persona().unwrap_or_default();
         let recent = m.recent(5).unwrap_or_default();
         let session = render::render_session(&persona, &recent);
@@ -108,7 +139,9 @@ pub fn user_prompt_submit(arg: Option<String>, hermes: bool) -> Result<()> {
     if should_nudge(latest, crate::entry::now_ms()) {
         blocks.push(render::render_nudge());
     }
-    emit("UserPromptSubmit", &blocks.join("\n"), hermes);
+    let text = blocks.join("\n");
+    debug_log("user_prompt_submit", hermes, &raw_in, &prompt, first_turn, text.len());
+    emit("UserPromptSubmit", &text, hermes);
     Ok(())
 }
 

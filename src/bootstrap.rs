@@ -401,6 +401,8 @@ fn hermes_install(dm: &str, remove: bool) -> Result<()> {
         println!("  wired Hermes -> {} (MCP tools + pre_llm_call: persona on first turn, recall per prompt)", cfg.display());
         println!("    allowlisted only the dmem hook in ~/.hermes/shell-hooks-allowlist.json (no global auto-accept).");
         println!("    migrated memory.provider off the v1 daimon plugin (set to unset) where it was 'daimon'.");
+        println!("    IMPORTANT: fully restart Hermes (quit the process, not just a new session). Hermes");
+        println!("               auto-reloads MCP on config change but registers shell hooks only at startup.");
     }
     Ok(())
 }
