@@ -130,6 +130,8 @@ dmem import ~/dmem-templates/           # load them as records
 
 `dmem setup` also asks your AI's name and your name and sets a default persona plus the generic governance for you. Nothing personal ships in the binary; the templates are blank skeletons.
 
+**dm-lite is the single source of governance.** Your agents' persona and protocols live here and are projected into each agent when you wire it. Static agent-instruction files like `AGENTS.md` (or a stray global `CLAUDE.md`/`SOUL.md` copy) compete with that and become noise: an agent that also reads an `AGENTS.md` picks up a second, drifting identity, and any topology or facts baked into it go stale the moment memory moves on. Some tools auto-create one (e.g. Codex desktop writes `~/AGENTS.md` on import from Claude Code). If you wire dm-lite, remove or empty any global `AGENTS.md` you did not deliberately author; keep only the repo-scoped ones you actually maintain.
+
 ## Migrate in
 
 ```bash
