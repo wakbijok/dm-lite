@@ -86,7 +86,8 @@ pub(crate) fn parse_wikilinks(s: &str) -> Vec<String> {
         match rest.find("]]") {
             Some(j) => {
                 let name = rest[..j].trim();
-                if !name.is_empty() {
+                // A well-formed [[name]] carries no brackets inside; skip nested/garbled captures.
+                if !name.is_empty() && !name.contains('[') && !name.contains(']') {
                     out.push(name.to_string());
                 }
                 rest = &rest[j + 2..];
@@ -489,6 +490,8 @@ impl LocalMemory {
     /// count of `[[name]]` references that resolved to a record and were linked.
     pub fn reindex_links(&self) -> Result<usize> {
         let records = self.store.recent(1_000_000)?;
+        // recent() is ordered importance DESC then created DESC, so on a slug collision or_insert
+        // keeps the highest-importance (then newest) record as the link target. Deterministic.
         let mut by_slug: std::collections::HashMap<String, String> = std::collections::HashMap::new();
         for e in &records {
             if let Some(slug) = e.uri.rsplit('/').next() {

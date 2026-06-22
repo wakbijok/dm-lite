@@ -274,7 +274,8 @@ fn call_tool(mem: &Memory, name: &str, args: &Value) -> std::result::Result<Stri
         }
         "entity" => {
             let kind = crate::entry::Kind::from_str(s(args, "kind"))
-                .ok_or_else(|| format!("unknown entity kind: {}", s(args, "kind")))?;
+                .filter(|k| k.is_entity())
+                .ok_or_else(|| format!("not an entity kind: {} (org/engagement/product/solution_stack/person/framework/site)", s(args, "kind")))?;
             let name = s(args, "name");
             if name.is_empty() {
                 return Err("entity requires a non-empty name".into());
@@ -593,5 +594,17 @@ mod tests {
         assert!(linked["result"]["content"][0]["text"].as_str().unwrap().contains("linked"));
         let links = handle(&mem, &None, &json!({"id":3,"method":"tools/call","params":{"name":"links","arguments":{"uri":a}}})).unwrap();
         assert!(links["result"]["content"][0]["text"].as_str().unwrap().contains(b));
+    }
+
+    #[test]
+    fn entity_tool_rejects_non_entity_kind() {
+        let mem = test_mem();
+        // a non-entity kind (persona) must not be mintable via the entity path
+        let r = handle(&mem, &None, &json!({"id":1,"method":"tools/call","params":{"name":"entity","arguments":{"kind":"persona","name":"X"}}})).unwrap();
+        assert_eq!(r["result"]["isError"], true);
+        assert!(r["result"]["content"][0]["text"].as_str().unwrap().contains("not an entity kind"));
+        // a real entity kind is accepted
+        let ok = handle(&mem, &None, &json!({"id":2,"method":"tools/call","params":{"name":"entity","arguments":{"kind":"org","name":"Lenovo"}}})).unwrap();
+        assert_eq!(ok["result"]["isError"], false);
     }
 }

@@ -44,6 +44,10 @@ pub trait MemoryStore {
     fn invalidate(&self, uri: &str, valid_to_ms: i64) -> Result<usize>;
 
     // --- graph layer (edges between records) ---
+    // Edges are NON-cascading by design: forget/invalidate do not remove a record's edges, so an
+    // edge can outlive its endpoint. Reads handle this gracefully (recall_expanded hydrates only
+    // current records via get(); the viewer drops edges whose endpoints are absent). Remove an
+    // edge explicitly with unlink.
 
     /// Add a typed directed edge `from_uri -[rel]-> to_uri`. Idempotent (a duplicate edge is a
     /// no-op). Edges are curated relations, not bitemporal facts: re-deriving them is safe.

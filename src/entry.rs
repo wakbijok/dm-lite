@@ -85,6 +85,16 @@ impl Kind {
             _ => return None,
         })
     }
+
+    /// Whether this is a domain-entity kind (a knowledge-graph node) rather than a memory-record
+    /// kind. The `entity` surfaces accept only these, so a caller cannot mint, say, a `persona`
+    /// record (importance 95, read into the governance boot layer) through the entity path.
+    pub fn is_entity(&self) -> bool {
+        matches!(
+            self,
+            Kind::Org | Kind::Engagement | Kind::Product | Kind::SolutionStack | Kind::Person | Kind::Framework | Kind::Site
+        )
+    }
 }
 
 /// One memory record version. `body` is the canonical source text (vectors are a
@@ -256,6 +266,16 @@ mod tests {
         assert_eq!(Kind::from_str("convention"), Some(Kind::ProjectConvention));
         assert_eq!(Kind::from_str("lesson"), Some(Kind::AgentLesson));
         assert_eq!(Kind::from_str("nope"), None);
+    }
+
+    #[test]
+    fn is_entity_only_for_entity_kinds() {
+        for k in [Kind::Org, Kind::Engagement, Kind::Product, Kind::SolutionStack, Kind::Person, Kind::Framework, Kind::Site] {
+            assert!(k.is_entity(), "{:?} should be an entity", k);
+        }
+        for k in [Kind::Persona, Kind::Protocol, Kind::Decision, Kind::Memory, Kind::Reminder, Kind::AgentLesson] {
+            assert!(!k.is_entity(), "{:?} must not be an entity (would pollute non-entity layers)", k);
+        }
     }
 
     #[test]

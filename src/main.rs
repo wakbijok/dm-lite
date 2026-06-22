@@ -147,7 +147,7 @@ enum Cmd {
         /// Bitemporal: recall facts VALID AT this epoch-ms (what was true then); defaults to as-of.
         #[arg(long = "valid-at", visible_alias = "valid_at")]
         valid_at: Option<i64>,
-        /// Graph: also pull each hit's neighborhood within this many hops (0 = off).
+        /// Graph: also pull each hit's neighborhood within this many hops (0 = off; ignored when --as-of/--valid-at is set).
         #[arg(long, default_value_t = 0)]
         expand: usize,
     },
@@ -499,8 +499,8 @@ fn run() -> Result<()> {
             Ok(())
         }
         Cmd::Entity { kind, name, attr, desc, namespace } => {
-            let k = entry::Kind::from_str(&kind).ok_or_else(|| {
-                anyhow::anyhow!("unknown entity kind '{kind}' (org/engagement/product/solution_stack/person/framework/site)")
+            let k = entry::Kind::from_str(&kind).filter(|k| k.is_entity()).ok_or_else(|| {
+                anyhow::anyhow!("not an entity kind: '{kind}' (use org/engagement/product/solution_stack/person/framework/site)")
             })?;
             let attrs: Vec<(String, String)> = attr
                 .iter()
