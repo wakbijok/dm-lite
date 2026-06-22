@@ -139,23 +139,40 @@ pub fn run() -> Result<()> {
             name.to_string()
         }
     };
+    // Claude Desktop is hook-less; its only integration is an mcpServers.dmem entry, so probe its
+    // config file for an existing dmem entry rather than the SessionStart-hook probe above.
+    let cd_cfg = dirs::config_dir().map(|d| d.join("Claude").join("claude_desktop_config.json"));
+    let cd_present = cd_cfg.as_ref().map(|p| p.parent().map(|x| x.exists()).unwrap_or(false) || p.exists()).unwrap_or(false);
+    let cd_label = match &cd_cfg {
+        Some(p) if cd_present => {
+            let wired = std::fs::read_to_string(p).map(|s| s.contains("\"dmem\"")).unwrap_or(false);
+            if wired {
+                "Claude Desktop (already wired - leave unchecked unless replacing)".to_string()
+            } else {
+                "Claude Desktop".to_string()
+            }
+        }
+        _ => "Claude Desktop (not installed)".to_string(),
+    };
     let items = [
         json_label(devin_present, &devin_cfg, "Devin CLI"),
         json_label(claude_present, &claude_cfg, "Claude Code"),
         plain_label(codex_present, &codex_cfg, "Codex"),
         plain_label(hermes_present, &hermes_cfg, "Hermes"),
+        cd_label,
     ];
     let chosen = MultiSelect::with_theme(&theme)
         .with_prompt("Wire dmem into which agents? (nothing is pre-selected; space toggles, enter confirms)")
         .items(&items)
-        .defaults(&[false, false, false, false])
+        .defaults(&[false, false, false, false, false])
         .interact()?;
     let devin = chosen.contains(&0);
     let claude = chosen.contains(&1);
     let codex = chosen.contains(&2);
     let hermes = chosen.contains(&3);
-    if devin || claude || codex || hermes {
-        crate::bootstrap::run(devin, claude, codex, hermes)?;
+    let claude_desktop = chosen.contains(&4);
+    if devin || claude || codex || hermes || claude_desktop {
+        crate::bootstrap::run(devin, claude, codex, hermes, claude_desktop)?;
     } else {
         println!("(skipped agent wiring - undo any wiring later with `dmem bootstrap --remove`)");
     }

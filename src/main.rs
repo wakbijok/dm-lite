@@ -54,7 +54,8 @@ enum Cmd {
     /// Interactive first-run setup: detect agents, wire hooks, seed memory. Needs --features wizard.
     #[cfg(feature = "wizard")]
     Setup,
-    /// Wire (or with --remove, unwire) dm's lifecycle hooks (Devin, Claude Code).
+    /// Wire (or with --remove, unwire) dmem into your agents (hooks for Devin/Claude Code/Codex/
+    /// Hermes; an MCP entry for hook-less Claude Desktop).
     Bootstrap {
         #[arg(long)]
         devin: bool,
@@ -64,6 +65,9 @@ enum Cmd {
         codex: bool,
         #[arg(long)]
         hermes: bool,
+        /// Claude Desktop (MCP only; no hooks). Adds an mcpServers.dmem entry.
+        #[arg(long = "claude-desktop")]
+        claude_desktop: bool,
         #[arg(long)]
         all: bool,
         /// remove dm's hooks instead of adding them
@@ -308,8 +312,8 @@ fn run() -> Result<()> {
     match cli.cmd {
         #[cfg(feature = "wizard")]
         Cmd::Setup => setup::run(),
-        Cmd::Bootstrap { devin, claude, codex, hermes, all, remove } => {
-            bootstrap::run_mode(devin || all, claude || all, codex || all, hermes || all, remove)
+        Cmd::Bootstrap { devin, claude, codex, hermes, claude_desktop, all, remove } => {
+            bootstrap::run_mode(devin || all, claude || all, codex || all, hermes || all, claude_desktop || all, remove)
         }
         Cmd::Hook { event, hermes } => match event {
             HookCmd::SessionStart => hooks::session_start(hermes),

@@ -495,14 +495,72 @@ fn agent_mcp(cli: &str, add_args: &[&str], rm_args: &[&str], remove: bool) -> bo
     matches!(std::process::Command::new(cli).args(add_args).output(), Ok(o) if o.status.success())
 }
 
-pub fn run(devin: bool, claude: bool, codex: bool, hermes: bool) -> Result<()> {
-    run_mode(devin, claude, codex, hermes, false)
+/// Claude Desktop has NO hook system, only MCP, so wiring it means adding an `mcpServers.dmem`
+/// entry to its claude_desktop_config.json (it then reads `initialize.instructions` for persona +
+/// protocols and exposes the bootstrap/recall prompts). Idempotent: drops any prior `dmem` entry
+/// first and preserves every other mcpServers entry. Path resolved via `dirs::config_dir()`: macOS
+/// `~/Library/Application Support/Claude`, Windows `%APPDATA%\Claude`, Linux `~/.config/Claude`.
+fn claude_desktop_install(dm: &str, remove: bool) -> Result<()> {
+    let Some(path) = dirs::config_dir().map(|d| d.join("Claude").join("claude_desktop_config.json")) else {
+        println!("  skip Claude Desktop (no config dir on this OS)");
+        return Ok(());
+    };
+    let dir_present = path.parent().map(|p| p.exists()).unwrap_or(false);
+    if !dir_present && !path.exists() {
+        println!("  skip Claude Desktop (not installed; no {})", path.parent().map(|p| p.display().to_string()).unwrap_or_default());
+        return Ok(());
+    }
+    let existing: Value = if path.exists() {
+        let raw = std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+        serde_json::from_str(&raw).unwrap_or_else(|_| json!({}))
+    } else {
+        json!({})
+    };
+    let root = desktop_merge(existing, dm, remove);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut out = serde_json::to_string_pretty(&root)?;
+    out.push('\n');
+    std::fs::write(&path, out).with_context(|| format!("write {}", path.display()))?;
+    if remove {
+        println!("  unwired Claude Desktop -> {} (removed mcpServers.dmem)", path.display());
+    } else {
+        println!("  wired Claude Desktop -> {} (MCP tools + persona via instructions + bootstrap prompt)", path.display());
+        println!("    quit and relaunch Claude Desktop to load it (it reads this config at launch; no hot reload).");
+    }
+    Ok(())
+}
+
+/// Pure JSON merge for Claude Desktop's config: ensure `mcpServers` is an object, drop any prior
+/// `dmem` entry (idempotent), and on `!remove` add `{command: dm, args: ["mcp"]}`. Every other
+/// key (and every other mcpServers entry) is preserved untouched. A non-object input is replaced
+/// with a fresh object, matching `install_into`'s defensive handling of a malformed config.
+fn desktop_merge(mut root: Value, dm: &str, remove: bool) -> Value {
+    if !root.is_object() {
+        root = json!({});
+    }
+    let servers = root.as_object_mut().unwrap().entry("mcpServers").or_insert_with(|| json!({}));
+    if !servers.is_object() {
+        *servers = json!({});
+    }
+    let servers = servers.as_object_mut().unwrap();
+    servers.remove("dmem");
+    if !remove {
+        servers.insert("dmem".to_string(), json!({ "command": dm, "args": ["mcp"] }));
+    }
+    root
+}
+
+pub fn run(devin: bool, claude: bool, codex: bool, hermes: bool, claude_desktop: bool) -> Result<()> {
+    run_mode(devin, claude, codex, hermes, claude_desktop, false)
 }
 
 /// Wire or (with `remove`) unwire dmem into the selected agents. Devin + Claude Code use the
 /// generic Claude-compatible settings.json hook merge; Codex uses a bespoke `~/.codex/config.toml`
-/// MCP+plugin installer; Hermes uses a `~/.hermes/config.yaml` MCP+shell-hook installer.
-pub fn run_mode(devin: bool, claude: bool, codex: bool, hermes: bool, remove: bool) -> Result<()> {
+/// MCP+plugin installer; Hermes uses a `~/.hermes/config.yaml` MCP+shell-hook installer; Claude
+/// Desktop (hook-less) gets an MCP entry in claude_desktop_config.json.
+pub fn run_mode(devin: bool, claude: bool, codex: bool, hermes: bool, claude_desktop: bool, remove: bool) -> Result<()> {
     let dm = dm_bin()?;
     let h = home()?;
     let mut did_any = false;
@@ -550,8 +608,13 @@ pub fn run_mode(devin: bool, claude: bool, codex: bool, hermes: bool, remove: bo
         did_any = true;
     }
 
+    if claude_desktop {
+        claude_desktop_install(&dm, remove)?;
+        did_any = true;
+    }
+
     if !did_any {
-        println!("Nothing changed. Pass --devin / --claude / --codex / --hermes (or --all), and ensure the agent is installed.");
+        println!("Nothing changed. Pass --devin / --claude / --codex / --hermes / --claude-desktop (or --all), and ensure the agent is installed.");
         return Ok(());
     }
     println!();
@@ -559,7 +622,7 @@ pub fn run_mode(devin: bool, claude: bool, codex: bool, hermes: bool, remove: bo
         println!("Done. dmem hooks removed (the agent's other hooks/plugins are untouched).");
     } else {
         println!("Done. dmem is wired in (SessionStart -> persona/recent, UserPromptSubmit -> recall + save nudge).");
-        println!("Undo any time with:  dmem bootstrap --remove --devin / --claude / --codex / --hermes");
+        println!("Undo any time with:  dmem bootstrap --remove --devin / --claude / --codex / --hermes / --claude-desktop");
     }
     Ok(())
 }
@@ -599,6 +662,31 @@ mod tests {
         assert!(v3["hooks"].get("SessionEnd").is_none(), "dm-only event removed");
         assert_eq!(v3["hooks"]["SessionStart"].as_array().unwrap().len(), 1);
         assert_eq!(v3["hooks"]["SessionStart"][0]["hooks"][0]["command"], "/other/tool x");
+    }
+
+    #[test]
+    fn desktop_merge_adds_dmem_preserves_others_and_is_idempotent() {
+        // a config with an unrelated MCP server and a sibling top-level key
+        let base = serde_json::json!({
+            "mcpServers": { "other": { "command": "x", "args": [] } },
+            "globalShortcut": "Cmd+K"
+        });
+        let wired = desktop_merge(base.clone(), "/abs/dmem", false);
+        assert_eq!(wired["mcpServers"]["dmem"]["command"], "/abs/dmem");
+        assert_eq!(wired["mcpServers"]["dmem"]["args"][0], "mcp");
+        assert_eq!(wired["mcpServers"]["other"]["command"], "x", "unrelated server preserved");
+        assert_eq!(wired["globalShortcut"], "Cmd+K", "unrelated top-level key preserved");
+        // idempotent: re-wiring yields exactly one dmem entry
+        let again = desktop_merge(wired.clone(), "/abs/dmem", false);
+        assert_eq!(again["mcpServers"]["dmem"]["command"], "/abs/dmem");
+        // remove drops only dmem, keeps the rest
+        let removed = desktop_merge(again, "/abs/dmem", true);
+        assert!(removed["mcpServers"].get("dmem").is_none(), "dmem removed");
+        assert_eq!(removed["mcpServers"]["other"]["command"], "x", "other server still there");
+        assert_eq!(removed["globalShortcut"], "Cmd+K");
+        // a malformed (non-object) config becomes a clean object with our entry
+        let from_garbage = desktop_merge(serde_json::json!("not an object"), "/abs/dmem", false);
+        assert_eq!(from_garbage["mcpServers"]["dmem"]["command"], "/abs/dmem");
     }
 
     #[test]
