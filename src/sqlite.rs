@@ -565,22 +565,6 @@ impl MemoryStore for SqliteStore {
             .collect();
         Ok(rows)
     }
-
-    fn resolve_slug(&self, slug: &str) -> Result<Option<String>> {
-        let now = crate::entry::now_ms();
-        // The slug is the uri's last segment (slug() emits only [a-z0-9-], so no LIKE wildcards).
-        let pat = format!("%/{}", slug);
-        let mut stmt = self.conn.prepare(&format!(
-            "SELECT uri FROM entries WHERE uri LIKE ?1 AND {CURRENT} \
-             ORDER BY importance DESC, created_ms DESC LIMIT 1"
-        ))?;
-        let mut rows = stmt.query(params![pat, now])?;
-        if let Some(r) = rows.next()? {
-            Ok(Some(r.get::<_, String>(0)?))
-        } else {
-            Ok(None)
-        }
-    }
 }
 
 #[cfg(test)]
@@ -991,10 +975,6 @@ mod tests {
         assert_eq!(s.unlink(&a.uri, &c.uri, "sources").unwrap(), 1);
         assert_eq!(s.edges_of(&a.uri).unwrap().len(), 1);
         assert_eq!(s.all_edges(100).unwrap().len(), 1);
-        // resolve_slug: a.uri ends with /arch-decision
-        let slug = a.uri.rsplit('/').next().unwrap().to_string();
-        assert_eq!(s.resolve_slug(&slug).unwrap().as_deref(), Some(a.uri.as_str()));
-        assert_eq!(s.resolve_slug("no-such-slug").unwrap(), None);
     }
 
     #[test]

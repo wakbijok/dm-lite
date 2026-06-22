@@ -184,6 +184,14 @@ enum Cmd {
     Links {
         uri: String,
     },
+    /// Show the records reachable from a uri within N hops (its graph neighborhood).
+    Neighbors {
+        uri: String,
+        #[arg(long, default_value_t = 1)]
+        depth: usize,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
     /// Rebuild edges from the [[name]] references in every record body (batch).
     ReindexLinks,
     /// Create or update a domain entity (a knowledge-graph node): org, engagement, product,
@@ -470,6 +478,17 @@ fn run() -> Result<()> {
                     } else {
                         println!("<- [{}] {}", e.rel, e.from_uri);
                     }
+                }
+            }
+            Ok(())
+        }
+        Cmd::Neighbors { uri, depth, limit } => {
+            let uris = Memory::open()?.neighbors(&[uri.clone()], depth, limit)?;
+            if uris.is_empty() {
+                println!("(no neighbors for {} within {} hop{})", uri, depth, if depth == 1 { "" } else { "s" });
+            } else {
+                for u in uris {
+                    println!("- {}", u);
                 }
             }
             Ok(())

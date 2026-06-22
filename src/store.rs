@@ -62,9 +62,4 @@ pub trait MemoryStore {
 
     /// All edges (capped), for the graph viewer.
     fn all_edges(&self, limit: usize) -> Result<Vec<Edge>>;
-
-    /// Resolve a `[[name]]` slug to a current record's uri (the slug is the uri's last segment),
-    /// most-important/recent first. None if nothing matches. Used to turn body `[[links]]` into
-    /// real edges.
-    fn resolve_slug(&self, slug: &str) -> Result<Option<String>>;
 }
