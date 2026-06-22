@@ -378,12 +378,14 @@ impl LocalMemory {
         self.store.by_kind("reminder", limit)
     }
 
-    /// Construct a LocalMemory directly over a store (tests only; bypasses config/embedder).
+    /// Construct a LocalMemory directly over a store (tests only; bypasses config). Uses the
+    /// cheap HashEmbedder rather than `make_embedder` so tests never load a real model (no
+    /// network, fast, deterministic); `vindex: None` keeps recall on the keyword path.
     #[cfg(test)]
-    fn for_test(store: SqliteStore) -> Self {
+    pub(crate) fn for_test(store: SqliteStore) -> Self {
         #[cfg(feature = "zvec")]
         {
-            Self { store, vindex: None, embedder: make_embedder() }
+            Self { store, vindex: None, embedder: std::sync::Arc::new(crate::embedder::HashEmbedder::new()) }
         }
         #[cfg(not(feature = "zvec"))]
         {

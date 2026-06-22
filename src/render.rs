@@ -105,6 +105,48 @@ pub fn render_soul(persona: &[Entry]) -> String {
     s.trim_end().to_string()
 }
 
+/// Lead-in for the MCP `initialize.instructions` field. MCP clients (Claude Desktop and most
+/// hosts) have no lifecycle hooks, so this string is the only place to tell the model the
+/// persona/protocols below are binding, and to name THIS server's tools (no `mcp_dmem_` prefix:
+/// that is a Hermes-only naming; here the tool names are exactly as advertised in `tools/list`).
+const INSTR_LEAD: &str = "You are connected to dmem, a shared cross-tool memory. The persona and \
+protocols below are your binding operating rules for this session, not style notes: the \
+Behavioral Discipline governs how you work, the Memory Save Discipline governs when and what you \
+persist. Recall before you reason, and persist durable memory, using this server's tools: recall, \
+remember, log_decision, log_lesson, log_incident, add_reminder, forget.";
+
+/// Persona + protocol bodies for the MCP `initialize.instructions` field: the spec analog of the
+/// SessionStart persona injection for hook-less MCP clients. Plain text (no `<daimon-persona>`
+/// fences: those are hook markers; `instructions` is consumed as a system-prompt string) and no
+/// SESSION_BUDGET cap (the MCP field has no host stdout limit). Empty persona -> empty string,
+/// so the caller omits the optional field.
+pub fn render_instructions(persona: &[Entry]) -> String {
+    let body = render_soul(persona);
+    if body.is_empty() {
+        return String::new();
+    }
+    format!("{INSTR_LEAD}\n\n{body}")
+}
+
+/// The `bootstrap` MCP prompt body: the identity layer (persona + protocols) plus the current
+/// open-reminder titles, in plain markdown (NOT the `<daimon-memory>` fence). Reminders are
+/// titles only, matching `render_session`'s greet; their detail is fetched via the recall prompt
+/// or tool. Empty persona AND no reminders -> empty string (the caller substitutes a placeholder).
+pub fn render_bootstrap(persona: &[Entry], reminders: &[Entry]) -> String {
+    let mut s = render_instructions(persona);
+    if !reminders.is_empty() {
+        if !s.is_empty() {
+            s.push_str("\n\n");
+        }
+        s.push_str("## Open reminders\n");
+        for e in reminders {
+            s.push_str(&format!("- {}\n", one_line(&e.title, 120)));
+        }
+        s = s.trim_end().to_string();
+    }
+    s
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -170,5 +212,44 @@ mod tests {
         let out = render_session(&[p], &[rem]);
         assert!(out.contains("fits fine"));
         assert!(out.chars().count() <= SESSION_BUDGET);
+    }
+
+    #[test]
+    fn render_instructions_has_lead_and_bodies_no_fence() {
+        let p = entry(Kind::Persona, "Operator Persona", "I am Izu.");
+        let proto = entry(Kind::Protocol, "Behavioral Discipline", "Recall before you reason.");
+        let out = render_instructions(&[p, proto]);
+        assert!(out.contains("binding operating rules"), "carries the lead-in");
+        assert!(out.contains("I am Izu.") && out.contains("Recall before you reason."));
+        assert!(!out.contains("<daimon-persona>"), "instructions is plain text, not a hook block");
+    }
+
+    #[test]
+    fn render_instructions_empty_is_empty() {
+        assert!(render_instructions(&[]).is_empty());
+    }
+
+    #[test]
+    fn render_bootstrap_appends_reminder_titles_not_bodies() {
+        let p = entry(Kind::Persona, "Operator Persona", "I am Izu.");
+        let rem = entry(Kind::Reminder, "ship the lean README", "BODY-MUST-NOT-APPEAR");
+        let out = render_bootstrap(&[p], &[rem]);
+        assert!(out.contains("## Open reminders"));
+        assert!(out.contains("ship the lean README"));
+        assert!(!out.contains("BODY-MUST-NOT-APPEAR"));
+        assert!(!out.contains("<daimon-memory>"), "bootstrap is plain markdown, not a hook block");
+    }
+
+    #[test]
+    fn render_bootstrap_empty_is_empty() {
+        assert!(render_bootstrap(&[], &[]).is_empty());
+    }
+
+    #[test]
+    fn render_bootstrap_reminders_only_when_persona_empty() {
+        let rem = entry(Kind::Reminder, "only reminder", "");
+        let out = render_bootstrap(&[], &[rem]);
+        assert!(out.starts_with("## Open reminders"));
+        assert!(out.contains("only reminder"));
     }
 }
