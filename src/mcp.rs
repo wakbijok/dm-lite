@@ -22,7 +22,8 @@ fn tool_schemas() -> Value {
                 "query":{"type":"string","description":"what to recall"},
                 "limit":{"type":"integer","description":"max results (default 6, capped at 1000)"},
                 "as_of":{"type":"integer","description":"system-time epoch-ms: recall the store as it was BELIEVED at this instant"},
-                "valid_at":{"type":"integer","description":"valid-time epoch-ms: recall what was TRUE at this instant (defaults to as_of)"}
+                "valid_at":{"type":"integer","description":"valid-time epoch-ms: recall what was TRUE at this instant (defaults to as_of)"},
+                "expand":{"type":"integer","description":"graph: also pull each hit's neighborhood within this many hops (0 = off)"}
             },"required":["query"]}
         },
         {
@@ -44,6 +45,36 @@ fn tool_schemas() -> Value {
                 "uri":{"type":"string","description":"the daimon:// uri of the record"},
                 "valid_to":{"type":"integer","description":"epoch-ms from which the fact stops being true"}
             },"required":["uri","valid_to"]}
+        },
+        {
+            "name": "link",
+            "description": "Add a typed directed edge between two records (the graph layer): from -[rel]-> to. rel is e.g. links, supersedes, informed, part-of, about. Idempotent.",
+            "inputSchema": {"type":"object","properties":{
+                "from":{"type":"string","description":"daimon:// uri of the source record"},
+                "to":{"type":"string","description":"daimon:// uri of the target record"},
+                "rel":{"type":"string","description":"relation type (default 'links')"}
+            },"required":["from","to"]}
+        },
+        {
+            "name": "unlink",
+            "description": "Remove a specific edge from -[rel]-> to.",
+            "inputSchema": {"type":"object","properties":{
+                "from":{"type":"string"},
+                "to":{"type":"string"},
+                "rel":{"type":"string","description":"default 'links'"}
+            },"required":["from","to"]}
+        },
+        {
+            "name": "links",
+            "description": "List the edges touching a record (its graph connections, both directions).",
+            "inputSchema": {"type":"object","properties":{
+                "uri":{"type":"string"}
+            },"required":["uri"]}
+        },
+        {
+            "name": "reindex_links",
+            "description": "Rebuild edges from the [[name]] references in every record body (batch). Run after bulk saves or imports to materialize the link graph.",
+            "inputSchema": {"type":"object","properties":{}}
         },
         {
             "name": "log_decision",
@@ -134,12 +165,16 @@ fn call_tool(mem: &Memory, name: &str, args: &Value) -> std::result::Result<Stri
             let limit = (args.get("limit").and_then(|v| v.as_u64()).unwrap_or(6) as usize).min(1000);
             let as_of = args.get("as_of").and_then(|v| v.as_i64());
             let valid_at = args.get("valid_at").and_then(|v| v.as_i64());
+            let expand = args.get("expand").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
             let hits = if as_of.is_some() || valid_at.is_some() {
                 // bitemporal slice: default the missing axis to the other (then to now)
                 let now = crate::entry::now_ms();
                 let sys = as_of.unwrap_or(now);
                 let val = valid_at.or(as_of).unwrap_or(now);
                 mem.recall_as_of(s(args, "query"), limit, sys, val).map_err(|e| e.to_string())?
+            } else if expand > 0 {
+                // graph-augmented: seeds by content, then their bounded-hop neighborhood (cap 5)
+                mem.recall_expanded(s(args, "query"), limit, expand.min(5)).map_err(|e| e.to_string())?
             } else {
                 mem.recall(s(args, "query"), limit).map_err(|e| e.to_string())?
             };
@@ -198,6 +233,33 @@ fn call_tool(mem: &Memory, name: &str, args: &Value) -> std::result::Result<Stri
                 .ok_or_else(|| "invalidate requires integer 'valid_to' (epoch-ms)".to_string())?;
             let n = mem.invalidate(uri, valid_to).map_err(|e| e.to_string())?;
             Ok(if n == 0 { "nothing to invalidate".into() } else { format!("invalidated {} ({} segment(s))", uri, n) })
+        }
+        "link" => {
+            let rel = if s(args, "rel").is_empty() { "links" } else { s(args, "rel") };
+            mem.link(s(args, "from"), s(args, "to"), rel).map_err(|e| e.to_string())?;
+            Ok(format!("linked {} -[{}]-> {}", s(args, "from"), rel, s(args, "to")))
+        }
+        "unlink" => {
+            let rel = if s(args, "rel").is_empty() { "links" } else { s(args, "rel") };
+            let n = mem.unlink(s(args, "from"), s(args, "to"), rel).map_err(|e| e.to_string())?;
+            Ok(if n == 0 { "no such edge".into() } else { format!("unlinked {} -[{}]-> {}", s(args, "from"), rel, s(args, "to")) })
+        }
+        "links" => {
+            let uri = s(args, "uri");
+            let edges = mem.edges_of(uri).map_err(|e| e.to_string())?;
+            if edges.is_empty() {
+                Ok("(no edges)".into())
+            } else {
+                let lines: Vec<String> = edges
+                    .iter()
+                    .map(|e| if e.from_uri == uri { format!("-> [{}] {}", e.rel, e.to_uri) } else { format!("<- [{}] {}", e.rel, e.from_uri) })
+                    .collect();
+                Ok(lines.join("\n"))
+            }
+        }
+        "reindex_links" => {
+            let n = mem.reindex_links().map_err(|e| e.to_string())?;
+            Ok(format!("reindexed: {} reference(s) linked", n))
         }
         other => Err(format!("unknown tool: {}", other)),
     }
@@ -474,5 +536,30 @@ mod tests {
         assert_eq!(msgs[0]["role"], "user");
         assert_eq!(msgs[0]["content"]["type"], "text");
         assert!(msgs[0]["content"]["text"].as_str().is_some());
+    }
+
+    #[test]
+    fn tool_schema_exposes_graph_tools() {
+        let tools = tool_schemas();
+        let names: Vec<&str> = tools.as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
+        for t in ["link", "unlink", "links", "reindex_links"] {
+            assert!(names.contains(&t), "graph tool missing: {t}");
+        }
+        let recall = tools.as_array().unwrap().iter().find(|t| t["name"] == "recall").unwrap();
+        assert!(recall["inputSchema"]["properties"].get("expand").is_some(), "recall must accept expand");
+    }
+
+    #[test]
+    fn handle_link_and_links_via_dispatch() {
+        let mem = test_mem();
+        for text in ["alpha node", "beta node"] {
+            handle(&mem, &None, &json!({"id":1,"method":"tools/call","params":{"name":"remember","arguments":{"text":text,"namespace":"resources/notes"}}})).unwrap();
+        }
+        let a = "daimon://resources/notes/memory/alpha-node";
+        let b = "daimon://resources/notes/memory/beta-node";
+        let linked = handle(&mem, &None, &json!({"id":2,"method":"tools/call","params":{"name":"link","arguments":{"from":a,"to":b,"rel":"relates"}}})).unwrap();
+        assert!(linked["result"]["content"][0]["text"].as_str().unwrap().contains("linked"));
+        let links = handle(&mem, &None, &json!({"id":3,"method":"tools/call","params":{"name":"links","arguments":{"uri":a}}})).unwrap();
+        assert!(links["result"]["content"][0]["text"].as_str().unwrap().contains(b));
     }
 }

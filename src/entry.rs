@@ -123,6 +123,16 @@ impl Entry {
     }
 }
 
+/// A directed, typed relation between two records: the graph layer over the memory. `from_uri`
+/// and `to_uri` are record uris; `rel` is the relation type ("links", "supersedes", "informed",
+/// "part-of", "about", and the entity relations such as "for", "uses", "made-by", "alias-of").
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Edge {
+    pub from_uri: String,
+    pub to_uri: String,
+    pub rel: String,
+}
+
 pub fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

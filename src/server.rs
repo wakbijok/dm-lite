@@ -217,6 +217,42 @@ struct InvalidateReq {
 }
 
 #[derive(Deserialize)]
+struct LinkReq {
+    from: String,
+    to: String,
+    rel: String,
+}
+
+#[derive(Deserialize)]
+struct EdgesReq {
+    uri: String,
+}
+
+#[derive(Deserialize)]
+struct EdgesAllReq {
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Deserialize)]
+struct NeighborsReq {
+    seeds: Vec<String>,
+    #[serde(default)]
+    depth: Option<usize>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Deserialize)]
+struct RecallExpandedReq {
+    query: String,
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    depth: Option<usize>,
+}
+
+#[derive(Deserialize)]
 struct DecisionReq {
     title: String,
     #[serde(default)]
@@ -384,6 +420,47 @@ async fn invalidate_h(State(st): State<AppState>, headers: HeaderMap, Json(req):
     .await
 }
 
+async fn link_h(State(st): State<AppState>, headers: HeaderMap, Json(req): Json<LinkReq>) -> ApiResp {
+    with_tenant(&st, &headers, true, move |m| {
+        m.link(&req.from, &req.to, &req.rel)?;
+        Ok(json!({ "linked": 1 }))
+    })
+    .await
+}
+
+async fn unlink_h(State(st): State<AppState>, headers: HeaderMap, Json(req): Json<LinkReq>) -> ApiResp {
+    with_tenant(&st, &headers, true, move |m| {
+        Ok(json!({ "unlinked": m.unlink(&req.from, &req.to, &req.rel)? }))
+    })
+    .await
+}
+
+async fn edges_h(State(st): State<AppState>, headers: HeaderMap, Json(req): Json<EdgesReq>) -> ApiResp {
+    with_tenant(&st, &headers, false, move |m| Ok(json!(m.edges_of(&req.uri)?))).await
+}
+
+async fn edges_all_h(State(st): State<AppState>, headers: HeaderMap, Json(req): Json<EdgesAllReq>) -> ApiResp {
+    with_tenant(&st, &headers, false, move |m| Ok(json!(m.all_edges(req.limit.unwrap_or(5000).min(50_000))?))).await
+}
+
+async fn neighbors_h(State(st): State<AppState>, headers: HeaderMap, Json(req): Json<NeighborsReq>) -> ApiResp {
+    with_tenant(&st, &headers, false, move |m| {
+        Ok(json!(m.neighbors(&req.seeds, req.depth.unwrap_or(1).min(5), req.limit.unwrap_or(50).min(MAX_LIMIT))?))
+    })
+    .await
+}
+
+async fn recall_expanded_h(State(st): State<AppState>, headers: HeaderMap, Json(req): Json<RecallExpandedReq>) -> ApiResp {
+    with_tenant(&st, &headers, false, move |m| {
+        Ok(json!(m.recall_expanded(&req.query, req.limit.unwrap_or(6).min(MAX_LIMIT), req.depth.unwrap_or(1).min(5))?))
+    })
+    .await
+}
+
+async fn reindex_links_h(State(st): State<AppState>, headers: HeaderMap) -> ApiResp {
+    with_tenant(&st, &headers, true, move |m| Ok(json!({ "linked": m.reindex_links()? }))).await
+}
+
 async fn decision_h(State(st): State<AppState>, headers: HeaderMap, Json(req): Json<DecisionReq>) -> ApiResp {
     with_tenant(&st, &headers, true, move |m| {
         let ns = ns_or(&req.namespace, "resources/notes");
@@ -530,6 +607,13 @@ pub fn router(auth: Arc<dyn Authenticator>, iam: Option<crate::iam::Iam>) -> Rou
         .route("/forget", post(forget_h))
         .route("/remember", post(remember_h))
         .route("/invalidate", post(invalidate_h))
+        .route("/link", post(link_h))
+        .route("/unlink", post(unlink_h))
+        .route("/edges", post(edges_h))
+        .route("/edges_all", post(edges_all_h))
+        .route("/neighbors", post(neighbors_h))
+        .route("/recall_expanded", post(recall_expanded_h))
+        .route("/reindex_links", post(reindex_links_h))
         .route("/log_decision", post(decision_h))
         .route("/log_lesson", post(lesson_h))
         .route("/log_incident", post(incident_h))

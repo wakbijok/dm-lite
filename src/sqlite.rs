@@ -4,7 +4,7 @@
 //! axes. Keyword recall via an FTS5 index that holds ONLY the current version of each
 //! record. As-of queries reconstruct any past slice. See `Entry` for the temporal model.
 
-use crate::entry::{Entry, Kind};
+use crate::entry::{Edge, Entry, Kind};
 use crate::store::MemoryStore;
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
@@ -57,6 +57,14 @@ impl SqliteStore {
                 access_count   INTEGER NOT NULL DEFAULT 0,
                 last_access_ms INTEGER NOT NULL DEFAULT 0
             );
+            CREATE TABLE IF NOT EXISTS edges (
+                from_uri   TEXT NOT NULL,
+                to_uri     TEXT NOT NULL,
+                rel        TEXT NOT NULL,
+                created_ms INTEGER NOT NULL,
+                PRIMARY KEY (from_uri, to_uri, rel)
+            );
+            CREATE INDEX IF NOT EXISTS idx_edges_to ON edges(to_uri);
             "#,
         )
         .context("init schema")?;
@@ -481,6 +489,98 @@ impl MemoryStore for SqliteStore {
         tx.commit()?;
         Ok(affected)
     }
+
+    fn link(&self, from_uri: &str, to_uri: &str, rel: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO edges(from_uri, to_uri, rel, created_ms) VALUES(?1,?2,?3,?4)",
+            params![from_uri, to_uri, rel, crate::entry::now_ms()],
+        )?;
+        Ok(())
+    }
+
+    fn unlink(&self, from_uri: &str, to_uri: &str, rel: &str) -> Result<usize> {
+        Ok(self.conn.execute(
+            "DELETE FROM edges WHERE from_uri=?1 AND to_uri=?2 AND rel=?3",
+            params![from_uri, to_uri, rel],
+        )?)
+    }
+
+    fn edges_of(&self, uri: &str) -> Result<Vec<Edge>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT from_uri, to_uri, rel FROM edges WHERE from_uri=?1 OR to_uri=?1 ORDER BY created_ms",
+        )?;
+        let rows = stmt
+            .query_map(params![uri], |r| Ok(Edge { from_uri: r.get(0)?, to_uri: r.get(1)?, rel: r.get(2)? }))?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    }
+
+    fn neighbors(&self, seeds: &[String], depth: usize, limit: usize) -> Result<Vec<String>> {
+        if seeds.is_empty() || depth == 0 || limit == 0 {
+            return Ok(Vec::new());
+        }
+        // Bounded breadth-first walk over the undirected edge set, capped by depth and limit. Done
+        // in Rust rather than a recursive CTE so the dynamic seed set and caps stay simple and the
+        // graph can never run away.
+        use std::collections::HashSet;
+        let mut visited: HashSet<String> = seeds.iter().cloned().collect();
+        let mut frontier: Vec<String> = seeds.to_vec();
+        let mut out: Vec<String> = Vec::new();
+        let mut stmt = self.conn.prepare(
+            "SELECT to_uri FROM edges WHERE from_uri=?1 UNION SELECT from_uri FROM edges WHERE to_uri=?1",
+        )?;
+        for _ in 0..depth {
+            if out.len() >= limit {
+                break;
+            }
+            let mut next: Vec<String> = Vec::new();
+            'frontier: for u in &frontier {
+                let hits = stmt.query_map(params![u], |r| r.get::<_, String>(0))?;
+                for h in hits.filter_map(|x| x.ok()) {
+                    if visited.insert(h.clone()) {
+                        next.push(h.clone());
+                        out.push(h);
+                        if out.len() >= limit {
+                            break 'frontier;
+                        }
+                    }
+                }
+            }
+            if next.is_empty() {
+                break;
+            }
+            frontier = next;
+        }
+        Ok(out)
+    }
+
+    fn all_edges(&self, limit: usize) -> Result<Vec<Edge>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT from_uri, to_uri, rel FROM edges ORDER BY created_ms DESC LIMIT ?1",
+        )?;
+        let rows = stmt
+            .query_map(params![limit as i64], |r| Ok(Edge { from_uri: r.get(0)?, to_uri: r.get(1)?, rel: r.get(2)? }))?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    }
+
+    fn resolve_slug(&self, slug: &str) -> Result<Option<String>> {
+        let now = crate::entry::now_ms();
+        // The slug is the uri's last segment (slug() emits only [a-z0-9-], so no LIKE wildcards).
+        let pat = format!("%/{}", slug);
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT uri FROM entries WHERE uri LIKE ?1 AND {CURRENT} \
+             ORDER BY importance DESC, created_ms DESC LIMIT 1"
+        ))?;
+        let mut rows = stmt.query(params![pat, now])?;
+        if let Some(r) = rows.next()? {
+            Ok(Some(r.get::<_, String>(0)?))
+        } else {
+            Ok(None)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -861,5 +961,53 @@ mod tests {
         let (f2, c2) = fts_eq_current(&s);
         assert_eq!(f2, c2, "FTS still mirrors after a multi-segment split");
         assert_eq!(c2, 4);
+    }
+
+    // --- graph layer ---
+
+    #[test]
+    fn graph_link_traverse_unlink_and_resolve() {
+        let s = mem_store();
+        let a = mk(Kind::Decision, "resources/p", "Arch decision", "we chose X");
+        let b = mk(Kind::ResourceSummary, "resources/p", "Project P", "the project");
+        let c = mk(Kind::AgentLesson, "agent/lessons", "Lesson L", "learned Y");
+        s.put(&a).unwrap();
+        s.put(&b).unwrap();
+        s.put(&c).unwrap();
+        s.link(&a.uri, &b.uri, "part-of").unwrap();
+        s.link(&a.uri, &c.uri, "sources").unwrap();
+        s.link(&a.uri, &b.uri, "part-of").unwrap(); // idempotent
+        assert_eq!(s.edges_of(&a.uri).unwrap().len(), 2);
+        assert_eq!(s.edges_of(&b.uri).unwrap().len(), 1, "b sees the incoming a->b edge");
+        // 1-hop neighbors of a = {b, c}
+        let n1 = s.neighbors(&[a.uri.clone()], 1, 10).unwrap();
+        assert_eq!(n1.len(), 2);
+        assert!(n1.contains(&b.uri) && n1.contains(&c.uri));
+        // undirected: 1-hop of b = {a}; 2-hop of b reaches c via a, excluding seed b
+        assert_eq!(s.neighbors(&[b.uri.clone()], 1, 10).unwrap(), vec![a.uri.clone()]);
+        let n2 = s.neighbors(&[b.uri.clone()], 2, 10).unwrap();
+        assert!(n2.contains(&c.uri) && n2.contains(&a.uri) && !n2.contains(&b.uri));
+        // unlink
+        assert_eq!(s.unlink(&a.uri, &c.uri, "sources").unwrap(), 1);
+        assert_eq!(s.edges_of(&a.uri).unwrap().len(), 1);
+        assert_eq!(s.all_edges(100).unwrap().len(), 1);
+        // resolve_slug: a.uri ends with /arch-decision
+        let slug = a.uri.rsplit('/').next().unwrap().to_string();
+        assert_eq!(s.resolve_slug(&slug).unwrap().as_deref(), Some(a.uri.as_str()));
+        assert_eq!(s.resolve_slug("no-such-slug").unwrap(), None);
+    }
+
+    #[test]
+    fn neighbors_respects_limit_and_depth() {
+        let s = mem_store();
+        let hub = mk(Kind::Memory, "ns", "hub", "h");
+        s.put(&hub).unwrap();
+        for i in 0..5 {
+            let sp = mk(Kind::Memory, "ns", &format!("spoke {i}"), "s");
+            s.put(&sp).unwrap();
+            s.link(&hub.uri, &sp.uri, "links").unwrap();
+        }
+        assert_eq!(s.neighbors(&[hub.uri.clone()], 1, 3).unwrap().len(), 3, "limit caps the neighborhood");
+        assert!(s.neighbors(&[hub.uri.clone()], 0, 10).unwrap().is_empty(), "depth 0 -> nothing");
     }
 }

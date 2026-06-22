@@ -2,7 +2,7 @@
 //! reliable SQLite impl behind this trait so the binary works + is testable today, and
 //! LanceDB drops in as another impl with zero change to the model or the callers.
 
-use crate::entry::Entry;
+use crate::entry::{Edge, Entry};
 use anyhow::Result;
 
 pub trait MemoryStore {
@@ -42,4 +42,29 @@ pub trait MemoryStore {
     /// is a VALID-time end, distinct from `forget` (which retracts from current belief in SYSTEM
     /// time, as if we never should have recorded it). Returns how many segments were affected.
     fn invalidate(&self, uri: &str, valid_to_ms: i64) -> Result<usize>;
+
+    // --- graph layer (edges between records) ---
+
+    /// Add a typed directed edge `from_uri -[rel]-> to_uri`. Idempotent (a duplicate edge is a
+    /// no-op). Edges are curated relations, not bitemporal facts: re-deriving them is safe.
+    fn link(&self, from_uri: &str, to_uri: &str, rel: &str) -> Result<()>;
+
+    /// Remove a specific edge. Returns how many rows were deleted (0 or 1).
+    fn unlink(&self, from_uri: &str, to_uri: &str, rel: &str) -> Result<usize>;
+
+    /// Every edge touching `uri`, in either direction (its immediate connections).
+    fn edges_of(&self, uri: &str) -> Result<Vec<Edge>>;
+
+    /// Bounded-hop traversal: the set of record uris reachable from any of `seeds` within `depth`
+    /// hops (following edges in either direction), excluding the seeds themselves, capped at
+    /// `limit`. This is the recall-expansion primitive: pull a seed's neighborhood, not the world.
+    fn neighbors(&self, seeds: &[String], depth: usize, limit: usize) -> Result<Vec<String>>;
+
+    /// All edges (capped), for the graph viewer.
+    fn all_edges(&self, limit: usize) -> Result<Vec<Edge>>;
+
+    /// Resolve a `[[name]]` slug to a current record's uri (the slug is the uri's last segment),
+    /// most-important/recent first. None if nothing matches. Used to turn body `[[links]]` into
+    /// real edges.
+    fn resolve_slug(&self, slug: &str) -> Result<Option<String>>;
 }

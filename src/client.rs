@@ -4,7 +4,7 @@
 //! a specific CA. The server enforces tenant isolation; this client just carries the token.
 
 use crate::config::ServerLink;
-use crate::entry::{Entry, Kind};
+use crate::entry::{Edge, Entry, Kind};
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
 
@@ -181,6 +181,36 @@ impl RemoteClient {
             "/import",
             json!({ "kind": kind.as_str(), "namespace": namespace, "title": title, "body": body, "created_ms": created_ms, "importance": importance }),
         )
+    }
+
+    // --- graph layer ---
+
+    pub fn link(&self, from_uri: &str, to_uri: &str, rel: &str) -> Result<()> {
+        self.post("/link", json!({ "from": from_uri, "to": to_uri, "rel": rel }))?;
+        Ok(())
+    }
+    pub fn unlink(&self, from_uri: &str, to_uri: &str, rel: &str) -> Result<usize> {
+        let v = self.post("/unlink", json!({ "from": from_uri, "to": to_uri, "rel": rel }))?;
+        Ok(v.get("unlinked").and_then(|n| n.as_u64()).unwrap_or(0) as usize)
+    }
+    pub fn edges_of(&self, uri: &str) -> Result<Vec<Edge>> {
+        let v = self.post("/edges", json!({ "uri": uri }))?;
+        serde_json::from_value(v).map_err(|e| anyhow!("decode edges from /edges: {e}"))
+    }
+    pub fn all_edges(&self, limit: usize) -> Result<Vec<Edge>> {
+        let v = self.post("/edges_all", json!({ "limit": limit }))?;
+        serde_json::from_value(v).map_err(|e| anyhow!("decode edges from /edges_all: {e}"))
+    }
+    pub fn neighbors(&self, seeds: &[String], depth: usize, limit: usize) -> Result<Vec<String>> {
+        let v = self.post("/neighbors", json!({ "seeds": seeds, "depth": depth, "limit": limit }))?;
+        serde_json::from_value(v).map_err(|e| anyhow!("decode neighbors: {e}"))
+    }
+    pub fn recall_expanded(&self, query: &str, limit: usize, depth: usize) -> Result<Vec<Entry>> {
+        self.list("/recall_expanded", json!({ "query": query, "limit": limit, "depth": depth }))
+    }
+    pub fn reindex_links(&self) -> Result<usize> {
+        let v = self.post("/reindex_links", json!({}))?;
+        Ok(v.get("linked").and_then(|n| n.as_u64()).unwrap_or(0) as usize)
     }
 }
 

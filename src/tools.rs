@@ -2,7 +2,7 @@
 //! validation) + recall. This is daimon's distinctive layer over the engine.
 
 use crate::config;
-use crate::entry::{make_uri, now_ms, Entry, Kind};
+use crate::entry::{make_uri, now_ms, Edge, Entry, Kind};
 use crate::sqlite::SqliteStore;
 use crate::store::MemoryStore;
 use anyhow::{anyhow, Result};
@@ -74,6 +74,27 @@ fn require(value: &str, field: &str) -> Result<()> {
 pub(crate) fn first_line(text: &str) -> String {
     let line = text.trim().lines().next().unwrap_or("").trim();
     line.chars().take(80).collect::<String>()
+}
+
+/// Extract the inner text of every `[[...]]` reference in a body (the wikilink convention the
+/// Save Discipline tells agents to use). Returns the raw names; the caller slugs and resolves them.
+pub(crate) fn parse_wikilinks(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = s;
+    while let Some(i) = rest.find("[[") {
+        rest = &rest[i + 2..];
+        match rest.find("]]") {
+            Some(j) => {
+                let name = rest[..j].trim();
+                if !name.is_empty() {
+                    out.push(name.to_string());
+                }
+                rest = &rest[j + 2..];
+            }
+            None => break,
+        }
+    }
+    out
 }
 
 /// Modest, deterministic runtime-signal multiplier, clamped to [1.0, 1.25]. It NUDGES
@@ -407,6 +428,74 @@ impl LocalMemory {
         self.store.latest_save_ms()
     }
 
+    // --- graph layer ---
+
+    pub fn link(&self, from_uri: &str, to_uri: &str, rel: &str) -> Result<()> {
+        self.store.link(from_uri, to_uri, rel)
+    }
+    pub fn unlink(&self, from_uri: &str, to_uri: &str, rel: &str) -> Result<usize> {
+        self.store.unlink(from_uri, to_uri, rel)
+    }
+    pub fn edges_of(&self, uri: &str) -> Result<Vec<Edge>> {
+        self.store.edges_of(uri)
+    }
+    pub fn all_edges(&self, limit: usize) -> Result<Vec<Edge>> {
+        self.store.all_edges(limit)
+    }
+    pub fn neighbors(&self, seeds: &[String], depth: usize, limit: usize) -> Result<Vec<String>> {
+        self.store.neighbors(seeds, depth, limit)
+    }
+
+    /// Graph-augmented recall: find seeds by content, then pull their bounded-hop neighborhood and
+    /// hydrate it, so connected-but-not-similar records ride along. Seeds first, then neighbors.
+    pub fn recall_expanded(&self, query: &str, limit: usize, depth: usize) -> Result<Vec<Entry>> {
+        let seeds = self.recall(query, limit)?;
+        if depth == 0 {
+            return Ok(seeds);
+        }
+        let seed_uris: Vec<String> = seeds.iter().map(|e| e.uri.clone()).collect();
+        let mut seen: std::collections::HashSet<String> = seed_uris.iter().cloned().collect();
+        let mut out = seeds;
+        for uri in self.store.neighbors(&seed_uris, depth, limit)? {
+            if seen.insert(uri.clone()) {
+                if let Some(e) = self.store.get(&uri)? {
+                    out.push(e);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Rebuild edges from the `[[name]]` references in every current record's body. Batch, not
+    /// on-save, so writes stay fast at scale: build a slug->uri map once (the slug is the uri's
+    /// last segment), then resolve each `[[name]]` against it in memory. Idempotent. Returns the
+    /// count of `[[name]]` references that resolved to a record and were linked.
+    pub fn reindex_links(&self) -> Result<usize> {
+        let records = self.store.recent(1_000_000)?;
+        let mut by_slug: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        for e in &records {
+            if let Some(slug) = e.uri.rsplit('/').next() {
+                by_slug.entry(slug.to_string()).or_insert_with(|| e.uri.clone());
+            }
+        }
+        let mut linked = 0usize;
+        for e in &records {
+            for name in parse_wikilinks(&e.body) {
+                let slug = crate::entry::slug(&name);
+                if slug.is_empty() {
+                    continue;
+                }
+                if let Some(target) = by_slug.get(&slug) {
+                    if target != &e.uri {
+                        self.store.link(&e.uri, target, "links")?;
+                        linked += 1;
+                    }
+                }
+            }
+        }
+        Ok(linked)
+    }
+
     /// Construct a LocalMemory directly over a store (tests only; bypasses config). Uses the
     /// cheap HashEmbedder rather than `make_embedder` so tests never load a real model (no
     /// network, fast, deterministic); `vindex: None` keeps recall on the keyword path.
@@ -589,6 +678,55 @@ impl Memory {
             Memory::Remote(r) => r.import_record_at(kind, namespace, title, body, created_ms, importance),
         }
     }
+    pub fn link(&self, from_uri: &str, to_uri: &str, rel: &str) -> Result<()> {
+        match self {
+            Memory::Local(l) => l.link(from_uri, to_uri, rel),
+            #[cfg(feature = "client")]
+            Memory::Remote(r) => r.link(from_uri, to_uri, rel),
+        }
+    }
+    pub fn unlink(&self, from_uri: &str, to_uri: &str, rel: &str) -> Result<usize> {
+        match self {
+            Memory::Local(l) => l.unlink(from_uri, to_uri, rel),
+            #[cfg(feature = "client")]
+            Memory::Remote(r) => r.unlink(from_uri, to_uri, rel),
+        }
+    }
+    pub fn edges_of(&self, uri: &str) -> Result<Vec<Edge>> {
+        match self {
+            Memory::Local(l) => l.edges_of(uri),
+            #[cfg(feature = "client")]
+            Memory::Remote(r) => r.edges_of(uri),
+        }
+    }
+    pub fn all_edges(&self, limit: usize) -> Result<Vec<Edge>> {
+        match self {
+            Memory::Local(l) => l.all_edges(limit),
+            #[cfg(feature = "client")]
+            Memory::Remote(r) => r.all_edges(limit),
+        }
+    }
+    pub fn neighbors(&self, seeds: &[String], depth: usize, limit: usize) -> Result<Vec<String>> {
+        match self {
+            Memory::Local(l) => l.neighbors(seeds, depth, limit),
+            #[cfg(feature = "client")]
+            Memory::Remote(r) => r.neighbors(seeds, depth, limit),
+        }
+    }
+    pub fn recall_expanded(&self, query: &str, limit: usize, depth: usize) -> Result<Vec<Entry>> {
+        match self {
+            Memory::Local(l) => l.recall_expanded(query, limit, depth),
+            #[cfg(feature = "client")]
+            Memory::Remote(r) => r.recall_expanded(query, limit, depth),
+        }
+    }
+    pub fn reindex_links(&self) -> Result<usize> {
+        match self {
+            Memory::Local(l) => l.reindex_links(),
+            #[cfg(feature = "client")]
+            Memory::Remote(r) => r.reindex_links(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -652,5 +790,17 @@ mod tests {
         assert!(m.recall("green", 5).unwrap().is_empty(), "no longer valid now");
         let past = m.recall_as_of("green", 5, now_ms(), 200).unwrap();
         assert!(past.iter().any(|e| e.body.contains("green")), "valid-as-of 200 still sees it");
+    }
+
+    #[test]
+    fn reindex_links_resolves_wikilinks_and_recall_expands() {
+        let m = LocalMemory::for_test(tmp_store());
+        m.remember("Beta the target", "resources/notes", None, None).unwrap();
+        m.remember("Alpha refers to [[Beta the target]] for context", "resources/notes", None, None).unwrap();
+        let n = m.reindex_links().unwrap();
+        assert!(n >= 1, "the [[Beta the target]] reference should resolve and link");
+        // a query that only hits alpha still pulls beta in, via the edge
+        let hits = m.recall_expanded("Alpha refers context", 3, 1).unwrap();
+        assert!(hits.iter().any(|e| e.body.contains("Beta the target")), "neighbor pulled in via the graph");
     }
 }

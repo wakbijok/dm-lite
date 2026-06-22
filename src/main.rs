@@ -145,6 +145,9 @@ enum Cmd {
         /// Bitemporal: recall facts VALID AT this epoch-ms (what was true then); defaults to as-of.
         #[arg(long = "valid-at", visible_alias = "valid_at")]
         valid_at: Option<i64>,
+        /// Graph: also pull each hit's neighborhood within this many hops (0 = off).
+        #[arg(long, default_value_t = 0)]
+        expand: usize,
     },
     /// Show recent high-importance memory.
     Recent {
@@ -161,6 +164,26 @@ enum Cmd {
     Forget {
         uri: String,
     },
+    /// Link two records (the graph layer): from -[rel]-> to.
+    Link {
+        from: String,
+        to: String,
+        #[arg(long, default_value = "links")]
+        rel: String,
+    },
+    /// Remove an edge: from -[rel]-> to.
+    Unlink {
+        from: String,
+        to: String,
+        #[arg(long, default_value = "links")]
+        rel: String,
+    },
+    /// Show the edges touching a record (its graph connections).
+    Links {
+        uri: String,
+    },
+    /// Rebuild edges from the [[name]] references in every record body (batch).
+    ReindexLinks,
     /// Save a typed Reminder.
     AddReminder {
         #[arg(long)]
@@ -374,7 +397,7 @@ fn run() -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Recall { query, limit, as_of, valid_at } => {
+        Cmd::Recall { query, limit, as_of, valid_at, expand } => {
             let q = query.join(" ");
             let m = Memory::open()?;
             let hits = if as_of.is_some() || valid_at.is_some() {
@@ -382,6 +405,8 @@ fn run() -> Result<()> {
                 let sys = as_of.unwrap_or(now);
                 let val = valid_at.or(as_of).unwrap_or(now);
                 m.recall_as_of(&q, limit, sys, val)?
+            } else if expand > 0 {
+                m.recall_expanded(&q, limit, expand)?
             } else {
                 m.recall(&q, limit)?
             };
@@ -392,6 +417,40 @@ fn run() -> Result<()> {
                     println!("- ({}) {}  [{}]", e.kind.as_str(), e.title, e.uri);
                 }
             }
+            Ok(())
+        }
+        Cmd::Link { from, to, rel } => {
+            Memory::open()?.link(&from, &to, &rel)?;
+            println!("linked {} -[{}]-> {}", from, rel, to);
+            Ok(())
+        }
+        Cmd::Unlink { from, to, rel } => {
+            let n = Memory::open()?.unlink(&from, &to, &rel)?;
+            if n == 0 {
+                println!("no such edge: {} -[{}]-> {}", from, rel, to);
+            } else {
+                println!("unlinked {} -[{}]-> {}", from, rel, to);
+            }
+            Ok(())
+        }
+        Cmd::Links { uri } => {
+            let edges = Memory::open()?.edges_of(&uri)?;
+            if edges.is_empty() {
+                println!("(no edges for {})", uri);
+            } else {
+                for e in edges {
+                    if e.from_uri == uri {
+                        println!("-> [{}] {}", e.rel, e.to_uri);
+                    } else {
+                        println!("<- [{}] {}", e.rel, e.from_uri);
+                    }
+                }
+            }
+            Ok(())
+        }
+        Cmd::ReindexLinks => {
+            let n = Memory::open()?.reindex_links()?;
+            println!("reindexed: {} [[link]] reference{} linked", n, if n == 1 { "" } else { "s" });
             Ok(())
         }
         Cmd::Recent { limit } => {
