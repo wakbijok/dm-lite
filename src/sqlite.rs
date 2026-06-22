@@ -123,9 +123,16 @@ impl SqliteStore {
         let kind_s: String = row.get("kind")?;
         let tags_s: String = row.get("tags")?;
         let tags: Vec<String> = serde_json::from_str(&tags_s).unwrap_or_default();
+        let kind = Kind::from_str(&kind_s).unwrap_or_else(|| {
+            // A stored kind we do not recognize (a forward-version record) is read back as Memory
+            // so the row is never lost, but warn once: a future persona/protocol kind read as
+            // Memory would silently drop out of the persona() boot layer.
+            warn_unknown_kind_once(&kind_s);
+            Kind::Memory
+        });
         Ok(Entry {
             uri: row.get("uri")?,
-            kind: Kind::from_str(&kind_s).unwrap_or(Kind::Memory),
+            kind,
             namespace: row.get("namespace")?,
             title: row.get("title")?,
             body: row.get("body")?,
@@ -178,6 +185,20 @@ impl SqliteStore {
             }
         }
         Ok(out)
+    }
+}
+
+/// Upper bound on rows scanned by an as-of query before keyword filtering, so a tenant with a
+/// large history cannot make `recall_as_of` pull the whole table into memory. Rows are ordered
+/// importance-first, so the cap keeps the most significant slice.
+const MAX_AS_OF_SCAN: usize = 10_000;
+
+/// Warn at most once per process that a stored kind was not recognized (read back as Memory).
+fn warn_unknown_kind_once(kind: &str) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if !WARNED.swap(true, Ordering::Relaxed) {
+        eprintln!("dmem: stored record kind '{kind}' is not recognized; reading it as 'memory' (newer dmem?)");
     }
 }
 
@@ -300,6 +321,7 @@ impl MemoryStore for SqliteStore {
         let all: Vec<Entry> = stmt
             .query_map(params![as_of_ms, valid_ms], Self::row_to_entry)?
             .filter_map(|r| r.ok())
+            .take(MAX_AS_OF_SCAN)
             .collect();
         let terms: Vec<String> = query
             .split(|c: char| !c.is_ascii_alphanumeric())
@@ -346,6 +368,15 @@ impl MemoryStore for SqliteStore {
         }
         tx.commit()?;
         Ok(ids.len())
+    }
+
+    fn latest_save_ms(&self) -> Result<Option<i64>> {
+        // MAX over ALL rows: every put inserts a row with system_from_ms = now, so this is the
+        // wall-clock of the last write even if that version was later superseded or forgotten.
+        // `MAX(...)` over an empty table yields one NULL row -> None.
+        Ok(self
+            .conn
+            .query_row("SELECT MAX(system_from_ms) FROM entries", [], |r| r.get::<_, Option<i64>>(0))?)
     }
 }
 
@@ -443,6 +474,23 @@ mod tests {
         assert_eq!(s.history(&e.uri, 5).unwrap().len(), 1, "history still holds the closed version");
         // forgetting again is a no-op (nothing current)
         assert_eq!(s.forget(&e.uri).unwrap(), 0);
+    }
+
+    #[test]
+    fn latest_save_ms_tracks_newest_write_not_importance() {
+        let s = mem_store();
+        assert_eq!(s.latest_save_ms().unwrap(), None, "empty store -> None");
+        // a high-importance record saved first, then a low-importance one. The newest SAVE wins,
+        // even though recent() (importance-ordered) would surface the high-importance one.
+        s.put(&mk(Kind::Persona, "agent/persona", "Persona", "I am Izu.")).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        s.put(&mk(Kind::Memory, "ns", "a quick note", "body")).unwrap();
+        let latest = s.latest_save_ms().unwrap().expect("some save");
+        let newest_row: i64 = s
+            .conn
+            .query_row("SELECT MAX(system_from_ms) FROM entries", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(latest, newest_row, "latest_save_ms = MAX(system_from_ms)");
     }
 
     #[test]

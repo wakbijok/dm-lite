@@ -31,4 +31,9 @@ pub trait MemoryStore {
     /// Retract a uri: close its current version(s) in system time so it drops out of recall,
     /// keeping the lineage (append-only, never hard-deleted). Returns how many were closed.
     fn forget(&self, uri: &str) -> Result<usize>;
+
+    /// System-time of the most recent write of ANY version (`MAX(system_from_ms)`), or None for
+    /// an empty store. This is "when did I last save", used by the save-discipline nudge cadence;
+    /// unlike `recent`, it is ordered by time, not importance.
+    fn latest_save_ms(&self) -> Result<Option<i64>>;
 }

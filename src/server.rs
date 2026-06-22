@@ -24,6 +24,14 @@ use std::sync::Arc;
 
 type ApiResp = (StatusCode, Json<Value>);
 
+/// Upper bound on any client-supplied `limit`, so an untrusted value cannot balloon a query
+/// (the deeper rescoring pool is `limit*2`) or wrap on the `LIMIT ?` cast.
+const MAX_LIMIT: usize = 1000;
+
+/// Cap on a request body: these payloads are small (a query, a memory record); a few hundred KB
+/// is generous and stops an unbounded-body memory blowup.
+const MAX_BODY_BYTES: usize = 512 * 1024;
+
 /// Resolve an `Authorization` header to a tenant. The seam: BearerAuth now, JWT could drop
 /// in later without touching handlers.
 pub trait Authenticator: Send + Sync {
@@ -140,9 +148,12 @@ struct RecallReq {
     query: String,
     #[serde(default)]
     limit: Option<usize>,
-    /// bitemporal: recall the store as of this epoch-ms (and facts valid then)
+    /// bitemporal: recall the store as of this epoch-ms (system time)
     #[serde(default)]
     as_of: Option<i64>,
+    /// bitemporal: facts valid at this epoch-ms; defaults to `as_of` when absent (older clients).
+    #[serde(default)]
+    valid: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -258,9 +269,9 @@ async fn healthz() -> ApiResp {
 
 async fn recall_h(State(st): State<AppState>, headers: HeaderMap, Json(req): Json<RecallReq>) -> ApiResp {
     with_tenant(&st, &headers, false, |m| {
-        let limit = req.limit.unwrap_or(6);
+        let limit = req.limit.unwrap_or(6).min(MAX_LIMIT);
         let hits = match req.as_of {
-            Some(ts) => m.recall_as_of(&req.query, limit, ts, ts)?,
+            Some(ts) => m.recall_as_of(&req.query, limit, ts, req.valid.unwrap_or(ts))?,
             None => m.recall(&req.query, limit)?,
         };
         Ok(json!(hits))
@@ -268,7 +279,7 @@ async fn recall_h(State(st): State<AppState>, headers: HeaderMap, Json(req): Jso
 }
 
 async fn recent_h(State(st): State<AppState>, headers: HeaderMap, Json(req): Json<RecentReq>) -> ApiResp {
-    with_tenant(&st, &headers, false, |m| Ok(json!(m.recent(req.limit.unwrap_or(10))?)))
+    with_tenant(&st, &headers, false, |m| Ok(json!(m.recent(req.limit.unwrap_or(10).min(MAX_LIMIT))?)))
 }
 
 async fn persona_h(State(st): State<AppState>, headers: HeaderMap) -> ApiResp {
@@ -276,11 +287,15 @@ async fn persona_h(State(st): State<AppState>, headers: HeaderMap) -> ApiResp {
 }
 
 async fn reminders_h(State(st): State<AppState>, headers: HeaderMap, Json(req): Json<RecentReq>) -> ApiResp {
-    with_tenant(&st, &headers, false, |m| Ok(json!(m.reminders(req.limit.unwrap_or(5))?)))
+    with_tenant(&st, &headers, false, |m| Ok(json!(m.reminders(req.limit.unwrap_or(5).min(MAX_LIMIT))?)))
+}
+
+async fn latest_save_h(State(st): State<AppState>, headers: HeaderMap) -> ApiResp {
+    with_tenant(&st, &headers, false, |m| Ok(json!({ "latest_save_ms": m.latest_save_ms()? })))
 }
 
 async fn history_h(State(st): State<AppState>, headers: HeaderMap, Json(req): Json<HistoryReq>) -> ApiResp {
-    with_tenant(&st, &headers, false, |m| Ok(json!(m.history(&req.uri, req.limit.unwrap_or(20))?)))
+    with_tenant(&st, &headers, false, |m| Ok(json!(m.history(&req.uri, req.limit.unwrap_or(20).min(MAX_LIMIT))?)))
 }
 
 async fn forget_h(State(st): State<AppState>, headers: HeaderMap, Json(req): Json<ForgetReq>) -> ApiResp {
@@ -420,6 +435,7 @@ pub fn router(auth: Arc<dyn Authenticator>) -> Router {
         .route("/recent", post(recent_h))
         .route("/persona", post(persona_h))
         .route("/reminders", post(reminders_h))
+        .route("/latest_save", post(latest_save_h))
         .route("/history", post(history_h))
         .route("/forget", post(forget_h))
         .route("/remember", post(remember_h))
@@ -434,6 +450,7 @@ pub fn router(auth: Arc<dyn Authenticator>) -> Router {
         .route("/admin/tenants", get(admin_list_h))
         .route("/admin/revoke", post(admin_revoke_h))
         .route("/admin/rm", post(admin_rm_h))
+        .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(AppState { auth })
 }
 

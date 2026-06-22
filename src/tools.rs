@@ -378,6 +378,11 @@ impl LocalMemory {
         self.store.by_kind("reminder", limit)
     }
 
+    /// System-time of the most recent save (for the save-discipline nudge cadence).
+    pub fn latest_save_ms(&self) -> Result<Option<i64>> {
+        self.store.latest_save_ms()
+    }
+
     /// Construct a LocalMemory directly over a store (tests only; bypasses config). Uses the
     /// cheap HashEmbedder rather than `make_embedder` so tests never load a real model (no
     /// network, fast, deterministic); `vindex: None` keeps recall on the keyword path.
@@ -467,6 +472,13 @@ impl Memory {
             Memory::Local(l) => l.reminders(limit),
             #[cfg(feature = "client")]
             Memory::Remote(r) => r.reminders(limit),
+        }
+    }
+    pub fn latest_save_ms(&self) -> Result<Option<i64>> {
+        match self {
+            Memory::Local(l) => l.latest_save_ms(),
+            #[cfg(feature = "client")]
+            Memory::Remote(r) => r.latest_save_ms(),
         }
     }
     pub fn counts(&self) -> Result<Vec<(String, usize)>> {

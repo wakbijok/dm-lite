@@ -133,7 +133,10 @@ pub fn user_prompt_submit(arg: Option<String>, hermes: bool) -> Result<()> {
         blocks.push(recall);
     }
     // cadence backstop: if nothing has been saved recently, remind to capture durable work.
-    let latest = m.recent(1).ok().and_then(|v| v.first().map(|e| e.created_ms));
+    // Use the newest SAVE time (latest_save_ms), not recent(1): recent() orders by importance, so
+    // it returns a persona/protocol record (importance 95) whose old timestamp made the nudge fire
+    // every turn regardless of recent activity.
+    let latest = m.latest_save_ms().ok().flatten();
     if should_nudge(latest, crate::entry::now_ms()) {
         blocks.push(render::render_nudge());
     }

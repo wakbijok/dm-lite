@@ -206,9 +206,21 @@ mod tests {
 
     #[test]
     fn kind_roundtrips() {
-        for k in [Kind::Decision, Kind::AgentLesson, Kind::IncidentSummary, Kind::ProjectConvention, Kind::ServiceTopology, Kind::KnownFailureMode, Kind::RemediationPattern, Kind::Reminder, Kind::ResourceSummary] {
-            assert_eq!(Kind::from_str(k.as_str()), Some(k));
+        // EVERY kind must round-trip through as_str -> from_str, the governance kinds
+        // (Persona/Protocol) and Memory included: persona() and the MCP instructions field
+        // depend on those resolving.
+        for k in [
+            Kind::Decision, Kind::Runbook, Kind::IncidentSummary, Kind::ServiceTopology,
+            Kind::KnownFailureMode, Kind::RemediationPattern, Kind::ProjectConvention,
+            Kind::AgentLesson, Kind::ResourceSummary, Kind::Persona, Kind::Protocol,
+            Kind::Reminder, Kind::Memory,
+        ] {
+            assert_eq!(Kind::from_str(k.as_str()), Some(k), "kind {:?} must round-trip", k);
         }
+        // the short aliases dm-lite briefly emitted still resolve
+        assert_eq!(Kind::from_str("incident"), Some(Kind::IncidentSummary));
+        assert_eq!(Kind::from_str("convention"), Some(Kind::ProjectConvention));
+        assert_eq!(Kind::from_str("lesson"), Some(Kind::AgentLesson));
         assert_eq!(Kind::from_str("nope"), None);
     }
 

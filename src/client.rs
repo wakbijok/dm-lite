@@ -46,7 +46,10 @@ impl RemoteClient {
         if !status.is_success() {
             anyhow::bail!("server {} on {}: {}", status.as_u16(), path, text.trim());
         }
-        Ok(serde_json::from_str(&text).unwrap_or(Value::Null))
+        // A 2xx with an undecodable body is a real error (broken channel / version skew), NOT an
+        // empty result: coercing it to Null/empty would silently render empty governance and look
+        // like a regression. Surface it. The body is not echoed (it could hold returned secrets).
+        serde_json::from_str(&text).map_err(|e| anyhow!("decode response from {path}: {e}"))
     }
 
     fn get(&self, path: &str) -> Result<Value> {
@@ -61,12 +64,12 @@ impl RemoteClient {
         if !status.is_success() {
             anyhow::bail!("server {} on {}: {}", status.as_u16(), path, text.trim());
         }
-        Ok(serde_json::from_str(&text).unwrap_or(Value::Null))
+        serde_json::from_str(&text).map_err(|e| anyhow!("decode response from {path}: {e}"))
     }
 
     fn list(&self, path: &str, body: Value) -> Result<Vec<Entry>> {
         let v = self.post(path, body)?;
-        Ok(serde_json::from_value(v).unwrap_or_default())
+        serde_json::from_value(v).map_err(|e| anyhow!("decode record list from {path}: {e}"))
     }
 
     // --- admin (root-token) operations ---
@@ -104,11 +107,17 @@ impl RemoteClient {
     pub fn recall(&self, query: &str, limit: usize) -> Result<Vec<Entry>> {
         self.list("/recall", json!({ "query": query, "limit": limit }))
     }
-    pub fn recall_as_of(&self, query: &str, limit: usize, as_of_ms: i64, _valid_ms: i64) -> Result<Vec<Entry>> {
-        self.list("/recall", json!({ "query": query, "limit": limit, "as_of": as_of_ms }))
+    pub fn recall_as_of(&self, query: &str, limit: usize, as_of_ms: i64, valid_ms: i64) -> Result<Vec<Entry>> {
+        // Carry BOTH bitemporal axes over the wire so remote as-of matches local (the server
+        // defaults `valid` to `as_of` when absent, preserving older clients).
+        self.list("/recall", json!({ "query": query, "limit": limit, "as_of": as_of_ms, "valid": valid_ms }))
     }
     pub fn recent(&self, limit: usize) -> Result<Vec<Entry>> {
         self.list("/recent", json!({ "limit": limit }))
+    }
+    pub fn latest_save_ms(&self) -> Result<Option<i64>> {
+        let v = self.post("/latest_save", json!({}))?;
+        Ok(v.get("latest_save_ms").and_then(|x| x.as_i64()))
     }
     pub fn history(&self, uri: &str, limit: usize) -> Result<Vec<Entry>> {
         self.list("/history", json!({ "uri": uri, "limit": limit }))
@@ -216,4 +225,33 @@ pub fn logout() -> Result<()> {
     std::fs::write(&path, toml::to_string(&doc)?)?;
     println!("logged out (server config removed)");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::entry::{Entry, Kind};
+    use serde_json::json;
+
+    /// The server returns a bare JSON array of Entry (e.g. `json!(m.persona()?)`); the client
+    /// decodes it via `serde_json::from_value::<Vec<Entry>>`. This guards that contract so the
+    /// remote persona/reminders path stays byte-compatible with the local one the feature relies on.
+    #[test]
+    fn server_entry_array_decodes_to_entries() {
+        let e = Entry::new_now(
+            "daimon://agent/persona/persona/op".into(),
+            Kind::Persona,
+            "agent/persona".into(),
+            "Operator Persona".into(),
+            "I am Izu.".into(),
+            vec!["persona".into()],
+            95,
+            "daimon://agent/persona/persona/op".into(),
+        );
+        let wire = json!(vec![e.clone()]); // exactly what /persona serializes
+        let back: Vec<Entry> = serde_json::from_value(wire).expect("server Entry array must decode");
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0].kind, Kind::Persona);
+        assert_eq!(back[0].uri, e.uri);
+        assert_eq!(back[0].tags, vec!["persona".to_string()]);
+    }
 }
