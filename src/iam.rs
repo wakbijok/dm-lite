@@ -98,12 +98,10 @@ impl Iam {
         )?;
         if let Ok(dir) = crate::config::data_dir() {
             let p = dir.join("admin.token");
-            if std::fs::write(&p, &token).is_ok() {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
-                }
+            // 0600 from creation (atomic temp+rename); surface a failure instead of swallowing it
+            // so a world-readable admin token never goes unnoticed.
+            if let Err(e) = crate::config::write_secret(&p, &token) {
+                eprintln!("dmem: could not write {} securely ({e}); the admin token is shown above", p.display());
             }
         }
         Ok(Some(token))

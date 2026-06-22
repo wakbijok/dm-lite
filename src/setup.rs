@@ -17,49 +17,46 @@ pub fn run() -> Result<()> {
         .default(0)
         .interact()?;
 
-    let mut cfg = String::new();
+    // Build the config with the toml serializer (not string-interpolation) so a token/url with a
+    // quote or special character is escaped rather than able to break or inject into the TOML.
+    let mut doc = toml::Table::new();
     if mode == 1 {
         let url: String = Input::with_theme(&theme)
             .with_prompt("Server URL (e.g. https://memory.myhost.tld:8077)")
             .interact_text()?;
         let token: String = Password::with_theme(&theme).with_prompt("Bearer token").interact()?;
-        cfg.push_str(&format!("[server]\nurl = \"{}\"\ntoken = \"{}\"\n", url.trim(), token));
+        let mut server = toml::Table::new();
+        server.insert("url".into(), toml::Value::String(url.trim().to_string()));
+        server.insert("token".into(), toml::Value::String(token));
         if url.trim().starts_with("https://") {
             let insecure = Confirm::with_theme(&theme)
                 .with_prompt("Accept a self-signed certificate (insecure)?")
                 .default(false)
                 .interact()?;
             if insecure {
-                cfg.push_str("insecure = true\n");
+                server.insert("insecure".into(), toml::Value::Boolean(true));
             } else {
                 let ca: String = Input::with_theme(&theme)
                     .with_prompt("Path to the server's cert/CA PEM (blank = system roots)")
                     .allow_empty(true)
                     .interact_text()?;
                 if !ca.trim().is_empty() {
-                    cfg.push_str(&format!("ca_cert = \"{}\"\n", ca.trim()));
+                    server.insert("ca_cert".into(), toml::Value::String(ca.trim().to_string()));
                 }
             }
         }
+        doc.insert("server".into(), toml::Value::Table(server));
     } else {
         let tenant: String = Input::with_theme(&theme)
             .with_prompt("Tenant name")
             .default("default".to_string())
             .interact_text()?;
-        cfg.push_str(&format!("tenant = \"{}\"\n", tenant.trim()));
+        doc.insert("tenant".into(), toml::Value::String(tenant.trim().to_string()));
     }
 
     let path = crate::config::config_path().ok_or_else(|| anyhow!("could not resolve a config dir"))?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(&path, &cfg)?;
-    // the file may hold a token; lock it down on unix
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-    }
+    // 0600 from creation (it may hold a token); atomic temp+rename, no write-then-chmod window.
+    crate::config::write_secret(&path, &toml::to_string(&doc)?)?;
     println!("\nwrote config to {}", path.display());
 
     // 2. name the AI and the user, then set up the default persona + governance (these are

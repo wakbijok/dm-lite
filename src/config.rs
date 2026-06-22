@@ -5,7 +5,7 @@
 
 use anyhow::{anyhow, Result};
 use serde::Deserialize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 /// The on-disk config (`~/.config/dmem/config.toml`, or `$DM_CONFIG`). All fields optional;
@@ -41,20 +41,85 @@ pub fn config_path() -> Option<PathBuf> {
     dirs::config_dir().map(|d| d.join("dmem").join("config.toml"))
 }
 
-/// The loaded config (cached). Returns defaults if the file is absent or unparseable.
+/// The loaded config (cached). An ABSENT/unreadable file is fine (the embedded fallback with
+/// defaults). A file that is PRESENT but invalid TOML is fatal: silently falling back to embedded
+/// would route reads/writes to the wrong (local) store while the user believes they are connected
+/// to a server. We never echo the file body in the error (it may hold a bearer token); only the
+/// parse position is reported.
 pub fn config() -> &'static Config {
-    CONFIG.get_or_init(|| {
-        config_path()
-            .and_then(|p| std::fs::read_to_string(p).ok())
-            .and_then(|s| match toml::from_str::<Config>(&s) {
-                Ok(c) => Some(c),
-                Err(e) => {
-                    eprintln!("dmem: ignoring bad config ({e})");
-                    None
-                }
-            })
-            .unwrap_or_default()
-    })
+    CONFIG.get_or_init(load_config)
+}
+
+fn load_config() -> Config {
+    let Some(path) = config_path() else {
+        return Config::default();
+    };
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(_) => return Config::default(), // absent or unreadable -> embedded fallback
+    };
+    match toml::from_str::<Config>(&raw) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!(
+                "dmem: config at {} is present but not valid TOML (at {}). Refusing to fall back \
+                 to local storage; fix it or re-run `dmem login` / `dmem setup`.",
+                path.display(),
+                parse_position(&raw, &e)
+            );
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Line/column of a TOML parse error, computed from the byte span WITHOUT printing any file
+/// content (the file may contain a bearer token).
+fn parse_position(raw: &str, e: &toml::de::Error) -> String {
+    match e.span() {
+        Some(span) => {
+            let upto = &raw[..span.start.min(raw.len())];
+            let line = upto.bytes().filter(|&b| b == b'\n').count() + 1;
+            let col = upto.len() - upto.rfind('\n').map(|i| i + 1).unwrap_or(0) + 1;
+            format!("line {line}, column {col}")
+        }
+        None => "unknown position".to_string(),
+    }
+}
+
+/// A token is safe to interpolate into config/unit files if it is non-empty and limited to the
+/// opaque-token charset dmem mints (`dmem_<hex>`) plus `-`. Rejects quotes, whitespace, and
+/// control characters that could break TOML/plist/systemd or inject extra directives.
+pub fn is_safe_token(s: &str) -> bool {
+    !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// Write a file that holds a secret (bearer token) with 0600 from the start. Writes to a sibling
+/// temp file opened 0600, then atomically renames over the target, so there is no window where the
+/// secret is readable at the default umask (the previous write-then-chmod had a TOCTOU gap).
+pub fn write_secret(path: &Path, contents: &str) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "secret".into());
+        let tmp = path.with_file_name(format!(".{name}.tmp.{}", std::process::id()));
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        f.write_all(contents.as_bytes())?;
+        f.sync_all().ok();
+        std::fs::rename(&tmp, path)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, contents)
+    }
 }
 
 /// The remote server link, if the config selects remote-client mode.
@@ -139,5 +204,33 @@ mod tests {
     fn empty_config_is_default() {
         let cfg: Config = toml::from_str("").unwrap();
         assert!(cfg.server.is_none() && cfg.tenant.is_none() && cfg.data_dir.is_none());
+    }
+
+    #[test]
+    fn is_safe_token_rejects_injection_chars() {
+        assert!(is_safe_token("dmem_0123abcdef"));
+        assert!(is_safe_token("tenant-laptop_1"));
+        assert!(!is_safe_token(""), "empty is not safe");
+        assert!(!is_safe_token("has space"));
+        assert!(!is_safe_token("has\"quote"));
+        assert!(!is_safe_token("has\nnewline"));
+        assert!(!is_safe_token("has=equals"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_secret_is_0600_and_creates_parents() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("dmcfg-{}-{}", std::process::id(), crate::entry::now_ms()));
+        let p = dir.join("nested").join("secret.toml");
+        write_secret(&p, "token = \"x\"\n").unwrap();
+        let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "a secret-bearing file must be 0600");
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "token = \"x\"\n");
+        // overwriting an existing (looser) file still ends at 0600
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
+        write_secret(&p, "token = \"y\"\n").unwrap();
+        let mode2 = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode2, 0o600, "rewrite must re-tighten to 0600");
     }
 }

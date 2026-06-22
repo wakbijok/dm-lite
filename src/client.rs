@@ -200,12 +200,8 @@ pub fn login(url: &str, token: &str, insecure: bool, ca_cert: Option<String>) ->
         server.insert("ca_cert".into(), toml::Value::String(ca));
     }
     doc.insert("server".into(), toml::Value::Table(server));
-    std::fs::write(&path, toml::to_string(&doc)?)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-    }
+    // 0600 from creation (the config holds the bearer token); atomic temp+rename, no chmod window.
+    crate::config::write_secret(&path, &toml::to_string(&doc)?)?;
     println!("logged in to {url}\nconfig: {}", path.display());
     Ok(())
 }

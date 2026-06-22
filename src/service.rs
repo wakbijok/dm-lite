@@ -41,8 +41,13 @@ fn run_ok(cmd: &str, args: &[&str]) -> Result<()> {
 /// Install + start the daemon as a login service and point config.toml at it. Reuses the token
 /// already in config.toml [server] (so existing clients keep working), else mints a fresh one.
 pub fn install(addr: &str) -> Result<()> {
-    let tenant = config::tenant();
+    let tenant = config::canonical_tenant(&config::tenant());
     let token = config::server_link().map(|s| s.token.clone()).unwrap_or_else(gen_token);
+    // The token is interpolated into a launchd plist / systemd unit (not just TOML), so reject
+    // anything outside the opaque-token charset before it can break or inject into those files.
+    if !config::is_safe_token(&token) {
+        bail!("refusing to install: the configured server token has characters unsafe for unit files; re-issue it with `dmem admin add` / `dmem login`");
+    }
     let data_dir = config::data_dir()?.to_string_lossy().into_owned();
     platform::install(addr, &token, &tenant, &data_dir)?;
     write_server_config(addr, &token, &tenant)?;
@@ -83,19 +88,17 @@ pub fn status() -> Result<()> {
 }
 
 /// Ensure config.toml has a [server] block pointing at the local daemon (so every dmem invocation
-/// - cli, hooks, mcp - becomes a thin client of it). 0600 (it holds the bearer token).
+/// - cli, hooks, mcp - becomes a thin client of it). 0600 (it holds the bearer token). Built via
+/// the toml serializer so the token/url are escaped, not string-interpolated.
 fn write_server_config(addr: &str, token: &str, tenant: &str) -> Result<()> {
     let path = config::config_path().ok_or_else(|| anyhow!("no config path"))?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let body = format!("tenant = \"{tenant}\"\n\n[server]\nurl = \"http://{addr}\"\ntoken = \"{token}\"\n");
-    std::fs::write(&path, body)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-    }
+    let mut doc = toml::Table::new();
+    doc.insert("tenant".into(), toml::Value::String(tenant.to_string()));
+    let mut server = toml::Table::new();
+    server.insert("url".into(), toml::Value::String(format!("http://{addr}")));
+    server.insert("token".into(), toml::Value::String(token.to_string()));
+    doc.insert("server".into(), toml::Value::Table(server));
+    config::write_secret(&path, &toml::to_string(&doc)?)?;
     Ok(())
 }
 
@@ -108,13 +111,24 @@ mod platform {
         Ok(home()?.join("Library/LaunchAgents").join(format!("{NAME}.plist")))
     }
 
+    /// Escape a value for an XML text node (the plist is XML). Paths and tokens go into
+    /// `<string>` nodes, so a stray `&`/`<`/`"` would otherwise corrupt the plist.
+    fn xml_escape(s: &str) -> String {
+        s.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;")
+            .replace('\'', "&apos;")
+    }
+
     pub fn install(addr: &str, token: &str, tenant: &str, data_dir: &str) -> Result<()> {
-        let bin = dmem_bin()?;
+        let bin = xml_escape(&dmem_bin()?);
         let p = plist()?;
         if let Some(parent) = p.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let log = home()?.join("Library/Logs/dmem-serve.log").display().to_string();
+        let log = xml_escape(&home()?.join("Library/Logs/dmem-serve.log").display().to_string());
+        // tenant is already canonical ([a-z0-9_-]); uppercased it stays a safe env-var key.
         let tenant_env = format!("DM_TOKEN_{}", tenant.to_uppercase());
         let content = format!(
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
@@ -133,7 +147,7 @@ mod platform {
              \x20 <key>StandardOutPath</key><string>{log}</string>\n\
              \x20 <key>StandardErrorPath</key><string>{log}</string>\n\
              </dict></plist>\n",
-            name = NAME, bin = bin, addr = addr, tenant_env = tenant_env, token = token, data_dir = data_dir, log = log
+            name = NAME, bin = bin, addr = xml_escape(addr), tenant_env = tenant_env, token = xml_escape(token), data_dir = xml_escape(data_dir), log = log
         );
         std::fs::write(&p, content)?;
         let ps = p.to_string_lossy().into_owned();
@@ -189,11 +203,14 @@ mod platform {
         if let Some(parent) = u.parent() {
             std::fs::create_dir_all(parent)?;
         }
+        // tenant is canonical; token is validated to the opaque-token charset upstream, so neither
+        // can carry a space/newline. Quote the path-bearing values (bin, data_dir) so a path with
+        // a space does not split the ExecStart args or the Environment assignment.
         let tenant_env = format!("DM_TOKEN_{}", tenant.to_uppercase());
         let content = format!(
             "[Unit]\nDescription=dmem memory server\nAfter=network.target\n\n\
-             [Service]\nExecStart={bin} serve --addr {addr}\n\
-             Environment={tenant_env}={token}\nEnvironment=DM_DATA_DIR={data_dir}\nRestart=on-failure\n\n\
+             [Service]\nExecStart=\"{bin}\" serve --addr {addr}\n\
+             Environment={tenant_env}={token}\nEnvironment=\"DM_DATA_DIR={data_dir}\"\nRestart=on-failure\n\n\
              [Install]\nWantedBy=default.target\n",
             bin = bin, addr = addr, tenant_env = tenant_env, token = token, data_dir = data_dir
         );
