@@ -1,6 +1,7 @@
-//! Paths, config file, and tenant resolution. Embedded mode = one local tenant; server mode
-//! selects the tenant per request; a `[server]` block in the config switches the binary into
-//! remote-client mode (it talks to a remote `dmem serve`). One database file per tenant.
+//! Paths, config file, and tenant resolution. The model is client/server: a `[server]` block puts
+//! the binary in remote-client mode (it talks to a `dmem serve`, local loopback or remote; server
+//! mode selects the tenant per request). Without one it falls back to the deprecated embedded mode
+//! (one local tenant). One database file per tenant.
 
 use anyhow::{anyhow, Result};
 use serde::Deserialize;
@@ -8,7 +9,7 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 
 /// The on-disk config (`~/.config/dmem/config.toml`, or `$DM_CONFIG`). All fields optional;
-/// an absent file means embedded mode with defaults.
+/// an absent file means the deprecated embedded fallback with defaults (prefer a `[server]` block).
 #[derive(Debug, Default, Deserialize)]
 pub struct Config {
     pub data_dir: Option<String>,

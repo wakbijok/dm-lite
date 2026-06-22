@@ -1,6 +1,6 @@
-//! dm - daimon-memory v2 (embedded mode). A small typed memory engine with hybrid
-//! recall, behind a MemoryStore trait. M0: SQLite + FTS keyword recall + Devin/Claude
-//! hooks. LanceDB + dense vectors layer in next behind the same trait.
+//! dmem - daimon-memory v2: typed memory with hybrid recall; client/server in one binary. A
+//! `[server]` block points the binary at a `dmem serve` (local loopback or remote); without one
+//! it falls back to the deprecated embedded mode (a single local tenant).
 
 mod bootstrap;
 #[cfg(feature = "client")]
@@ -42,7 +42,7 @@ const TPL_FILES: &[(&str, &str)] = &[
 ];
 
 #[derive(Parser)]
-#[command(name = "dmem", version, about = "daimon-memory v2: small embedded typed memory with hybrid recall")]
+#[command(name = "dmem", version, about = "daimon-memory v2: typed memory with hybrid recall; client/server in one binary")]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -574,7 +574,7 @@ fn status() -> Result<()> {
     }
     let tenant = config::tenant();
     let db = config::db_path(&tenant)?;
-    println!("mode   : embedded");
+    println!("mode   : embedded (local fallback, deprecated; run `dmem setup` for client/server)");
     println!("tenant : {}", tenant);
     println!("store  : {}", db.display());
     let m = Memory::open()?;
