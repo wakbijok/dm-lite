@@ -4,10 +4,10 @@ daimon-memory v2: a small typed memory engine for AI agents. One binary, client/
 
 ## Features
 
-- One memory across your AI tools: the same recall and capture in Claude Code, Codex, Hermes, and Devin, with the integration built in (one command per tool), not left for you to wire yourself. Switch tools, keep the same brain. Any other MCP client can connect too.
+- One memory across your AI tools: the same recall and capture in Claude Code, Codex, Hermes, Devin, and Claude Desktop, with the integration built in (one command per tool), not left for you to wire yourself. Switch tools, keep the same brain. Any MCP client can connect too, and receives the persona and protocols, not only the tools.
 - Typed, curated memory: decisions, lessons, incidents, runbooks, conventions, reminders, and more, each a first-class kind.
 - Hybrid recall: SQLite FTS5 keyword search fused with dense vectors (bge-small via zvec), ranked together.
-- Bitemporal: every save is a new version, nothing is overwritten; recall the store as of any point in time.
+- Bitemporal: two time axes, when a fact is true in the world and when you recorded it. Backdate a fact, end its validity, and recall both what was true at a past moment and what you knew at one. Nothing is overwritten.
 - Client/server in one binary: run it locally, or host it on a VPS, homelab, or cloud box and point your machines at it. Local or remote is just a URL.
 - Multitenant: one database per tenant, token-only IAM (root admin plus per-tenant tokens), built-in TLS (no reverse proxy).
 - Self-updating: `dmem upgrade` pulls the latest release in place.
@@ -33,7 +33,7 @@ dmem recall "vector store decision"
 Wire it into an agent (one command each, or `--all`):
 
 ```bash
-dmem bootstrap --claude     # or --codex / --hermes / --devin / --all
+dmem bootstrap --claude     # or --codex / --hermes / --devin / --claude-desktop / --all
 ```
 
 Out of the box this runs on one machine: the server and your client live together. To run the server on one host and connect clients from elsewhere, see the wiki.
