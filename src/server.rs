@@ -20,7 +20,19 @@ use axum::{
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+
+/// Hex SHA-256, used to key the env-token map by digest rather than by the raw secret. Looking a
+/// token up by its (fixed-length, high-entropy) hash avoids leaking secret bytes through the
+/// timing of a raw-string comparison.
+fn sha256_hex(s: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut out = String::with_capacity(64);
+    for b in Sha256::digest(s.as_bytes()) {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
+}
 
 type ApiResp = (StatusCode, Json<Value>);
 
@@ -38,13 +50,14 @@ pub trait Authenticator: Send + Sync {
     fn tenant_for(&self, auth_header: Option<&str>) -> Option<String>;
 }
 
-/// Multi-token bearer auth: a token -> tenant map built from `DM_TOKEN_<TENANT>` env vars.
+/// Multi-token bearer auth: a token -> tenant map built from `DM_TOKEN_<TENANT>` env vars. Keyed
+/// by the SHA-256 of the secret (not the raw secret) so a lookup compares fixed-length digests.
 pub struct BearerAuth {
     map: HashMap<String, String>,
 }
 
 impl BearerAuth {
-    /// Build the token -> tenant map from `DM_TOKEN_<TENANT>` env vars. Fails fast on an
+    /// Build the token-hash -> tenant map from `DM_TOKEN_<TENANT>` env vars. Fails fast on an
     /// ambiguous config: the same secret mapping to two different tenants would otherwise
     /// resolve nondeterministically (HashMap iteration order), silently breaking isolation.
     pub fn from_env() -> Result<Self> {
@@ -55,7 +68,7 @@ impl BearerAuth {
                     continue;
                 }
                 let tenant = crate::config::canonical_tenant(tenant);
-                if let Some(prev) = map.insert(v, tenant.clone()) {
+                if let Some(prev) = map.insert(sha256_hex(&v), tenant.clone()) {
                     if prev != tenant {
                         anyhow::bail!(
                             "ambiguous DM_TOKEN config: one bearer secret maps to both tenants '{prev}' and '{tenant}'"
@@ -85,13 +98,36 @@ fn parse_bearer(h: &str) -> Option<&str> {
 impl Authenticator for BearerAuth {
     fn tenant_for(&self, auth_header: Option<&str>) -> Option<String> {
         let token = parse_bearer(auth_header?)?;
-        self.map.get(token).cloned()
+        self.map.get(&sha256_hex(token)).cloned()
     }
 }
+
+/// Shared, per-tenant LocalMemory handle. rusqlite Connection is Send but !Sync, so each tenant's
+/// engine is behind its own Mutex; the IAM connection (also !Sync) sits behind one Mutex.
+type TenantHandle = Arc<Mutex<LocalMemory>>;
 
 #[derive(Clone)]
 struct AppState {
     auth: Arc<dyn Authenticator>,
+    /// The IAM connection, opened ONCE at startup (None if it could not be opened). Token
+    /// resolution locks it briefly; no per-request open.
+    iam: Arc<Mutex<Option<crate::iam::Iam>>>,
+    /// Per-tenant engine cache: a request reuses the tenant's open SQLite/zvec handles instead of
+    /// re-opening them every call. zvec's Collection is Send + Sync, so this is safe to share.
+    mem: Arc<Mutex<HashMap<String, TenantHandle>>>,
+}
+
+impl AppState {
+    /// The cached handle for a tenant, opening (and caching) it on first use.
+    fn memory_for(&self, tenant: &str) -> Result<TenantHandle> {
+        let mut cache = self.mem.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(m) = cache.get(tenant) {
+            return Ok(m.clone());
+        }
+        let handle: TenantHandle = Arc::new(Mutex::new(Memory::open_tenant(tenant)?));
+        cache.insert(tenant.to_string(), handle.clone());
+        Ok(handle)
+    }
 }
 
 fn err(code: StatusCode, msg: &str) -> ApiResp {
@@ -111,14 +147,19 @@ fn bad_request(e: anyhow::Error) -> ApiResp {
     err(StatusCode::BAD_REQUEST, "invalid request")
 }
 
-/// Resolve the bearer token to an identity: the IAM token DB first, then the env fallback
-/// (which always yields a member). None = unknown/revoked/suspended.
+/// Resolve the bearer token to an identity: the IAM token DB first (revocation/suspension
+/// enforced), then the env-token fallback. None = unknown/revoked/suspended. Uses the startup
+/// IAM handle (locked briefly); if IAM was unavailable at startup the map is None and only env
+/// tokens resolve, which was logged loudly then (a stale IAM no longer silently fails per request).
 fn resolve_identity(st: &AppState, headers: &HeaderMap) -> Option<crate::iam::Identity> {
     let h = headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok())?;
     let token = parse_bearer(h)?;
-    if let Ok(iam) = crate::iam::Iam::open() {
-        if let Some(id) = iam.resolve(token) {
-            return Some(id);
+    {
+        let iam = st.iam.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(iam) = iam.as_ref() {
+            if let Some(id) = iam.resolve(token) {
+                return Some(id);
+            }
         }
     }
     st.auth
@@ -239,27 +280,38 @@ fn ns_or<'a>(ns: &'a Option<String>, default: &'a str) -> &'a str {
     ns.as_deref().filter(|s| !s.is_empty()).unwrap_or(default)
 }
 
-/// Auth, open the request's tenant store, run `f`, and JSON-encode its result. `client_err`
-/// maps a failure to 400 (treat as bad input) instead of 500.
-fn with_tenant(
-    st: &AppState,
-    headers: &HeaderMap,
-    client_err: bool,
-    f: impl FnOnce(&LocalMemory) -> Result<serde_json::Value>,
-) -> ApiResp {
+/// Auth, get the request's (cached) tenant handle, run the blocking `f` on the blocking pool, and
+/// JSON-encode its result. `client_err` maps a failure to 400 (bad input) instead of 500. `f` runs
+/// under the tenant's Mutex via spawn_blocking, so SQLite/zvec work never blocks an async worker
+/// and same-tenant requests serialize (SQLite writes serialize anyway) while different tenants run
+/// in parallel.
+async fn with_tenant<F>(st: &AppState, headers: &HeaderMap, client_err: bool, f: F) -> ApiResp
+where
+    F: FnOnce(&LocalMemory) -> Result<serde_json::Value> + Send + 'static,
+{
     let tenant = match tenant_of(st, headers) {
         Some(t) => t,
         None => return err(StatusCode::UNAUTHORIZED, "invalid or missing bearer token"),
     };
-    match Memory::open_tenant(&tenant).and_then(|m| f(&m)) {
-        Ok(v) => (StatusCode::OK, Json(v)),
-        Err(e) => {
+    let handle = match st.memory_for(&tenant) {
+        Ok(h) => h,
+        Err(e) => return internal(e),
+    };
+    let res = tokio::task::spawn_blocking(move || {
+        let guard = handle.lock().unwrap_or_else(|p| p.into_inner());
+        f(&guard)
+    })
+    .await;
+    match res {
+        Ok(Ok(v)) => (StatusCode::OK, Json(v)),
+        Ok(Err(e)) => {
             if client_err {
                 bad_request(e)
             } else {
                 internal(e)
             }
         }
+        Err(e) => internal(anyhow::anyhow!("memory task failed: {e}")),
     }
 }
 
@@ -268,7 +320,7 @@ async fn healthz() -> ApiResp {
 }
 
 async fn recall_h(State(st): State<AppState>, headers: HeaderMap, Json(req): Json<RecallReq>) -> ApiResp {
-    with_tenant(&st, &headers, false, |m| {
+    with_tenant(&st, &headers, false, move |m| {
         let limit = req.limit.unwrap_or(6).min(MAX_LIMIT);
         let hits = match req.as_of {
             Some(ts) => m.recall_as_of(&req.query, limit, ts, req.valid.unwrap_or(ts))?,
@@ -276,74 +328,82 @@ async fn recall_h(State(st): State<AppState>, headers: HeaderMap, Json(req): Jso
         };
         Ok(json!(hits))
     })
+    .await
 }
 
 async fn recent_h(State(st): State<AppState>, headers: HeaderMap, Json(req): Json<RecentReq>) -> ApiResp {
-    with_tenant(&st, &headers, false, |m| Ok(json!(m.recent(req.limit.unwrap_or(10).min(MAX_LIMIT))?)))
+    with_tenant(&st, &headers, false, move |m| Ok(json!(m.recent(req.limit.unwrap_or(10).min(MAX_LIMIT))?))).await
 }
 
 async fn persona_h(State(st): State<AppState>, headers: HeaderMap) -> ApiResp {
-    with_tenant(&st, &headers, false, |m| Ok(json!(m.persona()?)))
+    with_tenant(&st, &headers, false, |m| Ok(json!(m.persona()?))).await
 }
 
 async fn reminders_h(State(st): State<AppState>, headers: HeaderMap, Json(req): Json<RecentReq>) -> ApiResp {
-    with_tenant(&st, &headers, false, |m| Ok(json!(m.reminders(req.limit.unwrap_or(5).min(MAX_LIMIT))?)))
+    with_tenant(&st, &headers, false, move |m| Ok(json!(m.reminders(req.limit.unwrap_or(5).min(MAX_LIMIT))?))).await
 }
 
 async fn latest_save_h(State(st): State<AppState>, headers: HeaderMap) -> ApiResp {
-    with_tenant(&st, &headers, false, |m| Ok(json!({ "latest_save_ms": m.latest_save_ms()? })))
+    with_tenant(&st, &headers, false, |m| Ok(json!({ "latest_save_ms": m.latest_save_ms()? }))).await
 }
 
 async fn history_h(State(st): State<AppState>, headers: HeaderMap, Json(req): Json<HistoryReq>) -> ApiResp {
-    with_tenant(&st, &headers, false, |m| Ok(json!(m.history(&req.uri, req.limit.unwrap_or(20).min(MAX_LIMIT))?)))
+    with_tenant(&st, &headers, false, move |m| Ok(json!(m.history(&req.uri, req.limit.unwrap_or(20).min(MAX_LIMIT))?))).await
 }
 
 async fn forget_h(State(st): State<AppState>, headers: HeaderMap, Json(req): Json<ForgetReq>) -> ApiResp {
-    with_tenant(&st, &headers, false, |m| Ok(json!({ "forgotten": m.forget(&req.uri)? })))
+    with_tenant(&st, &headers, false, move |m| Ok(json!({ "forgotten": m.forget(&req.uri)? }))).await
 }
 
 async fn remember_h(State(st): State<AppState>, headers: HeaderMap, Json(req): Json<RememberReq>) -> ApiResp {
-    with_tenant(&st, &headers, false, |m| {
+    with_tenant(&st, &headers, false, move |m| {
         Ok(json!({ "uri": m.remember(&req.text, ns_or(&req.namespace, "resources/notes"))? }))
     })
+    .await
 }
 
 async fn decision_h(State(st): State<AppState>, headers: HeaderMap, Json(req): Json<DecisionReq>) -> ApiResp {
-    with_tenant(&st, &headers, true, |m| {
+    with_tenant(&st, &headers, true, move |m| {
         let ns = ns_or(&req.namespace, "resources/notes");
         Ok(json!({ "uri": m.log_decision(&req.title, &req.context, &req.decision, &req.rationale, ns)? }))
     })
+    .await
 }
 
 async fn lesson_h(State(st): State<AppState>, headers: HeaderMap, Json(req): Json<LessonReq>) -> ApiResp {
-    with_tenant(&st, &headers, true, |m| {
+    with_tenant(&st, &headers, true, move |m| {
         Ok(json!({ "uri": m.log_lesson(&req.title, &req.lesson, ns_or(&req.namespace, "agent/lessons"))? }))
     })
+    .await
 }
 
 async fn incident_h(State(st): State<AppState>, headers: HeaderMap, Json(req): Json<IncidentReq>) -> ApiResp {
-    with_tenant(&st, &headers, true, |m| {
+    with_tenant(&st, &headers, true, move |m| {
         let ns = ns_or(&req.namespace, "resources/incidents");
         Ok(json!({ "uri": m.log_incident(&req.title, &req.impact, &req.resolution, ns)? }))
     })
+    .await
 }
 
 async fn runbook_h(State(st): State<AppState>, headers: HeaderMap, Json(req): Json<RunbookReq>) -> ApiResp {
-    with_tenant(&st, &headers, true, |m| {
+    with_tenant(&st, &headers, true, move |m| {
         Ok(json!({ "uri": m.log_runbook(&req.title, &req.steps, ns_or(&req.namespace, "resources/runbooks"))? }))
     })
+    .await
 }
 
 async fn convention_h(State(st): State<AppState>, headers: HeaderMap, Json(req): Json<ConventionReq>) -> ApiResp {
-    with_tenant(&st, &headers, true, |m| {
+    with_tenant(&st, &headers, true, move |m| {
         Ok(json!({ "uri": m.log_convention(&req.title, &req.rule, ns_or(&req.namespace, "resources/conventions"))? }))
     })
+    .await
 }
 
 async fn reminder_h(State(st): State<AppState>, headers: HeaderMap, Json(req): Json<ReminderReq>) -> ApiResp {
-    with_tenant(&st, &headers, true, |m| {
+    with_tenant(&st, &headers, true, move |m| {
         Ok(json!({ "uri": m.add_reminder(&req.title, &req.text, ns_or(&req.namespace, "agent/reminders"))? }))
     })
+    .await
 }
 
 #[derive(Deserialize)]
@@ -363,7 +423,7 @@ struct ImportReq {
 }
 
 async fn import_h(State(st): State<AppState>, headers: HeaderMap, Json(req): Json<ImportReq>) -> ApiResp {
-    with_tenant(&st, &headers, true, |m| {
+    with_tenant(&st, &headers, true, move |m| {
         let kind = crate::entry::Kind::from_str(&req.kind)
             .ok_or_else(|| anyhow::anyhow!("unknown kind: {}", req.kind))?;
         let ns = if req.namespace.is_empty() { "resources/notes" } else { &req.namespace };
@@ -374,6 +434,7 @@ async fn import_h(State(st): State<AppState>, headers: HeaderMap, Json(req): Jso
         };
         Ok(json!({ "uri": uri }))
     })
+    .await
 }
 
 // --- admin (IAM) routes: require the root admin token ---
@@ -427,8 +488,15 @@ async fn admin_rm_h(State(st): State<AppState>, headers: HeaderMap, Json(req): J
     })
 }
 
-/// Assemble the router. `/healthz` is open; every other route requires a valid bearer token.
-pub fn router(auth: Arc<dyn Authenticator>) -> Router {
+/// Assemble the router. `/healthz` is open; every other route requires a valid bearer token. `iam`
+/// is the startup-opened IAM handle (None if it could not be opened), shared for token resolution;
+/// the per-tenant memory cache starts empty and fills on first use.
+pub fn router(auth: Arc<dyn Authenticator>, iam: Option<crate::iam::Iam>) -> Router {
+    let state = AppState {
+        auth,
+        iam: Arc::new(Mutex::new(iam)),
+        mem: Arc::new(Mutex::new(HashMap::new())),
+    };
     Router::new()
         .route("/healthz", get(healthz))
         .route("/recall", post(recall_h))
@@ -451,7 +519,7 @@ pub fn router(auth: Arc<dyn Authenticator>) -> Router {
         .route("/admin/revoke", post(admin_revoke_h))
         .route("/admin/rm", post(admin_rm_h))
         .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY_BYTES))
-        .with_state(AppState { auth })
+        .with_state(state)
 }
 
 /// TLS choice for the server: bring-your-own cert/key, or generate a self-signed pair.
@@ -490,29 +558,43 @@ pub fn run_blocking(addr: &str, tls: TlsOpts) -> Result<()> {
     // rustls 0.23 needs a process-wide crypto provider installed before any TLS work.
     let _ = rustls::crypto::ring::default_provider().install_default();
     let auth = BearerAuth::from_env()?;
-    // IAM: ensure a bootstrap root admin token; print it once if newly generated.
-    if let Ok(iam) = crate::iam::Iam::open() {
-        match iam.ensure_admin() {
-            Ok(Some(token)) => {
-                let dir = crate::config::data_dir().map(|d| d.display().to_string()).unwrap_or_default();
-                eprintln!("dmem serve: generated ROOT ADMIN token (save it, shown once):");
-                eprintln!("    {token}");
-                eprintln!("  also written to {dir}/admin.token (0600)");
-                eprintln!("  wire the admin client: dmem login {addr} {token}  then `dmem admin add <tenant>`");
+    // IAM: open ONCE here (shared by the router for token resolution), ensure a bootstrap root
+    // admin token, and print it once if newly generated. If IAM cannot be opened, run env-only and
+    // say so loudly: token revocation is then not enforced until IAM recovers (no silent per-request
+    // open swallowing the failure as before).
+    let iam = match crate::iam::Iam::open() {
+        Ok(iam) => {
+            match iam.ensure_admin() {
+                Ok(Some(token)) => {
+                    let dir = crate::config::data_dir().map(|d| d.display().to_string()).unwrap_or_default();
+                    eprintln!("dmem serve: generated ROOT ADMIN token (save it, shown once):");
+                    eprintln!("    {token}");
+                    eprintln!("  also written to {dir}/admin.token (0600)");
+                    eprintln!("  wire the admin client: dmem login {addr} {token}  then `dmem admin add <tenant>`");
+                }
+                Ok(None) => {}
+                Err(e) => eprintln!("dmem serve: IAM init warning ({e:#})"),
             }
-            Ok(None) => {}
-            Err(e) => eprintln!("dmem serve: IAM init warning ({e:#})"),
+            Some(iam)
         }
-    }
+        Err(e) => {
+            eprintln!("dmem serve: IAM unavailable ({e:#}); serving with env tokens only - token revocation/suspension is NOT enforced until IAM is reachable.");
+            None
+        }
+    };
     if auth.is_empty() {
         eprintln!(
             "dmem serve: tip - create tenants with the admin token (`dmem admin add <tenant>`), \
              or set DM_TOKEN_<tenant>=<secret> for a quick static token."
         );
     }
+    // Warm the process-wide embedder before serving so the FIRST recall does not pay the model
+    // load on a request. No-op without the vector feature.
+    #[cfg(feature = "zvec")]
+    crate::tools::warm_embedder();
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async move {
-        let app = router(Arc::new(auth));
+        let app = router(Arc::new(auth), iam);
         let sock: std::net::SocketAddr = addr
             .parse()
             .map_err(|e| anyhow::anyhow!("bad addr {addr}: {e}"))?;
@@ -596,6 +678,24 @@ mod tests {
         std::env::remove_var("DM_TOKEN_GLOBEX");
     }
 
+    #[test]
+    fn memory_cache_reuses_one_handle_per_tenant() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("dmcache-{}-{}", std::process::id(), crate::entry::now_ms()));
+        std::env::set_var("DM_DATA_DIR", &dir);
+        let st = AppState {
+            auth: Arc::new(BearerAuth::from_env().unwrap()),
+            iam: Arc::new(Mutex::new(None)),
+            mem: Arc::new(Mutex::new(HashMap::new())),
+        };
+        let a1 = st.memory_for("tenant_a").unwrap();
+        let a2 = st.memory_for("tenant_a").unwrap();
+        let b1 = st.memory_for("tenant_b").unwrap();
+        assert!(Arc::ptr_eq(&a1, &a2), "same tenant must reuse the cached handle");
+        assert!(!Arc::ptr_eq(&a1, &b1), "different tenants must get different handles");
+        std::env::remove_var("DM_DATA_DIR");
+    }
+
     #[tokio::test]
     async fn recall_route_authorizes_and_returns_hits() {
         let _g = ENV_LOCK.lock().unwrap();
@@ -606,7 +706,7 @@ mod tests {
         let m = Memory::open_tenant("t1srv").unwrap();
         m.remember("the vector substrate is zvec", "resources/notes").unwrap();
 
-        let app = router(Arc::new(BearerAuth::from_env().unwrap()));
+        let app = router(Arc::new(BearerAuth::from_env().unwrap()), None);
 
         // missing token -> 401
         let resp = app

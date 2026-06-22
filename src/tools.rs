@@ -28,6 +28,13 @@ fn make_embedder() -> std::sync::Arc<dyn crate::embedder::Embedder> {
     EMBEDDER.get_or_init(build_embedder).clone()
 }
 
+/// Warm the process-wide embedder cache up front (server startup), so the FIRST recall does not
+/// pay the model load on a request thread. Subsequent calls reuse the cached instance.
+#[cfg(feature = "zvec")]
+pub fn warm_embedder() {
+    let _ = make_embedder();
+}
+
 /// Construct the best available embedder (called once, behind the `make_embedder` cache).
 #[cfg(feature = "zvec")]
 fn build_embedder() -> std::sync::Arc<dyn crate::embedder::Embedder> {

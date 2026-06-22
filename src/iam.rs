@@ -107,8 +107,10 @@ impl Iam {
         Ok(Some(token))
     }
 
-    /// Resolve a presented token to an identity (None = unknown/revoked/suspended). Bumps
-    /// last-used as a side effect.
+    /// Resolve a presented token to an identity (None = unknown/revoked/suspended). Read-only: it
+    /// does NOT write last_used_ms. The server resolves on EVERY request, and a per-request UPDATE
+    /// serializes all auth on the IAM write lock; the timestamp is not surfaced anywhere, so it is
+    /// not worth that contention. (The column stays for schema compatibility.)
     pub fn resolve(&self, token: &str) -> Option<Identity> {
         let h = sha256_hex(token);
         let (tenant, is_admin): (Option<String>, i64) = self
@@ -132,9 +134,6 @@ impl Iam {
                 return None;
             }
         }
-        let _ = self
-            .conn
-            .execute("UPDATE tokens SET last_used_ms=?1 WHERE token_hash=?2", params![crate::entry::now_ms(), h]);
         Some(Identity { tenant, is_admin: is_admin != 0 })
     }
 
