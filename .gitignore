@@ -4,6 +4,3 @@
 *.db
 *.db-*
 .fastembed_cache/
-# agent-local artifacts (Claude Code per-project settings, Devin CLI MCP registration)
-.claude/
-.devin/
