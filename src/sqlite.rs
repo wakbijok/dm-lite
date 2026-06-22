@@ -216,32 +216,55 @@ fn fts_query(query: &str) -> Option<String> {
     }
 }
 
-impl MemoryStore for SqliteStore {
-    fn put(&self, e: &Entry) -> Result<()> {
-        let now = crate::entry::now_ms();
-        // Atomic: supersede + canonical INSERT + FTS INSERT must commit or roll back together,
-        // else a crash mid-way could leave a dedup_key with no current version (data loss) or
-        // entries/entries_fts desynced. unchecked_transaction because put takes &self; on any
-        // early-return error the tx Drops -> ROLLBACK.
-        let tx = self.conn.unchecked_transaction()?;
-        // Append-only supersede: close prior CURRENT versions (same dedup_key) in SYSTEM
-        // time only (system_to_ms = now) - the old version is retained, never deleted - and
-        // drop their FTS rows so keyword recall sees only the current version.
-        let mut sel = tx
-            .prepare("SELECT id FROM entries WHERE dedup_key=?1 AND system_to_ms IS NULL")?;
-        let ids: Vec<i64> = sel
-            .query_map(params![e.dedup_key], |r| r.get::<_, i64>(0))?
+/// Sentinel for an open-ended (unbounded) valid_to in interval math: `None` reads as +infinity.
+const VALID_OPEN: i64 = i64::MAX;
+fn vto(v: Option<i64>) -> i64 {
+    v.unwrap_or(VALID_OPEN)
+}
+/// Do the half-open valid intervals [af, at) and [bf, bt) overlap? (None = open / +infinity.)
+fn intervals_overlap(af: i64, at: Option<i64>, bf: i64, bt: Option<i64>) -> bool {
+    af < vto(bt) && bf < vto(at)
+}
+
+impl SqliteStore {
+    /// All system-current versions (id + entry) for a dedup_key. Bitemporal: an entity can have
+    /// several at once, partitioning its valid-time line into non-overlapping segments.
+    fn current_rows(conn: &Connection, dedup_key: &str) -> Result<Vec<(i64, Entry)>> {
+        let mut stmt = conn.prepare(&format!(
+            "SELECT id, {COLS} FROM entries WHERE dedup_key=?1 AND system_to_ms IS NULL"
+        ))?;
+        let rows = stmt
+            .query_map(params![dedup_key], |row| Ok((row.get::<_, i64>("id")?, Self::row_to_entry(row)?)))?
             .filter_map(|r| r.ok())
             .collect();
-        drop(sel);
-        for id in &ids {
-            tx.execute("UPDATE entries SET system_to_ms=?1 WHERE id=?2", params![now, id])?;
-            tx.execute("DELETE FROM entries_fts WHERE idref=?1", params![id])?;
-        }
-        // Append the new current version: system_from = now (store-authoritative), system_to
-        // = NULL. created_ms / valid_from_ms / valid_to_ms come from the entry.
+        Ok(rows)
+    }
+
+    /// As `current_rows`, keyed by uri (used by `invalidate`).
+    fn current_rows_by_uri(conn: &Connection, uri: &str) -> Result<Vec<(i64, Entry)>> {
+        let mut stmt = conn.prepare(&format!(
+            "SELECT id, {COLS} FROM entries WHERE uri=?1 AND system_to_ms IS NULL"
+        ))?;
+        let rows = stmt
+            .query_map(params![uri], |row| Ok((row.get::<_, i64>("id")?, Self::row_to_entry(row)?)))?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    }
+
+    /// System-close one version (drop it from current belief) and remove its FTS row. The row is
+    /// retained (append-only); only `system_to_ms` is stamped.
+    fn close_version(conn: &Connection, id: i64, now: i64) -> Result<()> {
+        conn.execute("UPDATE entries SET system_to_ms=?1 WHERE id=?2", params![now, id])?;
+        conn.execute("DELETE FROM entries_fts WHERE idref=?1", params![id])?;
+        Ok(())
+    }
+
+    /// Insert one new system-current version (system_from=now, system_to=NULL) + its FTS row.
+    /// Carries the entry's valid interval verbatim, so remainders preserve the prior body.
+    fn insert_version(conn: &Connection, e: &Entry, now: i64) -> Result<()> {
         let tags = serde_json::to_string(&e.tags).unwrap_or_else(|_| "[]".into());
-        tx.execute(
+        conn.execute(
             "INSERT INTO entries(uri,kind,namespace,title,body,tags,importance,dedup_key,\
              created_ms,valid_from_ms,valid_to_ms,system_from_ms,system_to_ms) \
              VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,NULL)",
@@ -250,12 +273,58 @@ impl MemoryStore for SqliteStore {
                 e.importance, e.dedup_key, e.created_ms, e.valid_from_ms, e.valid_to_ms, now
             ],
         )?;
-        let new_id = tx.last_insert_rowid();
+        let new_id = conn.last_insert_rowid();
         let fts_text = format!("{} {} {}", e.title, e.body, e.tags.join(" "));
-        tx.execute(
-            "INSERT INTO entries_fts(idref, text) VALUES (?1, ?2)",
-            params![new_id, fts_text],
-        )?;
+        conn.execute("INSERT INTO entries_fts(idref, text) VALUES (?1, ?2)", params![new_id, fts_text])?;
+        Ok(())
+    }
+}
+
+impl MemoryStore for SqliteStore {
+    /// Bitemporal upsert with valid-time splitting. The new entry asserts its body over its valid
+    /// interval [valid_from, valid_to). Any system-current segment of the same entity that OVERLAPS
+    /// that interval is system-closed and its non-overlapping remainder(s) re-inserted (carrying
+    /// the old body), then the new segment is inserted. Non-overlapping segments are untouched, so
+    /// the entity can hold several valid-time segments at once. Whole thing is one transaction.
+    ///
+    /// - new interval == an existing segment  -> pure correction (close old, no remainder).
+    /// - new interval is a sub-range          -> the world changed (one or two remainders kept).
+    /// - identical body already covering it    -> no-op (no version churn on re-imports).
+    fn put(&self, e: &Entry) -> Result<()> {
+        let now = crate::entry::now_ms();
+        let tx = self.conn.unchecked_transaction()?;
+        let current = Self::current_rows(&tx, &e.dedup_key)?;
+        // Idempotent: a current segment with the SAME body that already covers the new interval
+        // means we already believe this -> nothing to record.
+        let already = current.iter().any(|(_, r)| {
+            r.body == e.body && r.valid_from_ms <= e.valid_from_ms && vto(r.valid_to_ms) >= vto(e.valid_to_ms)
+        });
+        if already {
+            tx.commit()?;
+            return Ok(());
+        }
+        for (id, r) in &current {
+            if !intervals_overlap(r.valid_from_ms, r.valid_to_ms, e.valid_from_ms, e.valid_to_ms) {
+                continue;
+            }
+            Self::close_version(&tx, *id, now)?;
+            // left remainder [r.valid_from, e.valid_from)
+            if r.valid_from_ms < e.valid_from_ms {
+                let mut left = r.clone();
+                left.valid_to_ms = Some(e.valid_from_ms);
+                Self::insert_version(&tx, &left, now)?;
+            }
+            // right remainder [e.valid_to, r.valid_to) - only if the new interval is bounded and
+            // ends before this segment did.
+            if let Some(evt) = e.valid_to_ms {
+                if evt < vto(r.valid_to_ms) {
+                    let mut right = r.clone();
+                    right.valid_from_ms = evt;
+                    Self::insert_version(&tx, &right, now)?;
+                }
+            }
+        }
+        Self::insert_version(&tx, e, now)?;
         tx.commit()?;
         Ok(())
     }
@@ -378,6 +447,29 @@ impl MemoryStore for SqliteStore {
             .conn
             .query_row("SELECT MAX(system_from_ms) FROM entries", [], |r| r.get::<_, Option<i64>>(0))?)
     }
+
+    fn invalidate(&self, uri: &str, valid_to_ms: i64) -> Result<usize> {
+        let now = crate::entry::now_ms();
+        let tx = self.conn.unchecked_transaction()?;
+        let mut affected = 0usize;
+        for (id, r) in Self::current_rows_by_uri(&tx, uri)? {
+            // segments that already end at/before the cut keep their full validity (untouched)
+            if vto(r.valid_to_ms) <= valid_to_ms {
+                continue;
+            }
+            // r extends past the cut -> close it; keep only the part before the cut, if any
+            // (a segment entirely at/after the cut is dropped with no remainder).
+            Self::close_version(&tx, id, now)?;
+            if r.valid_from_ms < valid_to_ms {
+                let mut keep = r.clone();
+                keep.valid_to_ms = Some(valid_to_ms);
+                Self::insert_version(&tx, &keep, now)?;
+            }
+            affected += 1;
+        }
+        tx.commit()?;
+        Ok(affected)
+    }
 }
 
 #[cfg(test)]
@@ -399,6 +491,25 @@ mod tests {
     fn mk(kind: Kind, ns: &str, title: &str, body: &str) -> Entry {
         let uri = make_uri(ns, kind, title);
         Entry::new_now(uri.clone(), kind, ns.into(), title.into(), body.into(), vec![], 50, uri)
+    }
+
+    /// Like `mk` but with an explicit valid interval (the caller-managed application-time axis).
+    fn mk_valid(title: &str, body: &str, vf: i64, vt: Option<i64>) -> Entry {
+        let mut e = mk(Kind::Memory, "ns", title, body);
+        e.valid_from_ms = vf;
+        e.valid_to_ms = vt;
+        e
+    }
+
+    fn current_segments(s: &SqliteStore, uri: &str) -> Vec<(String, i64, Option<i64>)> {
+        let mut st = s
+            .conn
+            .prepare("SELECT body, valid_from_ms, valid_to_ms FROM entries WHERE uri=?1 AND system_to_ms IS NULL ORDER BY valid_from_ms")
+            .unwrap();
+        st.query_map(params![uri], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .filter_map(|x| x.ok())
+            .collect()
     }
 
     #[test]
@@ -592,5 +703,79 @@ mod tests {
         // re-opening is a no-op (idempotent)
         let s2 = SqliteStore::open(&path).unwrap();
         assert_eq!(s2.recent(10).unwrap().len(), 1);
+    }
+
+    // --- bitemporal valid-time (Option B) ---
+
+    #[test]
+    fn change_splits_valid_time_and_keeps_old_segment() {
+        let s = mem_store();
+        let uri = make_uri("ns", Kind::Memory, "role");
+        s.put(&mk_valid("role", "architect", 100, None)).unwrap();
+        s.put(&mk_valid("role", "lead", 200, None)).unwrap(); // the world changed at 200
+        // current belief (valid now): lead
+        let now = s.recall("role", 10).unwrap();
+        assert_eq!(now.len(), 1);
+        assert_eq!(now[0].body, "lead");
+        // valid-as-of 150 (per current belief): architect
+        let past = s.recall_as_of("role", 10, now_ms(), 150).unwrap();
+        assert!(past.iter().any(|e| e.body == "architect"));
+        assert!(!past.iter().any(|e| e.body == "lead"));
+        // two system-current segments coexist
+        assert_eq!(
+            current_segments(&s, &uri),
+            vec![("architect".into(), 100, Some(200)), ("lead".into(), 200, None)]
+        );
+    }
+
+    #[test]
+    fn correction_same_interval_replaces_without_remainder() {
+        let s = mem_store();
+        let uri = make_uri("ns", Kind::Memory, "k");
+        s.put(&mk_valid("k", "wrong", 100, None)).unwrap();
+        s.put(&mk_valid("k", "right", 100, None)).unwrap(); // same interval = pure correction
+        assert_eq!(current_segments(&s, &uri), vec![("right".into(), 100, None)]);
+        let total: i64 = s.conn.query_row("SELECT COUNT(*) FROM entries WHERE uri=?1", params![uri], |r| r.get(0)).unwrap();
+        assert_eq!(total, 2, "old belief retained in system time (append-only)");
+    }
+
+    #[test]
+    fn identical_resave_is_a_noop() {
+        let s = mem_store();
+        let uri = make_uri("ns", Kind::Memory, "k");
+        s.put(&mk_valid("k", "same", 100, None)).unwrap();
+        s.put(&mk_valid("k", "same", 200, None)).unwrap(); // same body, already covered -> no-op
+        let total: i64 = s.conn.query_row("SELECT COUNT(*) FROM entries WHERE uri=?1", params![uri], |r| r.get(0)).unwrap();
+        assert_eq!(total, 1, "no new version for an unchanged re-save");
+    }
+
+    #[test]
+    fn invalidate_ends_validity_keeping_history() {
+        let s = mem_store();
+        let uri = make_uri("ns", Kind::Memory, "k");
+        s.put(&mk_valid("k", "live", 100, None)).unwrap();
+        assert_eq!(s.invalidate(&uri, 300).unwrap(), 1);
+        assert!(s.recall("live", 5).unwrap().is_empty(), "no longer true now");
+        let past = s.recall_as_of("live", 5, now_ms(), 200).unwrap();
+        assert!(past.iter().any(|e| e.body == "live"), "valid-as-of 200 still sees it");
+        assert_eq!(current_segments(&s, &uri), vec![("live".into(), 100, Some(300))]);
+    }
+
+    #[test]
+    fn sub_interval_update_creates_two_remainders() {
+        let s = mem_store();
+        let uri = make_uri("ns", Kind::Memory, "k");
+        s.put(&mk_valid("k", "base", 100, None)).unwrap();
+        s.put(&mk_valid("k", "blip", 200, Some(300))).unwrap(); // a value true only for [200,300)
+        assert_eq!(
+            current_segments(&s, &uri),
+            vec![
+                ("base".into(), 100, Some(200)),
+                ("blip".into(), 200, Some(300)),
+                ("base".into(), 300, None),
+            ]
+        );
+        assert_eq!(s.recall("base", 5).unwrap()[0].body, "base"); // valid now (>300)
+        assert!(s.recall_as_of("blip", 5, now_ms(), 250).unwrap().iter().any(|e| e.body == "blip"));
     }
 }

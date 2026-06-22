@@ -36,4 +36,10 @@ pub trait MemoryStore {
     /// an empty store. This is "when did I last save", used by the save-discipline nudge cadence;
     /// unlike `recent`, it is ordered by time, not importance.
     fn latest_save_ms(&self) -> Result<Option<i64>>;
+
+    /// Application-time invalidation: mark this uri's fact as no longer true from `valid_to_ms`
+    /// onward, keeping the historical `[valid_from, valid_to_ms)` slice queryable via as-of. This
+    /// is a VALID-time end, distinct from `forget` (which retracts from current belief in SYSTEM
+    /// time, as if we never should have recorded it). Returns how many segments were affected.
+    fn invalidate(&self, uri: &str, valid_to_ms: i64) -> Result<usize>;
 }
