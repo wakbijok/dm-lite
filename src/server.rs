@@ -275,6 +275,10 @@ async fn persona_h(State(st): State<AppState>, headers: HeaderMap) -> ApiResp {
     with_tenant(&st, &headers, false, |m| Ok(json!(m.persona()?)))
 }
 
+async fn reminders_h(State(st): State<AppState>, headers: HeaderMap, Json(req): Json<RecentReq>) -> ApiResp {
+    with_tenant(&st, &headers, false, |m| Ok(json!(m.reminders(req.limit.unwrap_or(5))?)))
+}
+
 async fn history_h(State(st): State<AppState>, headers: HeaderMap, Json(req): Json<HistoryReq>) -> ApiResp {
     with_tenant(&st, &headers, false, |m| Ok(json!(m.history(&req.uri, req.limit.unwrap_or(20))?)))
 }
@@ -415,6 +419,7 @@ pub fn router(auth: Arc<dyn Authenticator>) -> Router {
         .route("/recall", post(recall_h))
         .route("/recent", post(recent_h))
         .route("/persona", post(persona_h))
+        .route("/reminders", post(reminders_h))
         .route("/history", post(history_h))
         .route("/forget", post(forget_h))
         .route("/remember", post(remember_h))

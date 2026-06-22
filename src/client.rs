@@ -120,6 +120,9 @@ impl RemoteClient {
     pub fn persona(&self) -> Result<Vec<Entry>> {
         self.list("/persona", json!({}))
     }
+    pub fn reminders(&self, limit: usize) -> Result<Vec<Entry>> {
+        self.list("/reminders", json!({ "limit": limit }))
+    }
     pub fn counts(&self) -> Result<Vec<(String, usize)>> {
         // counts live server-side; a remote `dmem status` reports the connection, not tallies.
         Ok(Vec::new())

@@ -61,12 +61,15 @@ fn debug_log(event: &str, hermes: bool, raw_stdin: &str, prompt: &str, first_tur
     }
 }
 
-/// SessionStart: inject persona/protocol + recent context.
+/// SessionStart: inject persona/protocol + a lean open-reminders greet. Recent/recalled memory
+/// rides the per-prompt UserPromptSubmit hook, NOT here, so the payload stays under Claude Code's
+/// 10,000-char hook-stdout cap (see render::SESSION_BUDGET; over the cap CC persists the block to
+/// a file and injects only a ~2KB preview, dropping the protocols from live context).
 pub fn session_start(hermes: bool) -> Result<()> {
     let m = Memory::open()?;
     let persona = m.persona().unwrap_or_default();
-    let recent = m.recent(5).unwrap_or_default();
-    emit("SessionStart", &render::render_session(&persona, &recent), hermes);
+    let reminders = m.reminders(5).unwrap_or_default();
+    emit("SessionStart", &render::render_session(&persona, &reminders), hermes);
     Ok(())
 }
 

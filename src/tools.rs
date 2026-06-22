@@ -372,6 +372,12 @@ impl LocalMemory {
         Ok(out)
     }
 
+    /// Open reminders (kind=reminder), most important/recent first. The session-start greet
+    /// pulls a few of these; the full backlog is on-demand recall.
+    pub fn reminders(&self, limit: usize) -> Result<Vec<Entry>> {
+        self.store.by_kind("reminder", limit)
+    }
+
     /// Construct a LocalMemory directly over a store (tests only; bypasses config/embedder).
     #[cfg(test)]
     fn for_test(store: SqliteStore) -> Self {
@@ -452,6 +458,13 @@ impl Memory {
             Memory::Local(l) => l.persona(),
             #[cfg(feature = "client")]
             Memory::Remote(r) => r.persona(),
+        }
+    }
+    pub fn reminders(&self, limit: usize) -> Result<Vec<Entry>> {
+        match self {
+            Memory::Local(l) => l.reminders(limit),
+            #[cfg(feature = "client")]
+            Memory::Remote(r) => r.reminders(limit),
         }
     }
     pub fn counts(&self) -> Result<Vec<(String, usize)>> {

@@ -49,42 +49,47 @@ pub fn render_nudge() -> String {
     )
 }
 
-/// The session-start block: persona/protocol (full bodies) + recent context.
-pub fn render_session(persona: &[Entry], recent: &[Entry]) -> String {
-    let mut parts: Vec<String> = Vec::new();
+/// Char budget for the session-start block. Claude Code caps a hook's stdout at 10,000 chars;
+/// over the cap it persists the output to a file and injects only a ~2KB preview, so the
+/// protocols silently fall out of the model's live context. Persona + protocols are the
+/// must-keep core; the reminders block is the only trimmable part and is dropped first if the
+/// budget is hit. Leaves headroom under 10,000 for JSON escaping plus the hookSpecificOutput
+/// wrapper. If persona + protocols alone approach this, tighten the protocol prose.
+const SESSION_BUDGET: usize = 9300;
+
+/// The session-start block: persona/protocol (full bodies) + a lean open-reminders line.
+/// Recent/recalled memory deliberately does NOT ride this block (it would bloat the payload past
+/// the hook-stdout cap); it rides the per-prompt hook (`render_recall`) instead. Reminders are
+/// titles only, the actionable greet; their detail is fetched on demand via recall.
+pub fn render_session(persona: &[Entry], reminders: &[Entry]) -> String {
+    let mut out = String::new();
     if !persona.is_empty() {
-        let mut p = String::from(
+        out.push_str(
             "<daimon-persona>\n[Adopt the following persona and operating protocols for this session.]\n",
         );
         for e in persona {
-            p.push_str(&e.body);
+            out.push_str(&e.body);
             if !e.body.ends_with('\n') {
-                p.push('\n');
+                out.push('\n');
             }
         }
-        p.push_str("</daimon-persona>");
-        parts.push(p);
+        out.push_str("</daimon-persona>");
     }
-    let recent_block = if recent.is_empty() {
-        String::new()
-    } else {
-        let mut r = String::from("<daimon-memory>\n[Recent shared context:]\n");
-        for e in recent {
-            r.push_str(&format!(
-                "- ({}) {}: {} [{}]\n",
-                e.kind.as_str(),
-                e.title,
-                one_line(&e.body, 200),
-                e.uri
-            ));
+    if !reminders.is_empty() {
+        let sep = if out.is_empty() { "" } else { "\n\n" };
+        let mut r = format!(
+            "{sep}<daimon-memory>\n[Open reminders (titles only; recall or ask for the detail):]\n"
+        );
+        for e in reminders {
+            r.push_str(&format!("- {}\n", one_line(&e.title, 100)));
         }
         r.push_str("</daimon-memory>");
-        r
-    };
-    if !recent_block.is_empty() {
-        parts.push(recent_block);
+        // Persona + protocols win the budget; append reminders only if they still fit under the cap.
+        if out.chars().count() + r.chars().count() <= SESSION_BUDGET {
+            out.push_str(&r);
+        }
     }
-    parts.join("\n\n")
+    out
 }
 
 /// Project persona + protocol bodies into a SOUL.md identity block (Hermes's always-on
@@ -103,6 +108,20 @@ pub fn render_soul(persona: &[Entry]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::entry::Kind;
+
+    fn entry(kind: Kind, title: &str, body: &str) -> Entry {
+        Entry::new_now(
+            format!("daimon://test/{title}"),
+            kind,
+            "test".into(),
+            title.into(),
+            body.into(),
+            vec![],
+            50,
+            "dk".into(),
+        )
+    }
 
     #[test]
     fn render_nudge_names_a_save_tool() {
@@ -113,5 +132,43 @@ mod tests {
     #[test]
     fn render_recall_empty_is_empty() {
         assert!(render_recall(&[]).is_empty());
+    }
+
+    #[test]
+    fn session_renders_reminder_titles_not_bodies() {
+        let p = entry(Kind::Persona, "Operator Persona", "I am Izu.");
+        let rem = entry(Kind::Reminder, "ship the lean README", "BODY-MUST-NOT-APPEAR");
+        let out = render_session(&[p], &[rem]);
+        assert!(out.contains("<daimon-persona>"));
+        assert!(out.contains("ship the lean README"));
+        assert!(!out.contains("BODY-MUST-NOT-APPEAR"));
+    }
+
+    #[test]
+    fn session_omits_the_old_recent_block() {
+        let p = entry(Kind::Persona, "Operator Persona", "I am Izu.");
+        let out = render_session(&[p], &[]);
+        assert!(!out.contains("[Recent shared context:]"));
+        assert!(out.ends_with("</daimon-persona>"));
+    }
+
+    #[test]
+    fn session_drops_reminders_when_over_budget() {
+        // A persona/protocol body that alone fills the budget leaves no room: reminders are
+        // dropped (the trimmable part), persona is always kept (the must-have core).
+        let big = entry(Kind::Protocol, "Big Protocol", &"x".repeat(SESSION_BUDGET));
+        let rem = entry(Kind::Reminder, "should-be-dropped", "");
+        let out = render_session(&[big], &[rem]);
+        assert!(out.contains("<daimon-persona>"));
+        assert!(!out.contains("should-be-dropped"));
+    }
+
+    #[test]
+    fn session_keeps_reminders_when_under_budget() {
+        let p = entry(Kind::Persona, "Operator Persona", "I am Izu.");
+        let rem = entry(Kind::Reminder, "fits fine", "");
+        let out = render_session(&[p], &[rem]);
+        assert!(out.contains("fits fine"));
+        assert!(out.chars().count() <= SESSION_BUDGET);
     }
 }
