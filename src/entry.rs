@@ -22,6 +22,14 @@ pub enum Kind {
     Protocol,
     Reminder,
     Memory,
+    // Domain-entity kinds (the knowledge-graph layer): the "things" the records are about.
+    Org,
+    Engagement,
+    Product,
+    SolutionStack,
+    Person,
+    Framework,
+    Site,
 }
 
 impl Kind {
@@ -40,6 +48,13 @@ impl Kind {
             Kind::Protocol => "protocol",
             Kind::Reminder => "reminder",
             Kind::Memory => "memory",
+            Kind::Org => "org",
+            Kind::Engagement => "engagement",
+            Kind::Product => "product",
+            Kind::SolutionStack => "solution_stack",
+            Kind::Person => "person",
+            Kind::Framework => "framework",
+            Kind::Site => "site",
         }
     }
 
@@ -60,6 +75,13 @@ impl Kind {
             "protocol" => Kind::Protocol,
             "reminder" => Kind::Reminder,
             "memory" => Kind::Memory,
+            "org" => Kind::Org,
+            "engagement" => Kind::Engagement,
+            "product" => Kind::Product,
+            "solution_stack" => Kind::SolutionStack,
+            "person" => Kind::Person,
+            "framework" => Kind::Framework,
+            "site" => Kind::Site,
             _ => return None,
         })
     }
@@ -224,6 +246,8 @@ mod tests {
             Kind::KnownFailureMode, Kind::RemediationPattern, Kind::ProjectConvention,
             Kind::AgentLesson, Kind::ResourceSummary, Kind::Persona, Kind::Protocol,
             Kind::Reminder, Kind::Memory,
+            Kind::Org, Kind::Engagement, Kind::Product, Kind::SolutionStack,
+            Kind::Person, Kind::Framework, Kind::Site,
         ] {
             assert_eq!(Kind::from_str(k.as_str()), Some(k), "kind {:?} must round-trip", k);
         }

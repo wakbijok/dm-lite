@@ -77,6 +77,17 @@ fn tool_schemas() -> Value {
             "inputSchema": {"type":"object","properties":{}}
         },
         {
+            "name": "entity",
+            "description": "Create or update a domain entity (a knowledge-graph node): kinds org, engagement, product, solution_stack, person, framework, site. Put role/sector/stage etc. in `attrs`. Relate entities with the `link` tool (rel: for / uses / made-by / part-of / alias-of, etc.).",
+            "inputSchema": {"type":"object","properties":{
+                "kind":{"type":"string","description":"org / engagement / product / solution_stack / person / framework / site"},
+                "name":{"type":"string","description":"the entity name (becomes the title)"},
+                "attrs":{"type":"object","description":"key/value attributes, e.g. {\"role\":\"principal\",\"sector\":\"private\"}"},
+                "desc":{"type":"string","description":"optional free-text description"},
+                "namespace":{"type":"string","description":"default resources/entities"}
+            },"required":["kind","name"]}
+        },
+        {
             "name": "log_decision",
             "description": "Store a typed Decision (records a non-obvious choice and why).",
             "inputSchema": {"type":"object","properties":{
@@ -260,6 +271,27 @@ fn call_tool(mem: &Memory, name: &str, args: &Value) -> std::result::Result<Stri
         "reindex_links" => {
             let n = mem.reindex_links().map_err(|e| e.to_string())?;
             Ok(format!("reindexed: {} reference(s) linked", n))
+        }
+        "entity" => {
+            let kind = crate::entry::Kind::from_str(s(args, "kind"))
+                .ok_or_else(|| format!("unknown entity kind: {}", s(args, "kind")))?;
+            let name = s(args, "name");
+            if name.is_empty() {
+                return Err("entity requires a non-empty name".into());
+            }
+            let attrs: Vec<(String, String)> = args
+                .get("attrs")
+                .and_then(|v| v.as_object())
+                .map(|o| {
+                    o.iter()
+                        .map(|(k, v)| (k.clone(), v.as_str().map(|x| x.to_string()).unwrap_or_else(|| v.to_string())))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let ns = if s(args, "namespace").is_empty() { "resources/entities" } else { s(args, "namespace") };
+            let body = crate::tools::entity_body(kind, name, &attrs, s(args, "desc"));
+            let uri = mem.import_record(kind, ns, name, &body).map_err(|e| e.to_string())?;
+            Ok(format!("entity stored {}", uri))
         }
         other => Err(format!("unknown tool: {}", other)),
     }

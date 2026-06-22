@@ -184,6 +184,21 @@ enum Cmd {
     },
     /// Rebuild edges from the [[name]] references in every record body (batch).
     ReindexLinks,
+    /// Create or update a domain entity (a knowledge-graph node): org, engagement, product,
+    /// solution_stack, person, framework, site. Relate entities with `dmem link`.
+    Entity {
+        #[arg(long)]
+        kind: String,
+        #[arg(long)]
+        name: String,
+        /// repeatable key=value attribute (e.g. --attr role=principal --attr sector=private)
+        #[arg(long = "attr")]
+        attr: Vec<String>,
+        #[arg(long, default_value = "")]
+        desc: String,
+        #[arg(long, default_value = "resources/entities")]
+        namespace: String,
+    },
     /// Save a typed Reminder.
     AddReminder {
         #[arg(long)]
@@ -451,6 +466,19 @@ fn run() -> Result<()> {
         Cmd::ReindexLinks => {
             let n = Memory::open()?.reindex_links()?;
             println!("reindexed: {} [[link]] reference{} linked", n, if n == 1 { "" } else { "s" });
+            Ok(())
+        }
+        Cmd::Entity { kind, name, attr, desc, namespace } => {
+            let k = entry::Kind::from_str(&kind).ok_or_else(|| {
+                anyhow::anyhow!("unknown entity kind '{kind}' (org/engagement/product/solution_stack/person/framework/site)")
+            })?;
+            let attrs: Vec<(String, String)> = attr
+                .iter()
+                .filter_map(|a| a.split_once('=').map(|(k, v)| (k.trim().to_string(), v.trim().to_string())))
+                .collect();
+            let body = tools::entity_body(k, &name, &attrs, &desc);
+            let uri = Memory::open()?.import_record(k, &namespace, &name, &body)?;
+            println!("entity stored {}", uri);
             Ok(())
         }
         Cmd::Recent { limit } => {

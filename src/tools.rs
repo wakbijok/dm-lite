@@ -97,6 +97,23 @@ pub(crate) fn parse_wikilinks(s: &str) -> Vec<String> {
     out
 }
 
+/// Render a domain-entity record body from a name, kind, and key/value attributes (the
+/// knowledge-graph layer). Attributes go in a small structured block; relations between entities
+/// are edges (the graph), not body content. The name becomes the record title.
+pub(crate) fn entity_body(kind: Kind, name: &str, attrs: &[(String, String)], desc: &str) -> String {
+    let mut s = format!("# {}\n\n**Entity:** {}\n", name, kind.as_str());
+    for (k, v) in attrs {
+        if !k.trim().is_empty() {
+            s.push_str(&format!("**{}:** {}\n", k.trim(), v.trim()));
+        }
+    }
+    let desc = desc.trim();
+    if !desc.is_empty() {
+        s.push_str(&format!("\n{}\n", desc));
+    }
+    s
+}
+
 /// Modest, deterministic runtime-signal multiplier, clamped to [1.0, 1.25]. It NUDGES
 /// ranking: items at adjacent or deeper ranks may be reordered, but a clearly higher-ranked
 /// hit (a large base-score gap) is never displaced, because the multiplier is bounded. This
@@ -802,5 +819,30 @@ mod tests {
         // a query that only hits alpha still pulls beta in, via the edge
         let hits = m.recall_expanded("Alpha refers context", 3, 1).unwrap();
         assert!(hits.iter().any(|e| e.body.contains("Beta the target")), "neighbor pulled in via the graph");
+    }
+
+    #[test]
+    fn entity_kg_create_and_relate() {
+        let m = LocalMemory::for_test(tmp_store());
+        let lenovo = m
+            .import_record(Kind::Org, "resources/entities", "Lenovo",
+                &entity_body(Kind::Org, "Lenovo", &[("role".into(), "principal".into()), ("sector".into(), "private".into())], ""))
+            .unwrap();
+        let proj = m
+            .import_record(Kind::Engagement, "resources/entities", "MyGovUC",
+                &entity_body(Kind::Engagement, "MyGovUC", &[("stage".into(), "BAU".into())], ""))
+            .unwrap();
+        let sr630 = m
+            .import_record(Kind::Product, "resources/entities", "Lenovo SR630", &entity_body(Kind::Product, "Lenovo SR630", &[], ""))
+            .unwrap();
+        m.link(&sr630, &lenovo, "made-by").unwrap();
+        m.link(&proj, &sr630, "uses").unwrap();
+        // the engagement reaches the product at 1 hop and the principal at 2 hops
+        let n2 = m.neighbors(&[proj.clone()], 2, 10).unwrap();
+        assert!(n2.contains(&sr630), "engagement -> product");
+        assert!(n2.contains(&lenovo), "engagement -> product -> principal");
+        // the entity kind survives recall
+        let hits = m.recall("Lenovo SR630", 5).unwrap();
+        assert!(hits.iter().any(|e| e.kind == Kind::Product && e.title == "Lenovo SR630"));
     }
 }
