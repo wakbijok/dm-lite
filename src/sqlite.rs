@@ -291,6 +291,14 @@ impl MemoryStore for SqliteStore {
     /// - new interval is a sub-range          -> the world changed (one or two remainders kept).
     /// - identical body already covering it    -> no-op (no version churn on re-imports).
     fn put(&self, e: &Entry) -> Result<()> {
+        // Reject an inverted or zero-width valid interval: it would otherwise split a segment into
+        // overlapping remainders, breaking the non-overlapping-current-segments invariant. This is
+        // the single chokepoint every write path funnels through (CLI / HTTP / MCP).
+        if let Some(vt) = e.valid_to_ms {
+            if vt <= e.valid_from_ms {
+                anyhow::bail!("valid_to ({}) must be greater than valid_from ({})", vt, e.valid_from_ms);
+            }
+        }
         let now = crate::entry::now_ms();
         let tx = self.conn.unchecked_transaction()?;
         let current = Self::current_rows(&tx, &e.dedup_key)?;
@@ -449,6 +457,9 @@ impl MemoryStore for SqliteStore {
     }
 
     fn invalidate(&self, uri: &str, valid_to_ms: i64) -> Result<usize> {
+        if valid_to_ms <= 0 {
+            anyhow::bail!("invalidate valid_to must be a positive epoch-ms");
+        }
         let now = crate::entry::now_ms();
         let tx = self.conn.unchecked_transaction()?;
         let mut affected = 0usize;
@@ -777,5 +788,78 @@ mod tests {
         );
         assert_eq!(s.recall("base", 5).unwrap()[0].body, "base"); // valid now (>300)
         assert!(s.recall_as_of("blip", 5, now_ms(), 250).unwrap().iter().any(|e| e.body == "blip"));
+    }
+
+    #[test]
+    fn put_rejects_inverted_or_zero_width_interval() {
+        let s = mem_store();
+        assert!(s.put(&mk_valid("k", "x", 200, Some(100))).is_err(), "inverted interval rejected");
+        assert!(s.put(&mk_valid("k", "x", 100, Some(100))).is_err(), "zero-width interval rejected");
+        assert!(s.put(&mk_valid("k", "x", 100, Some(200))).is_ok(), "normal bounded interval accepted");
+        assert!(s.put(&mk_valid("k", "y", 100, None)).is_ok(), "open interval accepted");
+    }
+
+    #[test]
+    fn invalidate_rejects_nonpositive_cut() {
+        let s = mem_store();
+        let uri = make_uri("ns", Kind::Memory, "k");
+        s.put(&mk_valid("k", "v", 100, None)).unwrap();
+        assert!(s.invalidate(&uri, 0).is_err());
+        assert!(s.invalidate(&uri, -5).is_err());
+        assert!(s.invalidate(&uri, 300).is_ok());
+    }
+
+    #[test]
+    fn backdated_superset_replaces_without_left_remainder() {
+        let s = mem_store();
+        let uri = make_uri("ns", Kind::Memory, "k");
+        s.put(&mk_valid("k", "v1", 200, None)).unwrap(); // [200, inf)
+        s.put(&mk_valid("k", "v2", 100, None)).unwrap(); // backdated, fully subsumes v1
+        assert_eq!(current_segments(&s, &uri), vec![("v2".into(), 100, None)]);
+    }
+
+    #[test]
+    fn idempotency_boundary_exact_vs_poke_past_end() {
+        let s = mem_store();
+        let uri = make_uri("ns", Kind::Memory, "k");
+        s.put(&mk_valid("k", "a", 100, Some(300))).unwrap();
+        // same body, interval fully inside the existing one -> already covered -> no-op
+        s.put(&mk_valid("k", "a", 150, Some(250))).unwrap();
+        let n: i64 = s.conn.query_row("SELECT COUNT(*) FROM entries WHERE uri=?1", params![uri], |r| r.get(0)).unwrap();
+        assert_eq!(n, 1, "covered same-body re-save creates no version");
+        // poke past the end -> NOT covered -> extends to [100,400)
+        s.put(&mk_valid("k", "a", 100, Some(400))).unwrap();
+        assert_eq!(current_segments(&s, &uri), vec![("a".into(), 100, Some(400))]);
+    }
+
+    #[test]
+    fn multi_segment_entity_keeps_fts_mirror_and_splits_further() {
+        let s = mem_store();
+        let uri = make_uri("ns", Kind::Memory, "k");
+        s.put(&mk_valid("k", "base", 100, None)).unwrap();
+        s.put(&mk_valid("k", "blip", 200, Some(300))).unwrap(); // -> base[100,200) blip[200,300) base[300,inf)
+        assert_eq!(current_segments(&s, &uri).len(), 3);
+        let fts_eq_current = |s: &SqliteStore| -> (i64, i64) {
+            let fts: i64 = s.conn.query_row("SELECT COUNT(*) FROM entries_fts", [], |r| r.get(0)).unwrap();
+            let cur: i64 = s.conn.query_row("SELECT COUNT(*) FROM entries WHERE system_to_ms IS NULL", [], |r| r.get(0)).unwrap();
+            (fts, cur)
+        };
+        let (f1, c1) = fts_eq_current(&s);
+        assert_eq!(f1, c1, "FTS mirrors current rows");
+        assert_eq!(f1, 3);
+        // a change overlapping TWO existing segments (exercises the multi-row split loop)
+        s.put(&mk_valid("k", "mid", 150, Some(250))).unwrap();
+        assert_eq!(
+            current_segments(&s, &uri),
+            vec![
+                ("base".into(), 100, Some(150)),
+                ("mid".into(), 150, Some(250)),
+                ("blip".into(), 250, Some(300)),
+                ("base".into(), 300, None),
+            ]
+        );
+        let (f2, c2) = fts_eq_current(&s);
+        assert_eq!(f2, c2, "FTS still mirrors after a multi-segment split");
+        assert_eq!(c2, 4);
     }
 }

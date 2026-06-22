@@ -368,13 +368,16 @@ async fn forget_h(State(st): State<AppState>, headers: HeaderMap, Json(req): Jso
 }
 
 async fn remember_h(State(st): State<AppState>, headers: HeaderMap, Json(req): Json<RememberReq>) -> ApiResp {
-    with_tenant(&st, &headers, false, move |m| {
+    // client_err: a bad valid interval (valid_to <= valid_from) is client input -> 400, not 500.
+    with_tenant(&st, &headers, true, move |m| {
         Ok(json!({ "uri": m.remember(&req.text, ns_or(&req.namespace, "resources/notes"), req.valid_from, req.valid_to)? }))
     })
     .await
 }
 
 async fn invalidate_h(State(st): State<AppState>, headers: HeaderMap, Json(req): Json<InvalidateReq>) -> ApiResp {
+    // client_err: a non-positive cut is client input -> 400 (consistent with the other write
+    // handlers); genuine storage faults are rare and accept the same generic 400 those do.
     with_tenant(&st, &headers, true, move |m| {
         Ok(json!({ "invalidated": m.invalidate(&req.uri, req.valid_to)? }))
     })
