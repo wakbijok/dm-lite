@@ -27,6 +27,9 @@ candle = ["dep:candle-core","dep:candle-nn","dep:candle-transformers","dep:token
 # server: network API (axum + tokio) with multi-token bearer -> tenant auth and built-in TLS,
 # over the database-per-tenant store. Off by default so the embedded binary stays lean.
 server = ["dep:axum", "dep:axum-server", "dep:rcgen", "dep:rustls", "dep:tokio", "dep:tower", "dep:getrandom", "dep:sha2"]
+# ui: optional local graph viewer (`dmem ui`) - an embedded offline single page over axum/tokio.
+# Off by default; reuses axum + tokio, ships no CDN/runtime assets (the page is compiled in).
+ui = ["dep:axum", "dep:tokio"]
 # wizard: interactive `dmem setup` first-run flow (dialoguer).
 wizard = ["dep:dialoguer"]
 # self-update: `dmem upgrade` in-place from GitHub Releases.
@@ -34,7 +37,7 @@ self-update = ["dep:self_update", "dep:semver"]
 # client: remote-client mode - talk to a remote `dmem serve` over HTTPS (reqwest + rustls).
 client = ["dep:reqwest"]
 # dist: the friend-facing distribution build (what the release workflow ships).
-dist = ["zvec", "candle", "server", "wizard", "self-update", "client"]
+dist = ["zvec", "candle", "server", "wizard", "self-update", "client", "ui"]
 
 [dependencies]
 rusqlite = { version = "0.32", features = ["bundled"] }

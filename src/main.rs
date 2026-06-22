@@ -28,6 +28,8 @@ mod setup;
 mod upgrade;
 #[cfg(feature = "zvec")]
 mod zvec_index;
+#[cfg(feature = "ui")]
+mod ui;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -256,6 +258,15 @@ enum Cmd {
     Status,
     /// Run as an MCP stdio server (recall + typed save tools for MCP-aware agents).
     Mcp,
+    /// Launch the optional local graph viewer (an embedded offline web page). Needs --features ui.
+    #[cfg(feature = "ui")]
+    Ui {
+        #[arg(long, default_value = "127.0.0.1:8088")]
+        addr: String,
+        /// also open it in your default browser
+        #[arg(long)]
+        open: bool,
+    },
     /// Run the network API server (multi-token bearer -> tenant). Needs --features server.
     #[cfg(feature = "server")]
     Serve {
@@ -584,6 +595,8 @@ fn run() -> Result<()> {
         }
         Cmd::Status => status(),
         Cmd::Mcp => mcp::serve(),
+        #[cfg(feature = "ui")]
+        Cmd::Ui { addr, open } => ui::run(&addr, open),
         #[cfg(feature = "server")]
         Cmd::Serve { addr, tls_cert, tls_key, tls_generate } => server::run_blocking(
             &addr,
