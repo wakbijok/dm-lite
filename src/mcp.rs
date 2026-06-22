@@ -17,21 +17,33 @@ fn tool_schemas() -> Value {
     json!([
         {
             "name": "recall",
-            "description": "Recall relevant shared memory (typed; ranked by relevance and runtime signals, hybrid FTS + vector). Returns matching records.",
+            "description": "Recall relevant shared memory (typed; ranked by relevance and runtime signals, hybrid FTS + vector). Returns matching records. Bitemporal: pass `as_of` and/or `valid_at` (epoch-ms) to query the store as it was believed at a system time and/or what was true at a valid time; omit both for the current slice.",
             "inputSchema": {"type":"object","properties":{
                 "query":{"type":"string","description":"what to recall"},
-                "limit":{"type":"integer","description":"max results (default 6, capped at 1000)"}
+                "limit":{"type":"integer","description":"max results (default 6, capped at 1000)"},
+                "as_of":{"type":"integer","description":"system-time epoch-ms: recall the store as it was BELIEVED at this instant"},
+                "valid_at":{"type":"integer","description":"valid-time epoch-ms: recall what was TRUE at this instant (defaults to as_of)"}
             },"required":["query"]}
         },
         {
             "name": "remember",
-            "description": "Store a memory record. Free-form by default; pass `kind` (and ideally `title`) to store a TYPED record: runbook, project_convention, service_topology, known_failure_mode, remediation_pattern, resource_summary, persona, protocol, reminder, memory.",
+            "description": "Store a memory record. Free-form by default; pass `kind` (and ideally `title`) to store a TYPED record: runbook, project_convention, service_topology, known_failure_mode, remediation_pattern, resource_summary, persona, protocol, reminder, memory. Bitemporal: a plain memory may carry a valid interval via `valid_from`/`valid_to` (epoch-ms); re-saving the same context splits valid time so the prior value stays true up to the change.",
             "inputSchema": {"type":"object","properties":{
                 "text":{"type":"string","description":"the content / body of the record"},
                 "kind":{"type":"string","description":"optional typed kind (omit for a plain memory)"},
                 "title":{"type":"string","description":"title for a typed record (defaults to the first line of `text`)"},
-                "namespace":{"type":"string","description":"e.g. resources/notes or agent/lessons"}
+                "namespace":{"type":"string","description":"e.g. resources/notes or agent/lessons"},
+                "valid_from":{"type":"integer","description":"valid-time start epoch-ms for a plain memory (default now); backdate a fact here"},
+                "valid_to":{"type":"integer","description":"valid-time end epoch-ms for a plain memory (default open / still true)"}
             },"required":["text"]}
+        },
+        {
+            "name": "invalidate",
+            "description": "Mark a record's fact as no longer true from a valid time onward (keeps the historical slice queryable via recall as_of/valid_at). Distinct from forget, which retracts from current belief entirely.",
+            "inputSchema": {"type":"object","properties":{
+                "uri":{"type":"string","description":"the daimon:// uri of the record"},
+                "valid_to":{"type":"integer","description":"epoch-ms from which the fact stops being true"}
+            },"required":["uri","valid_to"]}
         },
         {
             "name": "log_decision",
@@ -120,7 +132,17 @@ fn call_tool(mem: &Memory, name: &str, args: &Value) -> std::result::Result<Stri
             // Clamp untrusted limit: bounds the deeper rescoring pool (limit*2) and the SQL
             // `LIMIT ?` cast, so a hostile value can't wrap or balloon the query.
             let limit = (args.get("limit").and_then(|v| v.as_u64()).unwrap_or(6) as usize).min(1000);
-            let hits = mem.recall(s(args, "query"), limit).map_err(|e| e.to_string())?;
+            let as_of = args.get("as_of").and_then(|v| v.as_i64());
+            let valid_at = args.get("valid_at").and_then(|v| v.as_i64());
+            let hits = if as_of.is_some() || valid_at.is_some() {
+                // bitemporal slice: default the missing axis to the other (then to now)
+                let now = crate::entry::now_ms();
+                let sys = as_of.unwrap_or(now);
+                let val = valid_at.or(as_of).unwrap_or(now);
+                mem.recall_as_of(s(args, "query"), limit, sys, val).map_err(|e| e.to_string())?
+            } else {
+                mem.recall(s(args, "query"), limit).map_err(|e| e.to_string())?
+            };
             let block = render::render_recall(&hits);
             Ok(if block.is_empty() { "(no matches)".into() } else { block })
         }
@@ -129,7 +151,9 @@ fn call_tool(mem: &Memory, name: &str, args: &Value) -> std::result::Result<Stri
             let text = s(args, "text");
             let kind_str = s(args, "kind");
             let uri = if kind_str.is_empty() {
-                mem.remember(text, ns).map_err(|e| e.to_string())?
+                let valid_from = args.get("valid_from").and_then(|v| v.as_i64());
+                let valid_to = args.get("valid_to").and_then(|v| v.as_i64());
+                mem.remember(text, ns, valid_from, valid_to).map_err(|e| e.to_string())?
             } else {
                 let kind = crate::entry::Kind::from_str(kind_str)
                     .ok_or_else(|| format!("unknown kind: {kind_str}"))?;
@@ -165,6 +189,15 @@ fn call_tool(mem: &Memory, name: &str, args: &Value) -> std::result::Result<Stri
         "forget" => {
             let n = mem.forget(s(args, "uri")).map_err(|e| e.to_string())?;
             Ok(if n == 0 { "nothing to forget".into() } else { format!("forgot {} ({} retired)", s(args, "uri"), n) })
+        }
+        "invalidate" => {
+            let uri = s(args, "uri");
+            let valid_to = args
+                .get("valid_to")
+                .and_then(|v| v.as_i64())
+                .ok_or_else(|| "invalidate requires integer 'valid_to' (epoch-ms)".to_string())?;
+            let n = mem.invalidate(uri, valid_to).map_err(|e| e.to_string())?;
+            Ok(if n == 0 { "nothing to invalidate".into() } else { format!("invalidated {} ({} segment(s))", uri, n) })
         }
         other => Err(format!("unknown tool: {}", other)),
     }
@@ -354,6 +387,23 @@ mod tests {
                   "remediation_pattern", "resource_summary", "persona", "protocol", "reminder", "memory"] {
             assert!(crate::entry::Kind::from_str(k).is_some(), "advertised kind does not parse: {k}");
         }
+    }
+
+    #[test]
+    fn tool_schema_exposes_invalidate_and_bitemporal_params() {
+        let tools = tool_schemas();
+        let arr = tools.as_array().unwrap();
+        let names: Vec<&str> = arr.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert!(names.contains(&"invalidate"), "bitemporal invalidate tool must be exposed");
+        let recall = arr.iter().find(|t| t["name"] == "recall").unwrap();
+        let rprops = &recall["inputSchema"]["properties"];
+        assert!(rprops.get("as_of").is_some() && rprops.get("valid_at").is_some(), "recall must accept as_of + valid_at");
+        let remember = arr.iter().find(|t| t["name"] == "remember").unwrap();
+        let mprops = &remember["inputSchema"]["properties"];
+        assert!(mprops.get("valid_from").is_some() && mprops.get("valid_to").is_some(), "remember must accept valid_from + valid_to");
+        let inval = arr.iter().find(|t| t["name"] == "invalidate").unwrap();
+        let req: Vec<&str> = inval["inputSchema"]["required"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
+        assert!(req.contains(&"uri") && req.contains(&"valid_to"));
     }
 
     #[test]

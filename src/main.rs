@@ -120,15 +120,31 @@ enum Cmd {
         text: String,
         #[arg(long, default_value = "resources/notes")]
         namespace: String,
+        /// valid-time start epoch-ms (default now); backdate when a fact became true
+        #[arg(long = "valid-from")]
+        valid_from: Option<i64>,
+        /// valid-time end epoch-ms (default open / still true)
+        #[arg(long = "valid-to")]
+        valid_to: Option<i64>,
+    },
+    /// Invalidate a record from a valid time onward (keeps history; distinct from forget).
+    Invalidate {
+        uri: String,
+        /// epoch-ms from which the fact stops being true
+        #[arg(long = "valid-to")]
+        valid_to: i64,
     },
     /// Recall memory for a query (human-readable).
     Recall {
         query: Vec<String>,
         #[arg(long, default_value_t = 6)]
         limit: usize,
-        /// Bitemporal: recall the store AS OF this epoch-ms (and facts valid then).
+        /// Bitemporal: recall the store AS OF this system-time epoch-ms (what we believed then).
         #[arg(long = "as-of", visible_alias = "as_of")]
         as_of: Option<i64>,
+        /// Bitemporal: recall facts VALID AT this epoch-ms (what was true then); defaults to as-of.
+        #[arg(long = "valid-at", visible_alias = "valid_at")]
+        valid_at: Option<i64>,
     },
     /// Show recent high-importance memory.
     Recent {
@@ -344,17 +360,30 @@ fn run() -> Result<()> {
             println!("stored {}", uri);
             Ok(())
         }
-        Cmd::Remember { text, namespace } => {
-            let uri = Memory::open()?.remember(&text, &namespace)?;
+        Cmd::Remember { text, namespace, valid_from, valid_to } => {
+            let uri = Memory::open()?.remember(&text, &namespace, valid_from, valid_to)?;
             println!("stored {}", uri);
             Ok(())
         }
-        Cmd::Recall { query, limit, as_of } => {
+        Cmd::Invalidate { uri, valid_to } => {
+            let n = Memory::open()?.invalidate(&uri, valid_to)?;
+            if n == 0 {
+                println!("nothing to invalidate for {}", uri);
+            } else {
+                println!("invalidated {} ({} segment{} ended at {})", uri, n, if n == 1 { "" } else { "s" }, valid_to);
+            }
+            Ok(())
+        }
+        Cmd::Recall { query, limit, as_of, valid_at } => {
             let q = query.join(" ");
             let m = Memory::open()?;
-            let hits = match as_of {
-                Some(ts) => m.recall_as_of(&q, limit, ts, ts)?,
-                None => m.recall(&q, limit)?,
+            let hits = if as_of.is_some() || valid_at.is_some() {
+                let now = entry::now_ms();
+                let sys = as_of.unwrap_or(now);
+                let val = valid_at.or(as_of).unwrap_or(now);
+                m.recall_as_of(&q, limit, sys, val)?
+            } else {
+                m.recall(&q, limit)?
             };
             if hits.is_empty() {
                 println!("(no matches for '{}')", q);

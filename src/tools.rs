@@ -122,8 +122,16 @@ impl LocalMemory {
     }
 
     fn save(&self, kind: Kind, namespace: &str, title: &str, body: String, importance: i64, tags: Vec<String>) -> Result<String> {
+        self.save_valid(kind, namespace, title, body, importance, tags, None, None)
+    }
+
+    /// As `save`, but with a caller-supplied valid interval (the bitemporal application-time axis).
+    /// `valid_from = None` means now; `valid_to = None` means open (still true). The store's put
+    /// does the valid-time splitting against any existing segments of this entity.
+    #[allow(clippy::too_many_arguments)]
+    fn save_valid(&self, kind: Kind, namespace: &str, title: &str, body: String, importance: i64, tags: Vec<String>, valid_from: Option<i64>, valid_to: Option<i64>) -> Result<String> {
         let uri = make_uri(namespace, kind, title);
-        let e = Entry::new_now(
+        let mut e = Entry::new_now(
             uri.clone(),
             kind,
             namespace.to_string(),
@@ -133,6 +141,10 @@ impl LocalMemory {
             importance,
             uri.clone(),
         );
+        if let Some(vf) = valid_from {
+            e.valid_from_ms = vf;
+        }
+        e.valid_to_ms = valid_to;
         self.save_entry(&e)?;
         Ok(uri)
     }
@@ -202,10 +214,15 @@ impl LocalMemory {
         self.save(Kind::IncidentSummary, namespace, title, body, 65, vec!["incident_summary".into()])
     }
 
-    pub fn remember(&self, text: &str, namespace: &str) -> Result<String> {
+    pub fn remember(&self, text: &str, namespace: &str, valid_from: Option<i64>, valid_to: Option<i64>) -> Result<String> {
         require(text, "text")?;
         let title = first_line(text);
-        self.save(Kind::Memory, namespace, &title, text.to_string(), 50, vec![])
+        self.save_valid(Kind::Memory, namespace, &title, text.to_string(), 50, vec![], valid_from, valid_to)
+    }
+
+    /// Application-time invalidation: this entity's fact is no longer true from `valid_to_ms` on.
+    pub fn invalidate(&self, uri: &str, valid_to_ms: i64) -> Result<usize> {
+        self.store.invalidate(uri, valid_to_ms)
     }
 
     pub fn add_reminder(&self, title: &str, text: &str, namespace: &str) -> Result<String> {
@@ -502,11 +519,18 @@ impl Memory {
             Memory::Remote(r) => r.recall_mode(),
         }
     }
-    pub fn remember(&self, text: &str, namespace: &str) -> Result<String> {
+    pub fn remember(&self, text: &str, namespace: &str, valid_from: Option<i64>, valid_to: Option<i64>) -> Result<String> {
         match self {
-            Memory::Local(l) => l.remember(text, namespace),
+            Memory::Local(l) => l.remember(text, namespace, valid_from, valid_to),
             #[cfg(feature = "client")]
-            Memory::Remote(r) => r.remember(text, namespace),
+            Memory::Remote(r) => r.remember(text, namespace, valid_from, valid_to),
+        }
+    }
+    pub fn invalidate(&self, uri: &str, valid_to_ms: i64) -> Result<usize> {
+        match self {
+            Memory::Local(l) => l.invalidate(uri, valid_to_ms),
+            #[cfg(feature = "client")]
+            Memory::Remote(r) => r.invalidate(uri, valid_to_ms),
         }
     }
     pub fn log_decision(&self, title: &str, context: &str, decision: &str, rationale: &str, namespace: &str) -> Result<String> {
@@ -618,5 +642,15 @@ mod tests {
             "a clearly higher-ranked hit must not be displaced by a deeper, much-accessed one"
         );
         assert_eq!(out.len(), 6);
+    }
+
+    #[test]
+    fn remember_valid_and_invalidate_wire_through_the_api() {
+        let m = LocalMemory::for_test(tmp_store());
+        let uri = m.remember("status is green", "resources/notes", Some(100), None).unwrap();
+        assert_eq!(m.invalidate(&uri, 300).unwrap(), 1, "one segment invalidated");
+        assert!(m.recall("green", 5).unwrap().is_empty(), "no longer valid now");
+        let past = m.recall_as_of("green", 5, now_ms(), 200).unwrap();
+        assert!(past.iter().any(|e| e.body.contains("green")), "valid-as-of 200 still sees it");
     }
 }

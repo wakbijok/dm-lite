@@ -188,7 +188,7 @@ pub fn run() -> Result<()> {
             .allow_empty(true)
             .interact_text()?;
         if !text.trim().is_empty() {
-            match crate::tools::Memory::open().and_then(|m| m.remember(&text, "resources/notes")) {
+            match crate::tools::Memory::open().and_then(|m| m.remember(&text, "resources/notes", None, None)) {
                 Ok(uri) => println!("  stored {uri}"),
                 Err(e) => eprintln!("  could not store ({e:#})"),
             }

@@ -139,8 +139,12 @@ impl RemoteClient {
     pub fn recall_mode(&self) -> &'static str {
         "remote (HTTP client -> dmem serve)"
     }
-    pub fn remember(&self, text: &str, namespace: &str) -> Result<String> {
-        self.uri_of("/remember", json!({ "text": text, "namespace": namespace }))
+    pub fn remember(&self, text: &str, namespace: &str, valid_from: Option<i64>, valid_to: Option<i64>) -> Result<String> {
+        self.uri_of("/remember", json!({ "text": text, "namespace": namespace, "valid_from": valid_from, "valid_to": valid_to }))
+    }
+    pub fn invalidate(&self, uri: &str, valid_to_ms: i64) -> Result<usize> {
+        let v = self.post("/invalidate", json!({ "uri": uri, "valid_to": valid_to_ms }))?;
+        Ok(v.get("invalidated").and_then(|n| n.as_u64()).unwrap_or(0) as usize)
     }
     pub fn log_decision(&self, title: &str, context: &str, decision: &str, rationale: &str, namespace: &str) -> Result<String> {
         self.uri_of(

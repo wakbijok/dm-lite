@@ -202,6 +202,18 @@ struct RememberReq {
     text: String,
     #[serde(default)]
     namespace: Option<String>,
+    /// bitemporal valid interval (application time); absent = now / open
+    #[serde(default)]
+    valid_from: Option<i64>,
+    #[serde(default)]
+    valid_to: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct InvalidateReq {
+    uri: String,
+    /// epoch-ms from which the fact is no longer true
+    valid_to: i64,
 }
 
 #[derive(Deserialize)]
@@ -357,7 +369,14 @@ async fn forget_h(State(st): State<AppState>, headers: HeaderMap, Json(req): Jso
 
 async fn remember_h(State(st): State<AppState>, headers: HeaderMap, Json(req): Json<RememberReq>) -> ApiResp {
     with_tenant(&st, &headers, false, move |m| {
-        Ok(json!({ "uri": m.remember(&req.text, ns_or(&req.namespace, "resources/notes"))? }))
+        Ok(json!({ "uri": m.remember(&req.text, ns_or(&req.namespace, "resources/notes"), req.valid_from, req.valid_to)? }))
+    })
+    .await
+}
+
+async fn invalidate_h(State(st): State<AppState>, headers: HeaderMap, Json(req): Json<InvalidateReq>) -> ApiResp {
+    with_tenant(&st, &headers, true, move |m| {
+        Ok(json!({ "invalidated": m.invalidate(&req.uri, req.valid_to)? }))
     })
     .await
 }
@@ -507,6 +526,7 @@ pub fn router(auth: Arc<dyn Authenticator>, iam: Option<crate::iam::Iam>) -> Rou
         .route("/history", post(history_h))
         .route("/forget", post(forget_h))
         .route("/remember", post(remember_h))
+        .route("/invalidate", post(invalidate_h))
         .route("/log_decision", post(decision_h))
         .route("/log_lesson", post(lesson_h))
         .route("/log_incident", post(incident_h))
@@ -704,7 +724,7 @@ mod tests {
         std::env::set_var("DM_TOKEN_T1SRV", "tok1");
         // seed a record into tenant t1srv
         let m = Memory::open_tenant("t1srv").unwrap();
-        m.remember("the vector substrate is zvec", "resources/notes").unwrap();
+        m.remember("the vector substrate is zvec", "resources/notes", None, None).unwrap();
 
         let app = router(Arc::new(BearerAuth::from_env().unwrap()), None);
 
