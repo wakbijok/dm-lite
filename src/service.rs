@@ -48,6 +48,10 @@ pub fn install(addr: &str) -> Result<()> {
     if !config::is_safe_token(&token) {
         bail!("refusing to install: the configured server token has characters unsafe for unit files; re-issue it with `dmem admin add` / `dmem login`");
     }
+    // `addr` is interpolated into the unit's ExecStart; parse it as a socket address up front so a
+    // newline/space cannot inject a directive or split args (it is only parsed at `serve` otherwise).
+    addr.parse::<std::net::SocketAddr>()
+        .map_err(|e| anyhow!("invalid --addr {addr:?}: {e}"))?;
     let data_dir = config::data_dir()?.to_string_lossy().into_owned();
     platform::install(addr, &token, &tenant, &data_dir)?;
     write_server_config(addr, &token, &tenant)?;
@@ -202,6 +206,14 @@ mod platform {
         let u = unit()?;
         if let Some(parent) = u.parent() {
             std::fs::create_dir_all(parent)?;
+        }
+        // The unit quotes path-bearing values, but a literal double-quote or newline in them would
+        // still break or inject into ExecStart/Environment. Reject those (the launchd plist escapes
+        // the same values; systemd has no escaping here, so we refuse instead).
+        for (label, v) in [("dmem binary path", bin.as_str()), ("data dir", data_dir)] {
+            if v.contains('"') || v.contains('\n') || v.contains('\r') {
+                bail!("refusing to write systemd unit: {label} contains a quote or newline: {v:?}");
+            }
         }
         // tenant is canonical; token is validated to the opaque-token charset upstream, so neither
         // can carry a space/newline. Quote the path-bearing values (bin, data_dir) so a path with
