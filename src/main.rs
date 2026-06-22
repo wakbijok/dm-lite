@@ -188,6 +188,12 @@ enum Cmd {
         /// v1 admin token (with --url)
         #[arg(long)]
         token: Option<String>,
+        /// accept a self-signed/invalid TLS cert from the v1 server (with --url)
+        #[arg(long)]
+        insecure: bool,
+        /// trust a specific CA/self-signed cert (PEM path) for the v1 server (with --url)
+        #[arg(long = "ca-cert")]
+        ca_cert: Option<String>,
     },
     /// Template helpers (export the bundled defaults to edit).
     #[command(subcommand)]
@@ -449,7 +455,7 @@ fn run() -> Result<()> {
             Ok(())
         }
         #[cfg(feature = "client")]
-        Cmd::Migrate { file, url, token } => migrate::run(file, url, token),
+        Cmd::Migrate { file, url, token, insecure, ca_cert } => migrate::run(file, url, token, insecure, ca_cert),
         Cmd::Template(TemplateCmd::Export { dir }) => {
             let d = std::path::Path::new(&dir);
             std::fs::create_dir_all(d)?;
