@@ -345,24 +345,32 @@ impl MemoryStore for SqliteStore {
         Ok(())
     }
 
-    fn recall(&self, query: &str, limit: usize) -> Result<Vec<Entry>> {
+    fn recall_scored(&self, query: &str, limit: usize) -> Result<Vec<(Entry, f64)>> {
         let fq = match fts_query(query) {
+            // No FTS terms (empty/short query) -> the recent() boot slice, which has no keyword
+            // magnitude; tag each with INFINITY so the recall floor never gates the boot rows out.
+            None => return Ok(self.recent(limit)?.into_iter().map(|e| (e, f64::INFINITY)).collect()),
             Some(q) => q,
-            None => return self.recent(limit),
         };
         let now = crate::entry::now_ms();
-        // Filter to the current slice in SQL (JOIN entries) BEFORE LIMIT, so the limit counts
-        // only live results - a stale FTS row (e.g. a record whose valid time has expired but
-        // is still system-current) can't consume a slot and crowd out a real match.
+        // The canonical recall query (the trait's `recall` derives from this by dropping the score).
+        // Filter to the current slice in SQL (JOIN entries) BEFORE LIMIT, so the limit counts only
+        // live results - a stale FTS row can't consume a slot and crowd out a real match. ORDER BY
+        // entries_fts.rank keeps positional rescoring aligned. SQLite bm25 (entries_fts.rank) is
+        // NEGATIVE with more-negative = better, so return -rank (>= 0, larger = better).
         let mut stmt = self.conn.prepare(&format!(
-            "SELECT {} FROM entries_fts JOIN entries e ON e.id = entries_fts.idref \
+            "SELECT {}, entries_fts.rank AS kw_rank FROM entries_fts JOIN entries e ON e.id = entries_fts.idref \
              WHERE entries_fts MATCH ?1 AND e.system_to_ms IS NULL \
              AND (e.valid_to_ms IS NULL OR e.valid_to_ms > ?2) \
              ORDER BY entries_fts.rank LIMIT ?3",
             COLS.split(',').map(|c| format!("e.{c}")).collect::<Vec<_>>().join(",")
         ))?;
         let out = stmt
-            .query_map(params![fq, now, limit as i64], Self::row_to_entry)?
+            .query_map(params![fq, now, limit as i64], |r| {
+                let e = Self::row_to_entry(r)?;
+                let rank: f64 = r.get("kw_rank")?;
+                Ok((e, -rank))
+            })?
             .filter_map(|r| r.ok())
             .collect();
         Ok(out)

@@ -87,8 +87,13 @@ impl ZvecIndex {
         Ok(())
     }
 
-    /// Nearest uris to the query vector, best first (reads the real uri from the field).
-    pub fn search(&self, vector: &[f32], k: usize) -> Result<Vec<String>> {
+    /// Nearest (uri, similarity) to the query vector, best first. zvec's `get_score()` for a
+    /// MetricType::Cosine HNSW index returns a cosine DISTANCE (0.0 = identical, 1.0 = orthogonal,
+    /// 2.0 = opposite; smaller = nearer), verified empirically. Our embeddings are L2-normalized,
+    /// so we convert to a true cosine SIMILARITY = 1.0 - distance, giving [-1, 1] with HIGHER =
+    /// more similar - the form the recall relevance floor (abs_cosine) thresholds on. Surfacing
+    /// this magnitude (not just the uri) is what lets the floor drop semantically-distant hits.
+    pub fn search(&self, vector: &[f32], k: usize) -> Result<Vec<(String, f32)>> {
         let q = SearchQuery::builder()
             .field_name("embedding")
             .vector(vector)
@@ -100,7 +105,7 @@ impl ZvecIndex {
         let mut out = Vec::new();
         for r in &results {
             if let Ok(Some(uri)) = r.get_string("uri") {
-                out.push(uri);
+                out.push((uri, 1.0 - r.get_score()));
             }
         }
         Ok(out)
@@ -124,8 +129,16 @@ mod tests {
         idx.upsert("uri-b", &b).expect("upsert b");
         let hits = idx.search(&a, 5).expect("search");
         assert!(
-            hits.first().map(|s| s == "uri-a").unwrap_or(false),
+            hits.first().map(|(s, _)| s == "uri-a").unwrap_or(false),
             "nearest to a should be uri-a, got {:?}",
+            hits
+        );
+        // search() returns cosine SIMILARITY (higher = nearer): self-match ~1.0, orthogonal ~0.0
+        let by: std::collections::HashMap<_, _> = hits.iter().cloned().collect();
+        assert!(by["uri-a"] > 0.9, "self-match similarity should be ~1.0, got {:?}", hits);
+        assert!(
+            by["uri-a"] > by.get("uri-b").copied().unwrap_or(f32::MIN),
+            "aligned vector must outscore the orthogonal one, got {:?}",
             hits
         );
     }
@@ -144,7 +157,7 @@ mod tests {
         let idx2 = ZvecIndex::open(&dir).expect("open(existing)");
         let hits = idx2.search(&a, 5).expect("search after reopen");
         assert!(
-            hits.contains(&"uri-a".to_string()),
+            hits.iter().any(|(u, _)| u == "uri-a"),
             "reopened index should still find uri-a, got {:?}",
             hits
         );
@@ -163,6 +176,6 @@ mod tests {
         v[7] = 1.0;
         idx.upsert(uri, &v).expect("upsert long daimon uri");
         let hits = idx.search(&v, 5).expect("search");
-        assert_eq!(hits.first().map(|s| s.as_str()), Some(uri), "got {:?}", hits);
+        assert_eq!(hits.first().map(|(s, _)| s.as_str()), Some(uri), "got {:?}", hits);
     }
 }

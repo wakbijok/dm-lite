@@ -10,9 +10,21 @@ pub trait MemoryStore {
     /// (close-not-delete), then insert the new one.
     fn put(&self, e: &Entry) -> Result<()>;
 
-    /// Hybrid recall. M0 is keyword-only (FTS); dense vector + RRF layer in behind the
-    /// same signature when the embedder is present. Returns live records, best first.
-    fn recall(&self, query: &str, limit: usize) -> Result<Vec<Entry>>;
+    /// Keyword relevance MAGNITUDE per hit (higher = better), best first. The SQLite impl returns
+    /// `-bm25` (SQLite's bm25 rank is negative, more-negative = better, so the negation makes larger
+    /// = better). This is the recall primitive: `recall` is derived from it by dropping the score.
+    /// It feeds the relevance floor's keyword gate; the empty/short-query fallback (no keyword
+    /// magnitude) returns `f64::INFINITY` so those boot/recent rows are never gated out. An impl
+    /// that cannot score keywords should return a uniform `f64::INFINITY` (its keyword gate becomes
+    /// a no-op). M0 is keyword-only (FTS); the dense vector + RRF layer fuses in above this, in the
+    /// caller, when the embedder is present.
+    fn recall_scored(&self, query: &str, limit: usize) -> Result<Vec<(Entry, f64)>>;
+
+    /// Live records best first (scores dropped). Derived from `recall_scored` so there is a single
+    /// query path; callers that do not need magnitudes use this.
+    fn recall(&self, query: &str, limit: usize) -> Result<Vec<Entry>> {
+        Ok(self.recall_scored(query, limit)?.into_iter().map(|(e, _)| e).collect())
+    }
 
     /// Recent high-importance live records (empty-query recall, for SessionStart).
     fn recent(&self, limit: usize) -> Result<Vec<Entry>>;
