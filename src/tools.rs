@@ -133,6 +133,59 @@ fn signal_boost(importance: i64, access_count: i64, last_access_ms: i64, now_ms:
     (1.0 + 0.05 * importance_norm + 0.05 * recency + 0.02 * freq).clamp(1.0, 1.25)
 }
 
+/// Pure relevance gate: which uris survive the floor. Both scores are "higher = better" (cosine
+/// similarity in [-1, 1] for the vector channel; `-bm25` >= 0 for the keyword channel). Clearing a
+/// channel means magnitude >= the absolute floor AND >= `rel_ratio` * the channel's top magnitude;
+/// the relative clause is SKIPPED when the channel's top score is <= 0, so a negative top can never
+/// invert into admitting WORSE hits.
+///
+/// COSINE is the floor when a vector channel exists (hybrid mode): a hit survives iff its cosine
+/// clears the cosine gate. The keyword channel does NOT independently bypass cosine, because a
+/// shared common word (e.g. an off-topic query and a filler both containing "rules") would
+/// otherwise admit semantically-irrelevant junk - exactly the pollution we are removing. Keyword
+/// relevance still shapes the RRF RANKING among survivors upstream; here it only matters for the
+/// INFINITY sentinel (empty/short query -> recent() boot rows), which always survives so the
+/// SessionStart/persona injection is never floored out.
+///
+/// When the vector channel is EMPTY (keyword-only build, or vector search failed) cosine is
+/// unavailable, so the keyword `-bm25` RELATIVE gate is the floor (bm25 is corpus-relative, so the
+/// scale-free ratio trims the weak tail; the absolute keyword floor stays permissive). In that mode
+/// an off-topic query that shares a term can still leak a weak keyword hit - a documented limit of
+/// the keyword-only fallback; the off-topic-injects-zero guarantee lives in the cosine gate.
+fn floor_survivors(
+    kw: &[(String, f64)],
+    vec: &[(String, f32)],
+    f: &config::RecallFloor,
+) -> std::collections::HashSet<String> {
+    use std::collections::HashSet;
+    // Keyword-only mode: no cosine to gate on, so the bm25 relative gate is the floor.
+    if vec.is_empty() {
+        let top_kw = kw.iter().map(|(_, s)| *s).fold(f64::NEG_INFINITY, f64::max);
+        return kw
+            .iter()
+            .filter(|(_, s)| *s >= f.abs_keyword && (top_kw <= 0.0 || *s >= f.rel_ratio * top_kw))
+            .map(|(u, _)| u.clone())
+            .collect();
+    }
+    // Hybrid: cosine is the floor.
+    let top_c = vec.iter().map(|(_, s)| *s as f64).fold(f64::NEG_INFINITY, f64::max);
+    let mut keep: HashSet<String> = vec
+        .iter()
+        .filter(|(_, s)| {
+            let s = *s as f64;
+            s >= f.abs_cosine && (top_c <= 0.0 || s >= f.rel_ratio * top_c)
+        })
+        .map(|(u, _)| u.clone())
+        .collect();
+    // The empty/short-query sentinel (recent() boot rows) is never gated out.
+    for (u, s) in kw {
+        if *s == f64::INFINITY {
+            keep.insert(u.clone());
+        }
+    }
+    keep
+}
+
 impl LocalMemory {
     /// Open the embedded-mode tenant ($DM_TENANT, else "default").
     pub fn open() -> Result<Self> {
@@ -307,9 +360,31 @@ impl LocalMemory {
             return self.recall_hybrid(query, limit, vindex);
         }
         // Keyword-only: pull a deeper pool (so rescoring can promote beyond the top-`limit`
-        // keyword hits), then apply the modest runtime-signal rescoring.
+        // keyword hits), apply the relevance floor's keyword gate (drops the weak bm25 tail so a
+        // 2-match query injects ~2, not the whole pool), then the modest runtime-signal rescoring.
         let pool = (limit * 2).max(10);
-        let hits = self.store.recall(query, pool)?;
+        let floor = config::recall_floor();
+        let hits: Vec<Entry> = if floor.enabled {
+            // No vector channel here, so the bm25 relative gate alone decides membership.
+            // recall_scored preserves FTS-rank order and `filter` retains it, so rescore_keyword's
+            // positional base stays aligned with bm25 rank.
+            let scored = self.store.recall_scored(query, pool)?;
+            let kw: Vec<(String, f64)> = scored.iter().map(|(e, s)| (e.uri.clone(), *s)).collect();
+            let keep = floor_survivors(&kw, &[], &floor);
+            let kept: Vec<Entry> = scored.into_iter().filter(|(e, _)| keep.contains(&e.uri)).map(|(e, _)| e).collect();
+            // Operator visibility: a default-on floor that empties a non-empty pool must not look
+            // like "matched nothing". Say so, with the top magnitude that was rejected.
+            if kept.is_empty() && !kw.is_empty() {
+                let top = kw.iter().map(|(_, s)| *s).fold(f64::NEG_INFINITY, f64::max);
+                eprintln!(
+                    "dmem: recall floor gated all {} keyword hit(s) (top -bm25={:.3}); query {:?} returned nothing. Set DM_RECALL_FLOOR=0 to disable.",
+                    kw.len(), top, query.chars().take(50).collect::<String>()
+                );
+            }
+            kept
+        } else {
+            self.store.recall(query, pool)?
+        };
         let out = self.rescore_keyword(hits, limit);
         self.bump_recalled(&out);
         Ok(out)
@@ -321,38 +396,79 @@ impl LocalMemory {
     fn recall_hybrid(&self, query: &str, limit: usize, vindex: &crate::zvec_index::ZvecIndex) -> Result<Vec<Entry>> {
         use std::collections::HashMap;
         let pool = (limit * 2).max(10);
-        let kw: Vec<String> = self.store.recall(query, pool)?.into_iter().map(|e| e.uri).collect();
+        // Pull both channels WITH their magnitudes: keyword hits carry -bm25 (and arrive already
+        // hydrated), vector hits carry cosine similarity.
+        let kw_scored = self.store.recall_scored(query, pool)?;
+        let kw: Vec<(String, f64)> = kw_scored.iter().map(|(e, s)| (e.uri.clone(), *s)).collect();
         let qv = self.embedder.embed(query);
-        let vec: Vec<String> = match vindex.search(&qv, pool) {
+        let vec: Vec<(String, f32)> = match vindex.search(&qv, pool) {
             Ok(v) => v,
             Err(e) => {
                 eprintln!("dmem: vector search failed ({e:#}); using keyword results only");
                 Vec::new()
             }
         };
+
+        // Relevance floor: gate channel MEMBERSHIP before fusion. RRF, the signal nudge, and
+        // take(limit) below are byte-identical to before; the floor only removes weak pool hits
+        // (so a 2-relevant query injects ~2 and an off-topic query injects 0). When disabled, every
+        // pool hit passes, reproducing the pre-floor result.
+        let mut floor = config::recall_floor();
+        // Cosine is embedder-relative: the placeholder HashEmbedder's cosine ~ keyword overlap, not
+        // bge-scale semantics, so disable its ABSOLUTE cosine gate (the bm25 + relative gates still
+        // apply); a bge-calibrated floor would mis-gate the placeholder.
+        if self.embedder.name() == "hash" {
+            floor.abs_cosine = f64::NEG_INFINITY;
+        }
+        let keep = if floor.enabled { Some(floor_survivors(&kw, &vec, &floor)) } else { None };
+        let passes = |uri: &str| keep.as_ref().is_none_or(|k| k.contains(uri));
+
         let k = 60.0_f64;
         let mut score: HashMap<String, f64> = HashMap::new();
-        for (rank, uri) in kw.iter().enumerate() {
-            *score.entry(uri.clone()).or_default() += 1.0 / (k + rank as f64 + 1.0);
+        // RRF over the FULL pool order (rank positions unchanged), accumulating only survivors -
+        // so disabling the floor yields exactly the prior score map.
+        for (rank, (uri, _)) in kw.iter().enumerate() {
+            if passes(uri) {
+                *score.entry(uri.clone()).or_default() += 1.0 / (k + rank as f64 + 1.0);
+            }
         }
-        for (rank, uri) in vec.iter().enumerate() {
-            *score.entry(uri.clone()).or_default() += 1.0 / (k + rank as f64 + 1.0);
+        for (rank, (uri, _)) in vec.iter().enumerate() {
+            if passes(uri) {
+                *score.entry(uri.clone()).or_default() += 1.0 / (k + rank as f64 + 1.0);
+            }
         }
         // Hydrate, then apply the modest runtime-signal multiplier AFTER RRF: a bounded
         // (<=1.25x) nudge that reorders near-equal scores without overturning a clear gap.
+        // Keyword survivors are already hydrated (recall_scored returned Entry); fetch only
+        // vector-only survivors via get().
         let now = now_ms();
+        let mut entries: HashMap<String, Entry> = kw_scored.into_iter().map(|(e, _)| (e.uri.clone(), e)).collect();
         let uris: Vec<String> = score.keys().cloned().collect();
         let sigs = self.store.read_signals(&uris).unwrap_or_default();
         let mut scored: Vec<(Entry, f64)> = Vec::new();
         for (uri, rrf) in score {
-            if let Some(e) = self.store.get(&uri)? {
-                let (ac, la) = sigs.get(&uri).copied().unwrap_or((0, 0));
-                let s = rrf * signal_boost(e.importance, ac, la, now);
-                scored.push((e, s));
-            }
+            let e = match entries.remove(&uri) {
+                Some(e) => e,
+                None => match self.store.get(&uri)? {
+                    Some(e) => e,
+                    None => continue,
+                },
+            };
+            let (ac, la) = sigs.get(&uri).copied().unwrap_or((0, 0));
+            let s = rrf * signal_boost(e.importance, ac, la, now);
+            scored.push((e, s));
         }
         scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         let out: Vec<Entry> = scored.into_iter().take(limit).map(|(e, _)| e).collect();
+        // Operator visibility: the floor emptied a non-empty pool (over-gating), distinct from a
+        // genuine no-match. Report the top cosine that was rejected so the threshold can be judged.
+        if floor.enabled && out.is_empty() && !(kw.is_empty() && vec.is_empty()) {
+            let top_c = vec.iter().map(|(_, s)| *s).fold(f32::NEG_INFINITY, f32::max);
+            eprintln!(
+                "dmem: recall floor gated all {} pool hit(s) (top cosine={:.3} < abs {:.2}); query {:?} returned nothing. Set DM_RECALL_FLOOR=0 to disable.",
+                kw.len() + vec.len(), top_c, floor.abs_cosine, query.chars().take(50).collect::<String>()
+            );
+        }
         self.bump_recalled(&out);
         Ok(out)
     }
@@ -847,5 +963,308 @@ mod tests {
         // the entity kind survives recall
         let hits = m.recall("Lenovo SR630", 5).unwrap();
         assert!(hits.iter().any(|e| e.kind == Kind::Product && e.title == "Lenovo SR630"));
+    }
+
+    // --- relevance floor: pure gate (no store, no env, deterministic) ---
+
+    fn floor(abs_cosine: f64, abs_keyword: f64, rel_ratio: f64) -> crate::config::RecallFloor {
+        crate::config::RecallFloor { enabled: true, abs_cosine, abs_keyword, rel_ratio }
+    }
+    fn v(uri: &str, c: f32) -> (String, f32) {
+        (uri.to_string(), c)
+    }
+    fn kwh(uri: &str, s: f64) -> (String, f64) {
+        (uri.to_string(), s)
+    }
+
+    #[test]
+    fn floor_off_topic_below_cosine_injects_zero() {
+        // off-topic query: every vector hit is below the absolute cosine floor.
+        let vec = vec![v("a", 0.12), v("b", 0.08), v("c", 0.20)];
+        let keep = floor_survivors(&[], &vec, &floor(0.30, 0.0, 0.45));
+        assert!(keep.is_empty(), "all cosines < 0.30 must inject nothing, got {keep:?}");
+    }
+
+    #[test]
+    fn floor_adaptive_keeps_strong_drops_weak_tail() {
+        // two strong hits then a steep drop-off: the relative ratio drops the tail, the absolute
+        // floor is cleared by the strong ones. A 2-relevant query injects ~2, not the whole pool.
+        let vec = vec![v("s1", 0.82), v("s2", 0.78), v("w1", 0.33), v("w2", 0.31)];
+        let keep = floor_survivors(&[], &vec, &floor(0.30, 0.0, 0.45));
+        assert!(keep.contains("s1") && keep.contains("s2"), "strong hits kept");
+        assert!(!keep.contains("w1") && !keep.contains("w2"), "weak tail dropped by ratio: {keep:?}");
+    }
+
+    #[test]
+    fn floor_negative_top_cosine_does_not_admit_worse() {
+        // all-negative cosine (off-topic): the relative clause is skipped (top <= 0) so it can't
+        // invert into admitting worse hits; the absolute gate empties the channel.
+        let vec = vec![v("a", -0.10), v("b", -0.20), v("c", -0.05)];
+        let keep = floor_survivors(&[], &vec, &floor(0.30, 0.0, 0.45));
+        assert!(keep.is_empty(), "negative cosines must not survive, got {keep:?}");
+    }
+
+    #[test]
+    fn floor_cosine_is_the_floor_in_hybrid_keyword_cannot_bypass() {
+        // the leak fix: a junk record that shares a common WORD with the query (strong bm25) but is
+        // semantically distant (low cosine) must NOT survive in hybrid - cosine is the floor, the
+        // keyword channel cannot bypass it. The genuinely relevant hit (high cosine) survives.
+        let kw = vec![kwh("kw_overlap_junk", 9.0), kwh("relevant", 3.0)];
+        let vec = vec![v("relevant", 0.82), v("kw_overlap_junk", 0.18)];
+        let keep = floor_survivors(&kw, &vec, &floor(0.30, 0.0, 0.45));
+        assert!(keep.contains("relevant"), "semantically-relevant hit survives");
+        assert!(!keep.contains("kw_overlap_junk"), "shared-word junk with low cosine must be dropped: {keep:?}");
+    }
+
+    #[test]
+    fn floor_keyword_only_mode_uses_bm25_relative_gate() {
+        // no vector channel (keyword-only build / search failed): the bm25 relative gate is the
+        // floor - the top match and anything within the ratio survive, the weak tail is dropped.
+        let kw = vec![kwh("strong", 8.0), kwh("mid", 4.0), kwh("weak", 1.0)];
+        let keep = floor_survivors(&kw, &[], &floor(0.30, 0.0, 0.45)); // 0.45*8 = 3.6
+        assert!(keep.contains("strong") && keep.contains("mid"), "top + within-ratio kept");
+        assert!(!keep.contains("weak"), "weak tail (1.0 < 3.6) dropped: {keep:?}");
+    }
+
+    // Serializes the few tests that mutate DM_RECALL_FLOOR (the other recall-calling tests assert
+    // "contains X", which holds floor-on-or-off, so they don't need the lock).
+    static RECALL_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn floor_disabled_matches_prefloor_recall() {
+        // The kill-switch guarantee: DM_RECALL_FLOOR=0 reproduces pre-floor recall exactly (the
+        // disabled keyword path is plain store.recall). This is what rollback depends on.
+        let _g = RECALL_ENV_LOCK.lock().unwrap();
+        std::env::set_var("DM_RECALL_FLOOR", "0");
+        let m = LocalMemory::for_test(tmp_store());
+        m.remember("alpha bravo charlie delta", "resources/notes", None, None).unwrap();
+        m.remember("alpha only here", "resources/notes", None, None).unwrap();
+        let disabled: std::collections::HashSet<String> =
+            m.recall("alpha", 10).unwrap().into_iter().map(|e| e.uri).collect();
+        let prefloor: std::collections::HashSet<String> =
+            m.store.recall("alpha", 10).unwrap().into_iter().map(|e| e.uri).collect();
+        std::env::remove_var("DM_RECALL_FLOOR");
+        assert_eq!(disabled, prefloor, "floor-disabled recall must equal pre-floor (plain) recall");
+        assert_eq!(disabled.len(), 2, "both keyword matches present when the floor is disabled");
+    }
+
+    #[test]
+    fn floor_recent_sentinel_survives_in_both_modes() {
+        // the empty/short-query sentinel (f64::INFINITY = recent() boot rows) is never floored out,
+        // whether or not a vector channel is present.
+        let kw = vec![kwh("recent1", f64::INFINITY), kwh("recent2", f64::INFINITY)];
+        assert_eq!(floor_survivors(&kw, &[], &floor(0.30, 0.0, 0.45)).len(), 2, "keyword-only mode");
+        // hybrid: a low-cosine vector pool would gate everything, but INFINITY recent rows still pass
+        let vec = vec![v("x", 0.05)];
+        let keep = floor_survivors(&kw, &vec, &floor(0.30, 0.0, 0.45));
+        assert!(keep.contains("recent1") && keep.contains("recent2"), "recent rows survive in hybrid too");
+    }
+}
+
+/// Step B: the recall-floor CALIBRATION harness. Dev-only and feature-gated to `candle` (the
+/// production bge-small embedder), so it NEVER compiles into the release binary. It stands up a
+/// real-embeddings store in an isolated temp dir (never the live arif.db), seeds a labeled
+/// synthetic corpus (topic clusters + vector-only paraphrases with zero keyword overlap +
+/// hard-negatives that share a keyword but are off-topic + fillers), sweeps (abs_cosine, rel_ratio)
+/// on TRAIN queries, and validates the chosen thresholds on a HELD-OUT split. Run it with:
+///   cargo test --features candle floor_eval -- --nocapture
+/// then read the printed RECOMMEND line and bake it into `RecallFloor::DEFAULTS`.
+#[cfg(all(test, feature = "candle"))]
+mod floor_eval {
+    use super::*;
+    use std::collections::{HashMap, HashSet};
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    // (label, text). Clusters share vocabulary; VO* are vector-only paraphrases of the VQ query
+    // with NO shared content word; H* are hard-negatives (share a keyword with a query, off-topic);
+    // F* are unrelated fillers.
+    fn corpus() -> Vec<(&'static str, &'static str)> {
+        vec![
+            ("A1", "The postgres database server was OOM-killed during the data migration."),
+            ("A2", "Postgres ran out of memory mid-migration and the kernel killed the process."),
+            ("A3", "We set work_mem too high and postgres exhausted RAM during the bulk import migration."),
+            ("A4", "The migration batch size was too large; postgres memory ballooned until it crashed."),
+            ("A5", "After the OOM kill we tuned shared_buffers and lowered the migration batch size."),
+            ("A6", "Adding swap stopped the postgres migration from being OOM-killed again."),
+            ("B1", "The kubernetes ingress controller failed to renew its TLS certificate."),
+            ("B2", "cert-manager could not issue a Let's Encrypt certificate for the ingress."),
+            ("B3", "The nginx ingress served an expired certificate after the renewal hook failed."),
+            ("B4", "We fixed ingress TLS by reconfiguring the cert-manager ClusterIssuer."),
+            ("B5", "Ingress traffic broke because the TLS certificate secret was not mounted."),
+            ("B6", "The k8s ingress returned 503 until the TLS secret was regenerated."),
+            ("C1", "Submitted the MyGovUC migration proposal for the government tender."),
+            ("C2", "The MCMC sovereign cloud tender requires local data residency in Malaysia."),
+            ("C3", "KHD is the hardware distributor feeding the government tender bid."),
+            ("C4", "Tender compliance for the JPN project needed CIDB and MOF certificates."),
+            ("C5", "The MyGovUC engagement reached BAU after the migration delivery."),
+            ("C6", "Prepared the BOM and sizing for the Malaysia public-sector tender."),
+            // vector-only: semantically about an overload outage, ZERO content-word overlap with VQ
+            ("VO1", "Users hit timeouts everywhere once the peak hour rush arrived."),
+            ("VO2", "Every request started failing as concurrency climbed past the limit."),
+            // hard-negatives: share a keyword with the postgres query but off-topic
+            ("H1", "A memory foam mattress review covering comfort, firmness, and price."),
+            ("H2", "The seasonal migration of shorebirds across the peninsula peaks in October."),
+            ("H3", "A certificate of attendance for the training was emailed to all staff."),
+            // fillers
+            ("F1", "Reorganized the home lab rack and labeled every network cable."),
+            ("F2", "Upgraded the NAS to ZFS and enabled nightly snapshots."),
+            ("F3", "Notes on the history of the Roman aqueducts and their engineering."),
+            ("F4", "Wrote a shell script to rotate and compress old log files."),
+            ("F5", "Planned the quarterly budget for the storage refresh."),
+            ("F6", "A recipe for sourdough bread with a long cold ferment."),
+            ("F7", "Benchmarked NVMe drives for random read IOPS."),
+            ("F8", "Set up Grafana dashboards for the Proxmox cluster."),
+            ("F9", "Reviewed firewall rules for the DMZ segment."),
+            ("F10", "Configured Wireguard tunnels between the two sites."),
+            ("F11", "Tested backup restore from the offsite repository."),
+            ("F12", "Compared two espresso machines for a small office pantry."),
+        ]
+    }
+
+    // (query, relevant labels). Empty relevant set = deliberately off-topic (must inject 0).
+    fn train() -> Vec<(&'static str, Vec<&'static str>)> {
+        vec![
+            ("postgres database ran out of memory and was OOM killed during the migration",
+                vec!["A1", "A2", "A3", "A4", "A5", "A6"]),
+            ("kubernetes ingress failed to renew its TLS certificate",
+                vec!["B1", "B2", "B3", "B4", "B5", "B6"]),
+            ("the rules and format of test match cricket", vec![]),
+        ]
+    }
+    fn heldout() -> Vec<(&'static str, Vec<&'static str>)> {
+        vec![
+            ("MyGovUC government tender submission in Malaysia",
+                vec!["C1", "C2", "C3", "C4", "C5", "C6"]),
+            ("the production cluster became unresponsive when traffic surged",
+                vec!["VO1", "VO2"]),
+            ("lattice gauge theory in quantum chromodynamics", vec![]),
+        ]
+    }
+
+    const POOL: usize = 24;
+
+    struct QChannels {
+        kw: Vec<(String, f64)>,
+        vec: Vec<(String, f32)>,
+        rel: HashSet<String>,
+        pool: HashSet<String>,
+    }
+
+    /// recall-retained (over relevant present in pool), junk-survivor count, total survivors.
+    fn eval_query(q: &QChannels, f: &config::RecallFloor) -> (f64, usize, usize) {
+        let keep = floor_survivors(&q.kw, &q.vec, f);
+        let rel_in_pool: usize = q.rel.iter().filter(|u| q.pool.contains(*u)).count();
+        let rel_kept = keep.iter().filter(|u| q.rel.contains(*u)).count();
+        let junk_kept = keep.len() - rel_kept;
+        let retained = if rel_in_pool == 0 { 1.0 } else { rel_kept as f64 / rel_in_pool as f64 };
+        (retained, junk_kept, keep.len())
+    }
+
+    #[test]
+    fn floor_eval_calibrate() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("dmeval-{}-{}", std::process::id(), now_ms()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::env::set_var("DM_DATA_DIR", &dir);
+        let m = LocalMemory::open_tenant("eval").expect("open eval tenant");
+        // HIGH-2 guard: a silent HashEmbedder fallback would make every cosine number bogus.
+        assert_ne!(m.embedder.name(), "hash", "calibration needs a real embedder; build --features candle");
+        eprintln!("\nEVAL embedder = {}  (dim {})", m.embedder.name(), m.embedder.dim());
+
+        let mut uri_of: HashMap<&str, String> = HashMap::new();
+        for (label, text) in corpus() {
+            uri_of.insert(label, m.remember(text, "resources/eval", None, None).unwrap());
+        }
+        let channels = |qs: Vec<(&'static str, Vec<&'static str>)>| -> Vec<QChannels> {
+            qs.into_iter()
+                .map(|(q, labels)| {
+                    let kw = m.store.recall_scored(q, POOL).unwrap();
+                    let qv = m.embedder.embed(q);
+                    let vec = m.vindex.as_ref().unwrap().search(&qv, POOL).unwrap();
+                    let rel: HashSet<String> = labels.iter().map(|l| uri_of[*l].clone()).collect();
+                    let mut pool: HashSet<String> = kw.iter().map(|(e, _)| e.uri.clone()).collect();
+                    pool.extend(vec.iter().map(|(u, _)| u.clone()));
+                    QChannels { kw: kw.iter().map(|(e, s)| (e.uri.clone(), *s)).collect(), vec, rel, pool }
+                })
+                .collect()
+        };
+        let train = channels(train());
+        let held = channels(heldout());
+
+        // raw cosine separation on train (relevant vs junk), to see the gap the floor exploits
+        let (mut rc, mut jc) = (Vec::new(), Vec::new());
+        for q in &train {
+            for (u, c) in &q.vec {
+                if q.rel.contains(u) { rc.push(*c) } else { jc.push(*c) }
+            }
+        }
+        rc.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        jc.sort_by(|a, b| b.partial_cmp(a).unwrap());
+        eprintln!("EVAL train cosine: relevant min={:.3} (all={:?})", rc.first().copied().unwrap_or(0.0),
+            rc.iter().map(|x| format!("{x:.2}")).collect::<Vec<_>>());
+        eprintln!("EVAL train cosine: junk top5={:?}", jc.iter().take(5).map(|x| format!("{x:.2}")).collect::<Vec<_>>());
+        // off-topic queries set the leak threshold: their top cosine is the bar abs_cosine must clear
+        for q in train.iter().filter(|q| q.rel.is_empty()) {
+            let mut tops: Vec<f32> = q.vec.iter().map(|(_, c)| *c).collect();
+            tops.sort_by(|a, b| b.partial_cmp(a).unwrap());
+            eprintln!("EVAL off-topic top5 cosine={:?}", tops.iter().take(5).map(|x| format!("{x:.2}")).collect::<Vec<_>>());
+        }
+
+        // Sweep (abs_cosine, rel_ratio). PRIORITY: off-topic-injects-zero is the hard guarantee
+        // (leak==0), THEN maximize recall-retained, THEN minimize noise, THEN lower abs_cosine
+        // (more conservative on recall). Perfect separation is impossible (relevant/junk cosine
+        // bands overlap), so we take the best tradeoff under the zero-leak constraint.
+        let mut best: Option<(f64, f64, f64, usize)> = None; // (ac, rr, retained, junk)
+        for ac_i in 10..=80 {
+            let ac = ac_i as f64 / 100.0;
+            for rr_i in (20..=70).step_by(5) {
+                let rr = rr_i as f64 / 100.0;
+                let f = config::RecallFloor { enabled: true, abs_cosine: ac, abs_keyword: 0.0, rel_ratio: rr };
+                let (mut ret_sum, mut ret_n, mut junk, mut leak) = (0.0, 0, 0usize, 0usize);
+                for q in &train {
+                    let (ret, jk, tot) = eval_query(q, &f);
+                    if q.rel.is_empty() { leak += tot } else { ret_sum += ret; ret_n += 1; junk += jk; }
+                }
+                if leak != 0 { continue; }
+                let retained = ret_sum / ret_n as f64;
+                let better = match best {
+                    None => true,
+                    Some((bac, _, bret, bj)) => {
+                        retained > bret + 1e-9
+                            || ((retained - bret).abs() < 1e-9 && junk < bj)
+                            || ((retained - bret).abs() < 1e-9 && junk == bj && ac < bac)
+                    }
+                };
+                if better { best = Some((ac, rr, retained, junk)); }
+            }
+        }
+        let (ac, rr, ret, _j) = best.expect("no abs_cosine achieved zero off-topic leak (off-topic top cosine too high)");
+        let chosen = config::RecallFloor { enabled: true, abs_cosine: ac, abs_keyword: 0.0, rel_ratio: rr };
+        eprintln!("EVAL RECOMMEND  abs_cosine={ac:.2}  rel_ratio={rr:.2}  abs_keyword=0.0  (train recall-retained={ret:.2})");
+
+        let _ = chosen; // the sweep RECOMMEND is informational; we ship + validate DEFAULTS below.
+
+        // Validate the SHIPPED defaults on held-out (regression guard on the baked-in constants).
+        // HARD guarantees: off-topic injects ZERO; named-entity cluster recall stays high; the
+        // zero-keyword-overlap paraphrase still survives the cosine floor (semantic recall).
+        let ship = config::RecallFloor::DEFAULTS;
+        eprintln!("EVAL held-out @ SHIPPED defaults (abs_cosine={:.2} rel_ratio={:.2}):", ship.abs_cosine, ship.rel_ratio);
+        for (q, labels) in heldout() {
+            let qc = held.iter().find(|c| c.rel == labels.iter().map(|l| uri_of[*l].clone()).collect::<HashSet<_>>()).unwrap();
+            let (ret, jk, tot) = eval_query(qc, &ship);
+            let kind = if labels.is_empty() { "off-topic" } else if labels.iter().all(|l| l.starts_with("VO")) { "vector-only" } else { "cluster" };
+            eprintln!("  [{kind}] q={q:?}  retained={ret:.2} survivors={tot} junk={jk}");
+            if labels.is_empty() {
+                assert_eq!(tot, 0, "off-topic must inject zero at shipped defaults, got {tot}");
+            } else if kind == "cluster" {
+                assert!(ret >= 0.8, "named-entity cluster recall fell to {ret:.2} at shipped defaults");
+            } else if kind == "vector-only" {
+                assert!(ret > 0.0, "shipped cosine floor must keep >=1 zero-keyword-overlap paraphrase");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        std::env::remove_var("DM_DATA_DIR");
     }
 }

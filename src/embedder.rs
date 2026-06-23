@@ -18,6 +18,12 @@ pub const DIM: usize = 256;
 pub trait Embedder: Send + Sync {
     fn dim(&self) -> usize;
     fn embed(&self, text: &str) -> Vec<f32>;
+    /// Stable identity of the active embedder. Used by the recall relevance floor (cosine
+    /// magnitudes are embedder-relative, so the floor must know which model produced them) and
+    /// by the calibration harness to ASSERT the real model loaded (a silent HashEmbedder
+    /// fallback would make every cosine number bogus). "hash" marks the placeholder, whose
+    /// cosine approximates keyword overlap, NOT bge-scale semantics.
+    fn name(&self) -> &'static str;
 }
 
 pub struct HashEmbedder;
@@ -46,6 +52,9 @@ fn fnv1a(token: &str) -> u64 {
 impl Embedder for HashEmbedder {
     fn dim(&self) -> usize {
         DIM
+    }
+    fn name(&self) -> &'static str {
+        "hash"
     }
 
     fn embed(&self, text: &str) -> Vec<f32> {
@@ -88,6 +97,9 @@ impl Embedder for FastEmbedder {
     fn dim(&self) -> usize {
         DIM
     }
+    fn name(&self) -> &'static str {
+        "fastembed-bge-small"
+    }
     fn embed(&self, text: &str) -> Vec<f32> {
         match self.model.embed(vec![text], None) {
             Ok(mut v) => v.pop().unwrap_or_else(|| vec![0.0; DIM]),
@@ -123,6 +135,9 @@ impl Model2VecEmbedder {
 impl Embedder for Model2VecEmbedder {
     fn dim(&self) -> usize {
         DIM
+    }
+    fn name(&self) -> &'static str {
+        "model2vec"
     }
     fn embed(&self, text: &str) -> Vec<f32> {
         let mut v = self.model.encode_single(text);
@@ -189,6 +204,9 @@ impl CandleEmbedder {
 impl Embedder for CandleEmbedder {
     fn dim(&self) -> usize {
         DIM
+    }
+    fn name(&self) -> &'static str {
+        "candle-bge-small"
     }
     fn embed(&self, text: &str) -> Vec<f32> {
         match self.embed_inner(text) {

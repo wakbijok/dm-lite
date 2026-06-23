@@ -184,6 +184,64 @@ pub fn tenant() -> String {
         .unwrap_or_else(|| "default".to_string())
 }
 
+/// Recall relevance-floor settings: the precision gate that stops recall from injecting a fixed
+/// count of weak/irrelevant hits. Thresholds are on the underlying CHANNEL MAGNITUDES (cosine for
+/// the vector channel, `-bm25` for the keyword channel), both "higher = better"; a hit survives a
+/// channel iff it clears the absolute floor AND a relative-to-top ratio.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RecallFloor {
+    pub enabled: bool,
+    /// Absolute cosine-similarity floor for the vector channel (bge-small scale).
+    pub abs_cosine: f64,
+    /// Absolute keyword (`-bm25`) floor for the keyword channel.
+    pub abs_keyword: f64,
+    /// Keep a hit only if its magnitude is >= this fraction of the channel's top magnitude.
+    pub rel_ratio: f64,
+}
+
+impl RecallFloor {
+    /// Conservative defaults, calibrated by the `floor_eval` harness (Step B) on the bge-small
+    /// (candle) production embedder, validated on a held-out split.
+    ///
+    /// `abs_cosine = 0.62`: cosine is bounded [-1,1] and corpus-INDEPENDENT, so an absolute floor on
+    /// it is robust and IS the real precision gate. The harness measured off-topic queries topping
+    /// out at ~0.61 cosine while on-topic clusters sit at ~0.74+, so 0.62 makes off-topic inject
+    /// ZERO while held-out cluster recall stayed 1.0 with zero junk; it also kept a zero-keyword-
+    /// overlap paraphrase (semantic recall where bm25 is silent). Cosine is the floor in hybrid -
+    /// the keyword channel cannot bypass it, so a shared common word can't drag in off-topic junk.
+    ///
+    /// `abs_keyword = 0.0`: bm25 is unbounded and corpus-RELATIVE (a constant suiting a 468-record
+    /// store is far too high for a tiny one), so the keyword channel gates on the scale-free
+    /// relative-to-top ratio only; it is the floor solely in keyword-only builds (no cosine).
+    ///
+    /// `rel_ratio = 0.45`: relaxed below the sweep's min-junk pick (0.70, the upper bound of the
+    /// swept [0.20, 0.70] range, not a proven optimum beyond it) to favor recall - the
+    /// absolute cosine floor already delivers off-topic-zero, so the relative gate is a gentle tail
+    /// trim, not the guarantee. The placeholder HashEmbedder disables the absolute cosine gate at
+    /// the call site (its cosine is keyword-overlap, not bge-scale). Dial via `DM_RECALL_FLOOR=0`.
+    pub const DEFAULTS: RecallFloor =
+        RecallFloor { enabled: true, abs_cosine: 0.62, abs_keyword: 0.0, rel_ratio: 0.45 };
+}
+
+/// Parse the `DM_RECALL_FLOOR` kill-switch value into a RecallFloor. "0"/"off"/"false"/"no"
+/// disables the floor (returns pre-floor recall); anything else (or unset) enables it with the
+/// calibrated defaults. Pure (env read happens in `recall_floor`) so it is unit-testable without
+/// touching the process environment.
+pub fn parse_recall_floor(val: Option<&str>) -> RecallFloor {
+    match val.map(|v| v.trim().to_ascii_lowercase()) {
+        Some(v) if matches!(v.as_str(), "0" | "off" | "false" | "no") => {
+            RecallFloor { enabled: false, ..RecallFloor::DEFAULTS }
+        }
+        _ => RecallFloor::DEFAULTS,
+    }
+}
+
+/// The active recall floor, read fresh from `DM_RECALL_FLOOR` (like `data_dir`'s env read), so the
+/// kill-switch takes effect for any new process without touching the cached config.
+pub fn recall_floor() -> RecallFloor {
+    parse_recall_floor(std::env::var("DM_RECALL_FLOOR").ok().as_deref())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -204,6 +262,20 @@ mod tests {
     fn empty_config_is_default() {
         let cfg: Config = toml::from_str("").unwrap();
         assert!(cfg.server.is_none() && cfg.tenant.is_none() && cfg.data_dir.is_none());
+    }
+
+    #[test]
+    fn recall_floor_kill_switch_parses() {
+        // unset / anything else -> enabled with defaults
+        assert!(parse_recall_floor(None).enabled);
+        assert_eq!(parse_recall_floor(None), RecallFloor::DEFAULTS);
+        assert!(parse_recall_floor(Some("1")).enabled);
+        assert!(parse_recall_floor(Some("on")).enabled);
+        // explicit off values disable, keeping the same thresholds otherwise
+        for off in ["0", "off", "false", "no", "OFF", " 0 "] {
+            assert!(!parse_recall_floor(Some(off)).enabled, "{off:?} should disable");
+            assert_eq!(parse_recall_floor(Some(off)).abs_cosine, RecallFloor::DEFAULTS.abs_cosine);
+        }
     }
 
     #[test]
