@@ -128,7 +128,16 @@ pub fn user_prompt_submit(arg: Option<String>, hermes: bool) -> Result<()> {
     // Persona/protocols are NOT injected here for Hermes: they live in SOUL.md (the always-on
     // system prompt, written by `dmem bootstrap --hermes`), so identity survives session resume
     // and compaction. This hook carries only the dynamic per-prompt layer: recall + save nudge.
-    let recall = render::render_recall(&m.recall(&prompt, 6).unwrap_or_default());
+    // Graph-augmented recall: pull the floor-trimmed seeds AND their 1-hop neighborhood, so
+    // connected-but-not-similar context rides along (only where edges exist; lean otherwise).
+    // Depth is env-dialable via DM_RECALL_EXPAND (default 1; 0 = plain recall).
+    let depth = crate::config::recall_expand_depth();
+    let hits = if depth == 0 {
+        m.recall(&prompt, 6).unwrap_or_default()
+    } else {
+        m.recall_expanded(&prompt, 6, depth).unwrap_or_default()
+    };
+    let recall = render::render_recall(&hits);
     if !recall.trim().is_empty() {
         blocks.push(recall);
     }
