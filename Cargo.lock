@@ -924,7 +924,7 @@ dependencies = [
 
 [[package]]
 name = "dm-lite"
-version = "0.1.0-rc.9"
+version = "0.1.0-rc.10"
 dependencies = [
  "anyhow",
  "axum",
