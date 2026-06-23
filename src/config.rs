@@ -242,6 +242,26 @@ pub fn recall_floor() -> RecallFloor {
     parse_recall_floor(std::env::var("DM_RECALL_FLOOR").ok().as_deref())
 }
 
+/// Graph-expansion depth for the per-prompt recall hook, read fresh from `DM_RECALL_EXPAND`
+/// (default 1 hop; "0"/"off"/"false"/"no" => plain recall, no expansion). An env knob like
+/// `recall_floor` so it can be dialed without a config-file edit; capped at 5 hops. Expansion is
+/// adaptive: it only adds connected records where the graph has edges, so generic prompts stay lean
+/// and graph-covered topics get their neighborhood.
+pub fn recall_expand_depth() -> usize {
+    parse_expand_depth(std::env::var("DM_RECALL_EXPAND").ok().as_deref())
+}
+
+fn parse_expand_depth(v: Option<&str>) -> usize {
+    match v.map(|s| s.trim().to_ascii_lowercase()) {
+        None => 1,
+        Some(s) => match s.as_str() {
+            "" => 1,
+            "0" | "off" | "false" | "no" => 0,
+            other => other.parse::<usize>().unwrap_or(1).min(5),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -276,6 +296,18 @@ mod tests {
             assert!(!parse_recall_floor(Some(off)).enabled, "{off:?} should disable");
             assert_eq!(parse_recall_floor(Some(off)).abs_cosine, RecallFloor::DEFAULTS.abs_cosine);
         }
+    }
+
+    #[test]
+    fn expand_depth_parses() {
+        assert_eq!(parse_expand_depth(None), 1, "unset defaults to 1 hop");
+        assert_eq!(parse_expand_depth(Some("")), 1);
+        assert_eq!(parse_expand_depth(Some("2")), 2);
+        assert_eq!(parse_expand_depth(Some("99")), 5, "capped at 5");
+        for off in ["0", "off", "false", "no", "OFF", " 0 "] {
+            assert_eq!(parse_expand_depth(Some(off)), 0, "{off:?} should disable expansion");
+        }
+        assert_eq!(parse_expand_depth(Some("garbage")), 1, "unparseable falls back to 1");
     }
 
     #[test]
