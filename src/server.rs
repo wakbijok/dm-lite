@@ -851,4 +851,56 @@ mod tests {
         std::env::remove_var("DM_TOKEN_T1SRV");
         std::env::remove_var("DM_DATA_DIR");
     }
+
+    // Full save->recall round-trip over the HTTP API (not just a pre-seeded store): POST /remember,
+    // then POST /recall and assert the just-saved record comes back. Closes the integration gap that
+    // unit tests over the in-process store do not cover.
+    #[tokio::test]
+    async fn remember_then_recall_round_trip_over_http() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("dmrt-{}-{}", std::process::id(), crate::entry::now_ms()));
+        std::env::set_var("DM_DATA_DIR", &dir);
+        std::env::set_var("DM_TOKEN_RT1", "rttok");
+        let app = router(Arc::new(BearerAuth::from_env().unwrap()), None);
+
+        // POST /remember (write through the wire)
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/remember")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer rttok")
+                    .body(Body::from(r#"{"text":"the mail relay runs postfix on local raid","namespace":"resources/notes"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        let s = String::from_utf8_lossy(&body);
+        assert!(s.contains("daimon://"), "remember should return the saved uri: {s}");
+
+        // POST /recall finds it (read back through the wire)
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/recall")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer rttok")
+                    .body(Body::from(r#"{"query":"postfix mail relay","limit":5}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        let s = String::from_utf8_lossy(&body);
+        assert!(s.contains("postfix"), "recall should return the just-saved record: {s}");
+
+        std::env::remove_var("DM_TOKEN_RT1");
+        std::env::remove_var("DM_DATA_DIR");
+    }
 }
