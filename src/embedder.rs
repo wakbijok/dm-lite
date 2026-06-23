@@ -219,6 +219,61 @@ impl Embedder for CandleEmbedder {
     }
 }
 
+/// Read-only diagnostics about the embedder that WOULD load (mirrors `build_embedder`'s selection
+/// order WITHOUT constructing it, so `dmem doctor` never triggers a model download). For neural
+/// embedders it reports the HuggingFace hub cache dir and whether the model is already present,
+/// so an air-gapped operator can pre-populate it.
+pub struct EmbedderDiag {
+    pub name: &'static str,
+    pub model_id: Option<String>,
+    pub neural: bool,
+    pub cache_dir: Option<std::path::PathBuf>,
+    pub cache_present: bool,
+}
+
+/// The HuggingFace hub cache dir (HUGGINGFACE_HUB_CACHE, else HF_HOME/hub, else
+/// ~/.cache/huggingface/hub, matching hf-hub's own resolution), and whether `model_id`'s snapshot
+/// is already cached there.
+#[cfg(any(feature = "fastembed", feature = "candle", feature = "model2vec"))]
+fn hf_model_cache(model_id: &str) -> (Option<std::path::PathBuf>, bool) {
+    let hub = if let Ok(c) = std::env::var("HUGGINGFACE_HUB_CACHE") {
+        std::path::PathBuf::from(c)
+    } else if let Ok(h) = std::env::var("HF_HOME") {
+        std::path::PathBuf::from(h).join("hub")
+    } else if let Some(h) = dirs::home_dir() {
+        h.join(".cache").join("huggingface").join("hub")
+    } else {
+        return (None, false);
+    };
+    let model_dir = hub.join(format!("models--{}", model_id.replace('/', "--")));
+    let present = model_dir.join("snapshots").is_dir();
+    (Some(hub), present)
+}
+
+/// Diagnostics for the active embedder, computed without loading the model.
+pub fn active_embedder_diag() -> EmbedderDiag {
+    #[cfg(feature = "fastembed")]
+    {
+        let m = std::env::var("DM_CANDLE_MODEL").unwrap_or_else(|_| "BAAI/bge-small-en-v1.5".to_string());
+        let (dir, present) = hf_model_cache(&m);
+        return EmbedderDiag { name: "fastembed-bge-small", model_id: Some(m), neural: true, cache_dir: dir, cache_present: present };
+    }
+    #[cfg(all(feature = "candle", not(feature = "fastembed")))]
+    {
+        let m = std::env::var("DM_CANDLE_MODEL").unwrap_or_else(|_| "BAAI/bge-small-en-v1.5".to_string());
+        let (dir, present) = hf_model_cache(&m);
+        return EmbedderDiag { name: "candle-bge-small", model_id: Some(m), neural: true, cache_dir: dir, cache_present: present };
+    }
+    #[cfg(all(feature = "model2vec", not(feature = "fastembed"), not(feature = "candle")))]
+    {
+        let m = std::env::var("DM_M2V_MODEL").unwrap_or_else(|_| "minishlab/potion-base-8M".to_string());
+        let (dir, present) = hf_model_cache(&m);
+        return EmbedderDiag { name: "model2vec", model_id: Some(m), neural: true, cache_dir: dir, cache_present: present };
+    }
+    #[allow(unreachable_code)]
+    EmbedderDiag { name: "hash-256", model_id: None, neural: false, cache_dir: None, cache_present: false }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

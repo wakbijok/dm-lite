@@ -38,6 +38,28 @@ dmem bootstrap --claude     # or --codex / --hermes / --devin / --claude-desktop
 
 Out of the box this runs on one machine: the server and your client live together. To run the server on one host and connect clients from elsewhere, see the wiki.
 
+## Offline / air-gapped
+
+Hybrid recall uses a small embedding model (bge-small-en-v1.5, about 130 MB), downloaded from HuggingFace on first use. Check readiness before deploying to a sealed network:
+
+```bash
+dmem doctor          # active embedder, model, cache dir, whether it is already cached, CPU features
+dmem doctor --json   # the same, machine-parseable
+```
+
+To run offline, pre-populate the model cache once on a connected machine, then carry it over (or point at a shared path):
+
+```bash
+# Pre-warm the cache (run once with network), then start dmem offline:
+HF_HOME=/srv/hf-cache python -c \
+  "from huggingface_hub import snapshot_download; snapshot_download('BAAI/bge-small-en-v1.5')"
+HF_HOME=/srv/hf-cache dmem serve --addr 127.0.0.1:8088
+```
+
+`dmem` honours `HF_HOME` and `HUGGINGFACE_HUB_CACHE` (it uses the standard HuggingFace cache), and `dmem serve` logs the cache dir and model on startup. `dmem doctor` prints the exact directory it expects and whether the model is present, so you know up front if a first run needs network.
+
+For CI and scripted ops, point any command at a server without editing the config: `dmem --endpoint https://memory.example.com recall "x"` (overrides `DM_ENDPOINT`; the token comes from `DM_TOKEN` or the config).
+
 ## Docs
 
 Full documentation is in the [project wiki](https://git.wakbijok.uk/daimon/dm-lite/-/wikis/home): install and first run, wiring each agent, run as a server, run as a client, multitenant admin, persona and governance, migrating from v1, upgrading, and building from source.

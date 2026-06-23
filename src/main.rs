@@ -46,6 +46,10 @@ const TPL_FILES: &[(&str, &str)] = &[
 #[derive(Parser)]
 #[command(name = "dmem", version, about = "daimon-memory v2: typed memory with hybrid recall; client/server in one binary")]
 struct Cli {
+    /// Point at a remote server URL for this invocation (overrides DM_ENDPOINT and the [server]
+    /// config; the token still comes from DM_TOKEN or the config). For CI and scripted ops.
+    #[arg(long, global = true)]
+    endpoint: Option<String>,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -264,6 +268,13 @@ enum Cmd {
     Template(TemplateCmd),
     /// Show store + wiring status.
     Status,
+    /// Diagnose readiness, especially for offline / air-gapped deploys: active embedder + model,
+    /// HuggingFace cache dir and whether the model is already cached, CPU features, and env.
+    Doctor {
+        /// Emit machine-parseable JSON instead of the human-readable report.
+        #[arg(long)]
+        json: bool,
+    },
     /// Run as an MCP stdio server (recall + typed save tools for MCP-aware agents).
     Mcp,
     /// Launch the optional local graph viewer (an embedded offline web page). Needs --features ui.
@@ -388,6 +399,17 @@ fn main() {
 
 fn run() -> Result<()> {
     let cli = Cli::parse();
+    // Fold the global --endpoint flag into DM_ENDPOINT before any config/server resolution, so the
+    // flag transparently overrides the env and the [server] config (see config::server_link).
+    if let Some(ep) = &cli.endpoint {
+        std::env::set_var("DM_ENDPOINT", ep);
+        // Warn (not fail) when no token will resolve: requests would be unauthenticated (a visible
+        // 401, not silent), but for CI/scripted ops this catches the missing DM_TOKEN early.
+        #[cfg(feature = "client")]
+        if config::server_link().map(|l| l.token.is_empty()).unwrap_or(false) {
+            eprintln!("dmem: --endpoint set but no token resolved (set DM_TOKEN or a [server].token); requests will be unauthenticated");
+        }
+    }
     match cli.cmd {
         #[cfg(feature = "wizard")]
         Cmd::Setup => setup::run(),
@@ -613,6 +635,7 @@ fn run() -> Result<()> {
             Ok(())
         }
         Cmd::Status => status(),
+        Cmd::Doctor { json } => doctor(json),
         Cmd::Mcp => mcp::serve(),
         #[cfg(feature = "ui")]
         Cmd::Ui { addr, open } => ui::run(&addr, open),
@@ -746,6 +769,83 @@ fn status() -> Result<()> {
     if let Some(h) = dirs::home_dir() {
         println!("devin  : {}", wired(&h.join(".config/devin/config.json"), "dmem hook"));
         println!("claude : {}", wired(&h.join(".claude/settings.json"), "dmem hook"));
+    }
+    Ok(())
+}
+
+/// Readiness diagnostics, especially for offline / air-gapped deploys. Reports the embedder that
+/// WOULD load, its HuggingFace cache dir and whether the model is already cached, CPU features, and
+/// any DM_/HF_ env overrides, WITHOUT loading the model (so it never triggers a download).
+fn doctor(json: bool) -> Result<()> {
+    let d = crate::embedder::active_embedder_diag();
+
+    #[cfg(feature = "client")]
+    let server_url = config::server_link().map(|l| l.url.clone());
+    #[cfg(not(feature = "client"))]
+    let server_url: Option<String> = None;
+    let mode = if server_url.is_some() { "remote client" } else { "embedded" };
+
+    let tenant = config::tenant();
+    let store = config::db_path(&tenant).ok().map(|p| p.display().to_string());
+
+    #[cfg(target_arch = "x86_64")]
+    let avx2 = if std::is_x86_feature_detected!("avx2") { "yes" } else { "no" };
+    #[cfg(not(target_arch = "x86_64"))]
+    let avx2 = "n/a (non-x86)";
+
+    let cache_dir = d.cache_dir.as_ref().map(|p| p.display().to_string());
+    let needs_network = d.neural && !d.cache_present;
+    let env: Vec<(&str, String)> = ["HF_HOME", "HUGGINGFACE_HUB_CACHE", "DM_CANDLE_MODEL", "DM_M2V_MODEL", "DM_CANDLE_F16", "DM_ENDPOINT", "DM_RECALL_FLOOR", "DM_RECALL_EXPAND"]
+        .iter()
+        .filter_map(|k| std::env::var(k).ok().map(|v| (*k, v)))
+        .collect();
+
+    if json {
+        let obj = serde_json::json!({
+            "version": env!("CARGO_PKG_VERSION"),
+            "mode": mode,
+            "server": server_url,
+            "tenant": tenant,
+            "store": store,
+            "embedder": d.name,
+            "model": d.model_id,
+            "neural": d.neural,
+            "model_cache": cache_dir,
+            "model_cached": d.cache_present,
+            "first_run_needs_network": needs_network,
+            "avx2": avx2,
+            "env": env.iter().map(|(k, v)| (k.to_string(), v.clone())).collect::<std::collections::BTreeMap<_, _>>(),
+        });
+        println!("{}", serde_json::to_string_pretty(&obj)?);
+        return Ok(());
+    }
+
+    println!("dmem {} - doctor", env!("CARGO_PKG_VERSION"));
+    println!("mode        : {mode}");
+    if let Some(u) = &server_url {
+        println!("server      : {u}");
+    }
+    println!("tenant      : {tenant}");
+    if let Some(s) = &store {
+        println!("store       : {s}");
+    }
+    println!("embedder    : {}{}", d.name, if d.neural { "" } else { " (placeholder, no real semantics)" });
+    if let Some(m) = &d.model_id {
+        println!("model       : {m}");
+    }
+    if d.neural {
+        println!("model_cache : {}", cache_dir.as_deref().unwrap_or("unknown"));
+        println!("model_cached: {}", if d.cache_present { "yes" } else { "NO (first run downloads ~130 MB, needs network)" });
+        println!("offline_ok  : {}", if d.cache_present { "yes" } else { "no - pre-populate the cache (README: Offline / air-gapped)" });
+    }
+    println!("avx2        : {avx2}");
+    if env.is_empty() {
+        println!("env         : (no DM_/HF_ overrides set)");
+    } else {
+        println!("env         :");
+        for (k, v) in &env {
+            println!("  {k} = {v}");
+        }
     }
     Ok(())
 }

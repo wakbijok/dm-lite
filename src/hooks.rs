@@ -166,4 +166,13 @@ mod tests {
         assert!(should_nudge(Some(now - 31 * 60_000), now), "stale (>30m) -> nudge");
         assert!(!should_nudge(Some(now - 5 * 60_000), now), "fresh (<30m) -> no nudge");
     }
+
+    #[test]
+    fn nudge_cadence_boundary_and_clock_skew() {
+        let now = 100 * 60_000;
+        assert!(!should_nudge(Some(now - NUDGE_GAP_MS), now), "exactly 30m -> no nudge (boundary is exclusive)");
+        assert!(should_nudge(Some(now - NUDGE_GAP_MS - 1), now), "30m + 1ms -> nudge");
+        assert!(!should_nudge(Some(now), now), "just saved -> no nudge");
+        assert!(!should_nudge(Some(now + 5), now), "future save (clock skew) -> no nudge (saturating_sub)");
+    }
 }

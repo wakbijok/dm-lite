@@ -122,10 +122,41 @@ pub fn write_secret(path: &Path, contents: &str) -> std::io::Result<()> {
     }
 }
 
-/// The remote server link, if the config selects remote-client mode.
+#[cfg_attr(not(feature = "client"), allow(dead_code))]
+static SERVER_LINK: OnceLock<Option<ServerLink>> = OnceLock::new();
+
+/// The remote server link, if remote-client mode is selected. Each field resolves independently:
+/// url = `$DM_ENDPOINT` (set by the global `--endpoint` flag for CI/automation) else config
+/// `[server].url`; token = `$DM_TOKEN` else config `[server].token`; `insecure`/`ca_cert` from the
+/// config. Returns None (embedded mode) only when neither an endpoint nor a `[server]` block exists.
+/// Cached: the env is read once, after `--endpoint` has been folded into `DM_ENDPOINT` in `main`.
 #[cfg_attr(not(feature = "client"), allow(dead_code))]
 pub fn server_link() -> Option<&'static ServerLink> {
-    config().server.as_ref()
+    SERVER_LINK
+        .get_or_init(|| {
+            resolve_server_link(
+                std::env::var("DM_ENDPOINT").ok().filter(|s| !s.trim().is_empty()),
+                std::env::var("DM_TOKEN").ok().filter(|s| !s.trim().is_empty()),
+                config().server.clone(),
+            )
+        })
+        .as_ref()
+}
+
+/// Pure precedence resolver for the server link (unit-tested). url = endpoint else config; token =
+/// token_env else config; insecure/ca_cert from config. None only when neither is present.
+#[cfg_attr(not(feature = "client"), allow(dead_code))]
+fn resolve_server_link(endpoint: Option<String>, token_env: Option<String>, cfg: Option<ServerLink>) -> Option<ServerLink> {
+    match (endpoint, cfg) {
+        (Some(url), cfg) => Some(ServerLink {
+            url,
+            token: token_env.or_else(|| cfg.as_ref().map(|s| s.token.clone())).unwrap_or_default(),
+            insecure: cfg.as_ref().map(|s| s.insecure).unwrap_or(false),
+            ca_cert: cfg.and_then(|s| s.ca_cert),
+        }),
+        (None, Some(cfg)) => Some(ServerLink { token: token_env.unwrap_or(cfg.token), ..cfg }),
+        (None, None) => None,
+    }
 }
 
 /// Base data dir: $DM_DATA_DIR, else config `data_dir`, else ~/.local/share/dm, else ~/.dm.
@@ -308,6 +339,28 @@ mod tests {
             assert_eq!(parse_expand_depth(Some(off)), 0, "{off:?} should disable expansion");
         }
         assert_eq!(parse_expand_depth(Some("garbage")), 1, "unparseable falls back to 1");
+    }
+
+    #[test]
+    fn server_link_resolution_precedence() {
+        let cfg = || ServerLink { url: "https://cfg".into(), token: "ctok".into(), insecure: true, ca_cert: Some("/ca.pem".into()) };
+        // endpoint overrides url; token + insecure + ca_cert inherited from config when no DM_TOKEN
+        let r = resolve_server_link(Some("https://flag".into()), None, Some(cfg())).unwrap();
+        assert_eq!(r.url, "https://flag");
+        assert_eq!(r.token, "ctok");
+        assert!(r.insecure && r.ca_cert.as_deref() == Some("/ca.pem"));
+        // DM_TOKEN overrides the config token
+        assert_eq!(resolve_server_link(Some("https://flag".into()), Some("etok".into()), Some(cfg())).unwrap().token, "etok");
+        // endpoint with no config -> empty token
+        let r = resolve_server_link(Some("https://flag".into()), None, None).unwrap();
+        assert_eq!((r.url.as_str(), r.token.as_str(), r.insecure), ("https://flag", "", false));
+        // no endpoint, config only -> config url + token
+        let r = resolve_server_link(None, None, Some(cfg())).unwrap();
+        assert_eq!((r.url.as_str(), r.token.as_str()), ("https://cfg", "ctok"));
+        // DM_TOKEN overrides even without an endpoint
+        assert_eq!(resolve_server_link(None, Some("etok".into()), Some(cfg())).unwrap().token, "etok");
+        // nothing -> embedded
+        assert!(resolve_server_link(None, None, None).is_none());
     }
 
     #[test]

@@ -32,6 +32,18 @@ fn make_embedder() -> std::sync::Arc<dyn crate::embedder::Embedder> {
 /// pay the model load on a request thread. Subsequent calls reuse the cached instance.
 #[cfg(feature = "zvec")]
 pub fn warm_embedder() {
+    // One line on startup so a cache miss is visible (names the embedder, model, and HF cache dir,
+    // and whether the model is already cached or will download on first use). See `dmem doctor`.
+    let d = crate::embedder::active_embedder_diag();
+    if d.neural {
+        eprintln!(
+            "dmem: embedder={} model={} cache={} ({})",
+            d.name,
+            d.model_id.as_deref().unwrap_or("?"),
+            d.cache_dir.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "unknown".into()),
+            if d.cache_present { "cached" } else { "will download on first use (needs network)" },
+        );
+    }
     let _ = make_embedder();
 }
 
