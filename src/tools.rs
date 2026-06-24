@@ -569,6 +569,11 @@ impl LocalMemory {
         self.store.by_kind("reminder", limit)
     }
 
+    /// All live skill records (kind=skill), for `dmem skills sync`/`list`.
+    pub fn skills_all(&self, limit: usize) -> Result<Vec<Entry>> {
+        self.store.by_kind("skill", limit)
+    }
+
     /// System-time of the most recent save (for the save-discipline nudge cadence).
     pub fn latest_save_ms(&self) -> Result<Option<i64>> {
         self.store.latest_save_ms()
@@ -684,6 +689,17 @@ impl Memory {
     #[cfg_attr(not(feature = "server"), allow(dead_code))]
     pub fn open_tenant(tenant: &str) -> Result<LocalMemory> {
         LocalMemory::open_tenant(tenant)
+    }
+
+    /// Borrow the inner local engine (tests only; the skills tests import through `Memory` then
+    /// read back through the local store).
+    #[cfg(test)]
+    pub(crate) fn as_local(&self) -> &LocalMemory {
+        match self {
+            Memory::Local(l) => l,
+            #[cfg(feature = "client")]
+            Memory::Remote(_) => panic!("as_local called on a remote Memory"),
+        }
     }
 
     pub fn recall(&self, query: &str, limit: usize) -> Result<Vec<Entry>> {

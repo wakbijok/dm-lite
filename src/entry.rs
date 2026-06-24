@@ -22,6 +22,7 @@ pub enum Kind {
     Protocol,
     Reminder,
     Memory,
+    Skill,
     // Domain-entity kinds (the knowledge-graph layer): the "things" the records are about.
     Org,
     Engagement,
@@ -48,6 +49,7 @@ impl Kind {
             Kind::Protocol => "protocol",
             Kind::Reminder => "reminder",
             Kind::Memory => "memory",
+            Kind::Skill => "skill",
             Kind::Org => "org",
             Kind::Engagement => "engagement",
             Kind::Product => "product",
@@ -75,6 +77,7 @@ impl Kind {
             "protocol" => Kind::Protocol,
             "reminder" => Kind::Reminder,
             "memory" => Kind::Memory,
+            "skill" => Kind::Skill,
             "org" => Kind::Org,
             "engagement" => Kind::Engagement,
             "product" => Kind::Product,
@@ -232,6 +235,7 @@ pub fn default_importance(kind: Kind) -> i64 {
     match kind {
         Kind::Persona | Kind::Protocol => 95,
         Kind::ProjectConvention => 70,
+        Kind::Skill => 75,
         _ => 60,
     }
 }
@@ -255,7 +259,7 @@ mod tests {
             Kind::Decision, Kind::Runbook, Kind::IncidentSummary, Kind::ServiceTopology,
             Kind::KnownFailureMode, Kind::RemediationPattern, Kind::ProjectConvention,
             Kind::AgentLesson, Kind::ResourceSummary, Kind::Persona, Kind::Protocol,
-            Kind::Reminder, Kind::Memory,
+            Kind::Reminder, Kind::Memory, Kind::Skill,
             Kind::Org, Kind::Engagement, Kind::Product, Kind::SolutionStack,
             Kind::Person, Kind::Framework, Kind::Site,
         ] {
@@ -273,7 +277,7 @@ mod tests {
         for k in [Kind::Org, Kind::Engagement, Kind::Product, Kind::SolutionStack, Kind::Person, Kind::Framework, Kind::Site] {
             assert!(k.is_entity(), "{:?} should be an entity", k);
         }
-        for k in [Kind::Persona, Kind::Protocol, Kind::Decision, Kind::Memory, Kind::Reminder, Kind::AgentLesson] {
+        for k in [Kind::Persona, Kind::Protocol, Kind::Decision, Kind::Memory, Kind::Reminder, Kind::AgentLesson, Kind::Skill] {
             assert!(!k.is_entity(), "{:?} must not be an entity (would pollute non-entity layers)", k);
         }
     }

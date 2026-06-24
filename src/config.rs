@@ -176,6 +176,17 @@ pub fn data_dir() -> Result<PathBuf> {
     Err(anyhow!("could not resolve a data directory"))
 }
 
+/// Claude Code skills dir: `$DM_CLAUDE_DIR/skills` (a test/CI seam), else `~/.claude/skills`.
+/// Reuses the same `dirs::home_dir()` helper as `data_dir()`/`status`/`bootstrap`, not `$HOME`.
+pub fn claude_skills_dir() -> Result<PathBuf> {
+    if let Ok(d) = std::env::var("DM_CLAUDE_DIR") {
+        return Ok(PathBuf::from(d).join("skills"));
+    }
+    dirs::home_dir()
+        .map(|h| h.join(".claude").join("skills"))
+        .ok_or_else(|| anyhow!("could not resolve home directory for ~/.claude/skills"))
+}
+
 /// Canonical tenant identity: lowercased and restricted to [a-z0-9_-]; empty -> "default".
 /// Used by BOTH auth and path derivation so one logical tenant maps to exactly one store
 /// regardless of case or punctuation (tenant names are case-insensitive), and so the record

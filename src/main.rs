@@ -16,6 +16,7 @@ mod render;
 mod sqlite;
 mod store;
 mod tools;
+mod skills;
 #[cfg(feature = "server")]
 mod iam;
 #[cfg(feature = "server")]
@@ -266,6 +267,9 @@ enum Cmd {
     /// Template helpers (export the bundled defaults to edit).
     #[command(subcommand)]
     Template(TemplateCmd),
+    /// Manage SA skills as a queryable memory kind, projected into Claude Code (~/.claude/skills).
+    #[command(subcommand)]
+    Skills(SkillsCmd),
     /// Show store + wiring status.
     Status,
     /// Diagnose readiness, especially for offline / air-gapped deploys: active embedder + model,
@@ -377,6 +381,17 @@ enum AdminCmd {
 enum TemplateCmd {
     /// Write the bundled default templates to a directory to edit.
     Export { dir: String },
+}
+
+#[derive(Subcommand)]
+#[command(rename_all = "snake_case")]
+enum SkillsCmd {
+    /// Import each <dir>/<name>/SKILL.md as a skill record (idempotent upsert).
+    Import { dir: String },
+    /// Materialize skill records to ~/.claude/skills/<name>/SKILL.md (overwrite).
+    Sync,
+    /// List skill records (name + first line of description).
+    List,
 }
 
 #[derive(Subcommand)]
@@ -634,6 +649,11 @@ fn run() -> Result<()> {
             println!("edit persona.md (fill the <PLACEHOLDERS>), then:  dmem import {}", d.display());
             Ok(())
         }
+        Cmd::Skills(s) => match s {
+            SkillsCmd::Import { dir } => skills::import(&dir),
+            SkillsCmd::Sync => skills::sync(),
+            SkillsCmd::List => skills::list(),
+        },
         Cmd::Status => status(),
         Cmd::Doctor { json } => doctor(json),
         Cmd::Mcp => mcp::serve(),
