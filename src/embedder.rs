@@ -189,10 +189,17 @@ impl CandleEmbedder {
 
     fn embed_inner(&self, text: &str) -> anyhow::Result<Vec<f32>> {
         use candle_core::{IndexOp, Tensor};
+        // bge-small-en-v1.5 has 512 position embeddings; a longer token sequence overflows the
+        // position index-select and fails the forward pass. Cap at the model max so long records
+        // (e.g. a full SKILL.md body) embed from their leading 512 tokens instead of not at all.
+        const MAX_TOKENS: usize = 512;
         let enc = self.tokenizer.encode(text, true).map_err(|e| anyhow::anyhow!("encode: {e}"))?;
-        let ids = Tensor::new(enc.get_ids(), &self.device)?.unsqueeze(0)?;
+        let id_slice = enc.get_ids();
+        let mask_slice = enc.get_attention_mask();
+        let n = id_slice.len().min(MAX_TOKENS);
+        let ids = Tensor::new(&id_slice[..n], &self.device)?.unsqueeze(0)?;
         let type_ids = ids.zeros_like()?;
-        let mask = Tensor::new(enc.get_attention_mask(), &self.device)?.unsqueeze(0)?;
+        let mask = Tensor::new(&mask_slice[..n], &self.device)?.unsqueeze(0)?;
         let out = self.model.forward(&ids, &type_ids, Some(&mask))?; // [1, seq, hidden]
         let cls: Vec<f32> = out.i((0, 0))?.to_vec1()?; // CLS token
         let norm = cls.iter().map(|x| x * x).sum::<f32>().sqrt();
