@@ -331,4 +331,18 @@ mod tests {
             cos(&a, &c)
         );
     }
+
+    // The 512-token cap (embed_inner): bge-small has only 512 position embeddings, so a record
+    // longer than that (e.g. a full SKILL.md body) must embed from its leading 512 tokens, not
+    // overflow the forward pass and fall back to the zero vector.
+    #[cfg(all(feature = "candle", not(feature = "fastembed")))]
+    #[test]
+    fn candle_caps_long_input_at_512_tokens() {
+        let e = CandleEmbedder::new().expect("load bge-small model");
+        let long = "word ".repeat(2000); // ~2000 tokens, well over the 512 cap
+        let v = e.embed(&long);
+        assert_eq!(v.len(), DIM, "must produce a DIM-length vector");
+        let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!(norm > 0.5, "a >512-token input must embed (capped), not fail to the zero vector (norm={norm})");
+    }
 }

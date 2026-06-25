@@ -358,7 +358,10 @@ impl LocalMemory {
 
     /// Count of live records per kind (for `dm status`).
     pub fn counts(&self) -> Result<Vec<(String, usize)>> {
-        let all = self.store.recent(1_000_000)?;
+        let mut all = self.store.recent(1_000_000)?;
+        // recent() excludes skills (they are not recall memory); add them back so status shows the
+        // full inventory, including the skill count.
+        all.extend(self.store.by_kind("skill", 1_000_000)?);
         let mut map: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
         for e in &all {
             *map.entry(e.kind.as_str().to_string()).or_default() += 1;
@@ -466,6 +469,12 @@ impl LocalMemory {
                     None => continue,
                 },
             };
+            // Skills surface via the ~/.claude/skills projection, not recall. The keyword channel
+            // already excludes them in SQL; the vector channel can still return a skill uri, so drop
+            // it here before it pollutes per-prompt context with a full SKILL.md body.
+            if e.kind == crate::entry::Kind::Skill {
+                continue;
+            }
             let (ac, la) = sigs.get(&uri).copied().unwrap_or((0, 0));
             let s = rrf * signal_boost(e.importance, ac, la, now);
             scored.push((e, s));

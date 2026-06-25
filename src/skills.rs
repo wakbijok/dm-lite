@@ -51,9 +51,15 @@ fn parse_skill_frontmatter(text: &str) -> Result<(String, String)> {
     Ok((name, desc))
 }
 
-/// Reject names that could escape the skills root on `sync` (path traversal / separators).
+/// Reject names that could escape the skills root on `sync` or create a hidden/dotfile dir (path
+/// traversal, separators, or a leading dot like `.git` / `.ssh` / `.env` from attacker-set
+/// frontmatter when importing an untrusted SKILL.md).
 fn safe_skill_name(name: &str) -> bool {
-    !name.is_empty() && !name.contains('/') && !name.contains('\\') && !name.contains("..")
+    !name.is_empty()
+        && !name.starts_with('.')
+        && !name.contains('/')
+        && !name.contains('\\')
+        && !name.contains("..")
 }
 
 /// CORE (testable): import every `<dir>/<name>/SKILL.md` as a `skill` record. Idempotent: the
@@ -65,12 +71,20 @@ pub fn import_dir(mem: &Memory, dir: &Path) -> Result<(usize, usize)> {
     let mut subdirs: Vec<_> = std::fs::read_dir(dir)
         .map_err(|e| anyhow!("read {}: {e}", dir.display()))?
         .filter_map(|e| e.ok())
+        // file_type() does NOT follow symlinks, so a symlinked subdir pointing outside the import
+        // root is skipped, not traversed (a shared/cloned repo could commit such a symlink).
+        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
         .map(|e| e.path())
-        .filter(|p| p.is_dir())
         .collect();
     subdirs.sort();
     for sub in subdirs {
-        let text = match std::fs::read_to_string(sub.join("SKILL.md")) {
+        let skill_md = sub.join("SKILL.md");
+        // Don't read a SKILL.md that is itself a symlink (it could resolve outside the import root).
+        if std::fs::symlink_metadata(&skill_md).map(|m| m.file_type().is_symlink()).unwrap_or(false) {
+            skipped += 1;
+            continue;
+        }
+        let text = match std::fs::read_to_string(&skill_md) {
             Ok(t) => t,
             Err(_) => {
                 skipped += 1;
@@ -105,7 +119,18 @@ pub fn sync_to(records: &[Entry], root: &Path) -> Result<usize> {
         }
         let dir = root.join(name);
         std::fs::create_dir_all(&dir).map_err(|e| anyhow!("create {}: {e}", dir.display()))?;
-        std::fs::write(dir.join("SKILL.md"), &r.body).map_err(|e| anyhow!("write {}: {e}", dir.display()))?;
+        // Atomic write: a crash mid-write must not leave a 0-byte / partial SKILL.md that Claude
+        // Code then loads. Write a temp sibling, fsync, then rename (POSIX rename is atomic, so the
+        // target is always either the old full file or the new full file).
+        let target = dir.join("SKILL.md");
+        let tmp = dir.join(format!(".SKILL.md.tmp.{}", std::process::id()));
+        {
+            use std::io::Write;
+            let mut f = std::fs::File::create(&tmp).map_err(|e| anyhow!("create {}: {e}", tmp.display()))?;
+            f.write_all(r.body.as_bytes()).map_err(|e| anyhow!("write {}: {e}", tmp.display()))?;
+            f.sync_all().ok();
+        }
+        std::fs::rename(&tmp, &target).map_err(|e| anyhow!("rename {}: {e}", target.display()))?;
         n += 1;
     }
     Ok(n)
@@ -201,7 +226,7 @@ mod tests {
     #[test]
     fn safe_name_guard() {
         assert!(safe_skill_name("design-review"));
-        for bad in ["", "../evil", "a/b", "a\\b", "x..y"] {
+        for bad in ["", ".", "..", ".git", ".ssh", ".env", "../evil", "a/b", "a\\b", "x..y"] {
             assert!(!safe_skill_name(bad), "{bad} must be rejected");
         }
     }
@@ -219,7 +244,7 @@ mod tests {
     }
 
     #[test]
-    fn skill_kind_and_recall_round_trip() {
+    fn skill_stored_but_excluded_from_recall() {
         let m = mem();
         let src = uniq("src");
         write_skill(&src, "zeta-skill", "zebrawordmarker");
@@ -228,11 +253,35 @@ mod tests {
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].kind, Kind::Skill);
         assert_eq!(all[0].title, "zeta-skill");
+        // Skills reach the agent via the ~/.claude/skills projection (and `dmem skills list`), NOT
+        // the fuzzy recall pool: a full SKILL.md body must never bleed into per-prompt context.
         let hits = m.recall("zebrawordmarker", 5).unwrap();
         assert!(
-            hits.iter().any(|e| e.title == "zeta-skill" && e.kind == Kind::Skill),
-            "skill must be recall-queryable"
+            !hits.iter().any(|e| e.kind == Kind::Skill),
+            "skills must be EXCLUDED from recall (surface via skills_all / projection)"
         );
+    }
+
+    #[test]
+    fn import_skips_unsafe_frontmatter_name() {
+        let m = mem();
+        let src = uniq("src");
+        let d = src.join("looks-ok");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("SKILL.md"), "---\nname: ../evil\ndescription: \"x\"\n---\nbody\n").unwrap();
+        assert_eq!(import_dir(&m, &src).unwrap(), (0, 1), "unsafe frontmatter name must be skipped on import");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn import_skips_symlinked_subdir() {
+        let m = mem();
+        let src = uniq("src");
+        let outside = uniq("outside");
+        write_skill(&outside, "real-skill", "marker"); // a real skill dir OUTSIDE the import root
+        std::os::unix::fs::symlink(outside.join("real-skill"), src.join("link")).unwrap();
+        let (ok, _) = import_dir(&m, &src).unwrap();
+        assert_eq!(ok, 0, "a symlinked subdir must not be imported (no traversal outside the root)");
     }
 
     #[test]

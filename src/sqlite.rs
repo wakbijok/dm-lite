@@ -362,6 +362,7 @@ impl MemoryStore for SqliteStore {
             "SELECT {}, entries_fts.rank AS kw_rank FROM entries_fts JOIN entries e ON e.id = entries_fts.idref \
              WHERE entries_fts MATCH ?1 AND e.system_to_ms IS NULL \
              AND (e.valid_to_ms IS NULL OR e.valid_to_ms > ?2) \
+             AND e.kind <> 'skill' \
              ORDER BY entries_fts.rank LIMIT ?3",
             COLS.split(',').map(|c| format!("e.{c}")).collect::<Vec<_>>().join(",")
         ))?;
@@ -378,8 +379,10 @@ impl MemoryStore for SqliteStore {
 
     fn recent(&self, limit: usize) -> Result<Vec<Entry>> {
         let now = crate::entry::now_ms();
+        // Exclude skills: they are knowledge surfaced via the ~/.claude/skills projection, not the
+        // recent/recall pool, so their full bodies never bloat the boot/per-prompt context.
         let mut stmt = self.conn.prepare(&format!(
-            "SELECT {COLS} FROM entries WHERE {CURRENT} \
+            "SELECT {COLS} FROM entries WHERE {CURRENT} AND kind <> 'skill' \
              ORDER BY importance DESC, created_ms DESC LIMIT ?"
         ))?;
         let rows = stmt
@@ -407,7 +410,8 @@ impl MemoryStore for SqliteStore {
         // so scan `entries` for the as-of slice and keyword-filter in Rust. History is small
         // per tenant, so a linear scan is fine; this keeps as-of deterministic and simple.
         let pred = "system_from_ms <= ?1 AND (system_to_ms IS NULL OR system_to_ms > ?1) \
-                    AND valid_from_ms <= ?2 AND (valid_to_ms IS NULL OR valid_to_ms > ?2)";
+                    AND valid_from_ms <= ?2 AND (valid_to_ms IS NULL OR valid_to_ms > ?2) \
+                    AND kind <> 'skill'";
         let mut stmt = self.conn.prepare(&format!(
             "SELECT {COLS} FROM entries WHERE {pred} ORDER BY importance DESC, created_ms DESC"
         ))?;
