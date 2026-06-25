@@ -18,6 +18,14 @@ pub const DIM: usize = 256;
 pub trait Embedder: Send + Sync {
     fn dim(&self) -> usize;
     fn embed(&self, text: &str) -> Vec<f32>;
+    /// Embed a record body as one or more vectors. A body within the model's token limit yields a
+    /// single vector (identical to `embed`); a longer body is split into windows so its TAIL is
+    /// represented too, not just the leading tokens. Recall max-pools these per record, so a query
+    /// matching any section scores on that section. Default: one chunk (overridden by neural
+    /// embedders with a real position limit). Queries always use `embed` (single vector).
+    fn embed_chunks(&self, text: &str) -> Vec<Vec<f32>> {
+        vec![self.embed(text)]
+    }
     /// Stable identity of the active embedder. Used by the recall relevance floor (cosine
     /// magnitudes are embedder-relative, so the floor must know which model produced them) and
     /// by the calibration harness to ASSERT the real model loaded (a silent HashEmbedder
@@ -187,23 +195,59 @@ impl CandleEmbedder {
         Ok(Self { model, tokenizer, device })
     }
 
-    fn embed_inner(&self, text: &str) -> anyhow::Result<Vec<f32>> {
+    /// Forward one already-bounded token window ([CLS] .. [SEP], <= 512 ids) to a normalized CLS
+    /// vector. Shared by the single-vector path and the chunked path.
+    fn forward_window(&self, ids: &[u32], mask: &[u32]) -> anyhow::Result<Vec<f32>> {
         use candle_core::{IndexOp, Tensor};
-        // bge-small-en-v1.5 has 512 position embeddings; a longer token sequence overflows the
-        // position index-select and fails the forward pass. Cap at the model max so long records
-        // (e.g. a full SKILL.md body) embed from their leading 512 tokens instead of not at all.
-        const MAX_TOKENS: usize = 512;
-        let enc = self.tokenizer.encode(text, true).map_err(|e| anyhow::anyhow!("encode: {e}"))?;
-        let id_slice = enc.get_ids();
-        let mask_slice = enc.get_attention_mask();
-        let n = id_slice.len().min(MAX_TOKENS);
-        let ids = Tensor::new(&id_slice[..n], &self.device)?.unsqueeze(0)?;
-        let type_ids = ids.zeros_like()?;
-        let mask = Tensor::new(&mask_slice[..n], &self.device)?.unsqueeze(0)?;
-        let out = self.model.forward(&ids, &type_ids, Some(&mask))?; // [1, seq, hidden]
+        let t_ids = Tensor::new(ids, &self.device)?.unsqueeze(0)?;
+        let type_ids = t_ids.zeros_like()?;
+        let t_mask = Tensor::new(mask, &self.device)?.unsqueeze(0)?;
+        let out = self.model.forward(&t_ids, &type_ids, Some(&t_mask))?; // [1, seq, hidden]
         let cls: Vec<f32> = out.i((0, 0))?.to_vec1()?; // CLS token
         let norm = cls.iter().map(|x| x * x).sum::<f32>().sqrt();
         Ok(if norm > 0.0 { cls.iter().map(|x| x / norm).collect() } else { cls })
+    }
+
+    fn embed_inner(&self, text: &str) -> anyhow::Result<Vec<f32>> {
+        // bge-small-en-v1.5 has 512 position embeddings; a longer token sequence overflows the
+        // position index-select and fails the forward pass. Cap at the model max so long records
+        // (and every query) embed from their leading 512 tokens instead of not at all.
+        const MAX_TOKENS: usize = 512;
+        let enc = self.tokenizer.encode(text, true).map_err(|e| anyhow::anyhow!("encode: {e}"))?;
+        let ids = enc.get_ids();
+        let mask = enc.get_attention_mask();
+        let n = ids.len().min(MAX_TOKENS);
+        self.forward_window(&ids[..n], &mask[..n])
+    }
+
+    /// Split a body into <=510-token content windows, each re-wrapped with the model's [CLS]/[SEP]
+    /// so every window is a valid sequence with its own positions. A body within the limit is one
+    /// window (byte-identical to `embed_inner`, so single-chunk records need no migration). Bounded
+    /// at MAX_CHUNKS windows (~130 KB of body); content past that embeds only via FTS.
+    fn embed_chunks_inner(&self, text: &str) -> anyhow::Result<Vec<Vec<f32>>> {
+        const MAX_TOKENS: usize = 512;
+        const MAX_CHUNKS: usize = 64;
+        let enc = self.tokenizer.encode(text, true).map_err(|e| anyhow::anyhow!("encode: {e}"))?;
+        let ids = enc.get_ids();
+        let mask = enc.get_attention_mask();
+        if ids.len() <= MAX_TOKENS {
+            return Ok(vec![self.forward_window(ids, mask)?]);
+        }
+        // ids is [CLS] content.. [SEP]; window the content, re-wrapping each with CLS/SEP.
+        let cls = ids[0];
+        let sep = ids[ids.len() - 1];
+        let content = &ids[1..ids.len() - 1];
+        const WIN: usize = MAX_TOKENS - 2; // leave room for CLS + SEP
+        let mut out = Vec::new();
+        for w in content.chunks(WIN).take(MAX_CHUNKS) {
+            let mut cids = Vec::with_capacity(w.len() + 2);
+            cids.push(cls);
+            cids.extend_from_slice(w);
+            cids.push(sep);
+            let cmask = vec![1u32; cids.len()];
+            out.push(self.forward_window(&cids, &cmask)?);
+        }
+        Ok(out)
     }
 }
 
@@ -221,6 +265,16 @@ impl Embedder for CandleEmbedder {
             Err(e) => {
                 eprintln!("dmem: candle embed failed: {e:?}");
                 vec![0.0; DIM]
+            }
+        }
+    }
+    fn embed_chunks(&self, text: &str) -> Vec<Vec<f32>> {
+        match self.embed_chunks_inner(text) {
+            Ok(v) if !v.is_empty() => v,
+            Ok(_) => vec![vec![0.0; DIM]],
+            Err(e) => {
+                eprintln!("dmem: candle embed_chunks failed: {e:?}");
+                vec![vec![0.0; DIM]]
             }
         }
     }
@@ -344,5 +398,26 @@ mod tests {
         assert_eq!(v.len(), DIM, "must produce a DIM-length vector");
         let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
         assert!(norm > 0.5, "a >512-token input must embed (capped), not fail to the zero vector (norm={norm})");
+    }
+
+    // embed_chunks: a body within the limit is one vector; a longer body splits into several real
+    // (non-zero) windows so its tail is representable, not just the leading 512 tokens.
+    #[cfg(all(feature = "candle", not(feature = "fastembed")))]
+    #[test]
+    fn candle_embed_chunks_splits_long_input() {
+        let e = CandleEmbedder::new().expect("load bge-small model");
+        assert_eq!(e.embed_chunks("a brief note").len(), 1, "short text is a single chunk");
+        let long = "word ".repeat(2000); // ~2000 tokens -> multiple 510-token windows
+        let chunks = e.embed_chunks(&long);
+        assert!(chunks.len() > 1, "a >512-token body must split into multiple chunks, got {}", chunks.len());
+        for (i, c) in chunks.iter().enumerate() {
+            assert_eq!(c.len(), DIM, "chunk {i} must be DIM-length");
+            let norm: f32 = c.iter().map(|x| x * x).sum::<f32>().sqrt();
+            assert!(norm > 0.5, "chunk {i} must be a real vector, norm={norm}");
+        }
+        // a body within the limit embeds identically via embed and embed_chunks, so a short record's
+        // single chunk (PK = pk_for(uri)) matches the pre-chunking vector: no migration for it.
+        let short = "a brief operational note about disk iowait on the mail relay";
+        assert_eq!(e.embed_chunks(short), vec![e.embed(short)], "short body: one chunk equal to embed()");
     }
 }

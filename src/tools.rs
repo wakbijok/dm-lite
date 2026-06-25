@@ -260,8 +260,8 @@ impl LocalMemory {
         self.store.put(e)?;
         #[cfg(feature = "zvec")]
         if let Some(vindex) = &self.vindex {
-            let v = self.embedder.embed(&e.body);
-            if let Err(err) = vindex.upsert(&e.uri, &v) {
+            let chunks = self.embedder.embed_chunks(&e.body);
+            if let Err(err) = vindex.upsert_chunks(&e.uri, &chunks) {
                 eprintln!("dmem: vector index upsert failed for {} ({err:#}); keyword recall unaffected", e.uri);
             }
         }
@@ -286,8 +286,8 @@ impl LocalMemory {
             if e.body.len() > 2048 {
                 long += 1;
             }
-            let v = self.embedder.embed(&e.body);
-            vindex.upsert(&e.uri, &v)?;
+            let chunks = self.embedder.embed_chunks(&e.body);
+            vindex.upsert_chunks(&e.uri, &chunks)?;
         }
         Ok((all.len(), long))
     }
