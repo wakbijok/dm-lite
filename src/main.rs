@@ -199,6 +199,10 @@ enum Cmd {
     },
     /// Rebuild edges from the [[name]] references in every record body (batch).
     ReindexLinks,
+    /// Re-embed every live record's body into the vector index, healing records whose embedding
+    /// predates an embedder fix (e.g. long bodies that overflowed bge's 512-token limit and were
+    /// stored as a zero vector). Idempotent.
+    ReindexEmbeddings,
     /// Create or update a domain entity (a knowledge-graph node): org, engagement, product,
     /// solution_stack, person, framework, site. Relate entities with `dmem link`.
     Entity {
@@ -534,6 +538,22 @@ fn run() -> Result<()> {
             let n = Memory::open()?.reindex_links()?;
             println!("reindexed: {} [[link]] reference{} linked", n, if n == 1 { "" } else { "s" });
             Ok(())
+        }
+        Cmd::ReindexEmbeddings => {
+            #[cfg(feature = "zvec")]
+            {
+                let (total, long) = Memory::open()?.reindex_embeddings()?;
+                println!(
+                    "re-embedded {total} live record{} ({long} over 2048 bytes)",
+                    if total == 1 { "" } else { "s" }
+                );
+                Ok(())
+            }
+            #[cfg(not(feature = "zvec"))]
+            {
+                println!("built without zvec; no vector index to reindex");
+                Ok(())
+            }
         }
         Cmd::Entity { kind, name, attr, desc, namespace } => {
             let k = entry::Kind::from_str(&kind).filter(|k| k.is_entity()).ok_or_else(|| {

@@ -268,6 +268,30 @@ impl LocalMemory {
         Ok(())
     }
 
+    /// Re-embed every live record's body into the vector index, overwriting its stored vector.
+    /// Heals records whose embedding predates an embedder fix, e.g. bodies that overflowed bge's
+    /// 512 position limit and were stored as a zero vector (invisible to hybrid recall because a
+    /// zero vector never clears the cosine floor). The hashed-PK upsert overwrites in place, so
+    /// this is idempotent and safe to re-run. Skills are excluded: they never enter the recall
+    /// pool. Returns (records re-embedded, of which over 2048 bytes of body).
+    #[cfg(feature = "zvec")]
+    pub fn reindex_embeddings(&self) -> Result<(usize, usize)> {
+        let vindex = self
+            .vindex
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("vector index unavailable; cannot reindex embeddings"))?;
+        let all = self.store.recent(1_000_000)?;
+        let mut long = 0usize;
+        for e in &all {
+            if e.body.len() > 2048 {
+                long += 1;
+            }
+            let v = self.embedder.embed(&e.body);
+            vindex.upsert(&e.uri, &v)?;
+        }
+        Ok((all.len(), long))
+    }
+
     /// Import a record preserving its ORIGINAL creation/valid time (for v1->v2 migration).
     /// System time stays "now" (when we recorded it); valid/created time is the original.
     pub fn import_record_at(&self, kind: Kind, namespace: &str, title: &str, body: &str, created_ms: i64, importance: Option<i64>) -> Result<String> {
@@ -898,6 +922,18 @@ impl Memory {
             Memory::Local(l) => l.reindex_links(),
             #[cfg(feature = "client")]
             Memory::Remote(r) => r.reindex_links(),
+        }
+    }
+    /// Re-embed every live record into the local vector index (embedded mode only; the work is
+    /// local embedding + upsert, so it is not exposed over the remote client).
+    #[cfg(feature = "zvec")]
+    pub fn reindex_embeddings(&self) -> Result<(usize, usize)> {
+        match self {
+            Memory::Local(l) => l.reindex_embeddings(),
+            #[cfg(feature = "client")]
+            Memory::Remote(_) => anyhow::bail!(
+                "reindex-embeddings runs in embedded mode against the local store, not over a remote client"
+            ),
         }
     }
 }
