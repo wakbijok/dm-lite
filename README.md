@@ -7,6 +7,7 @@ daimon-memory v2: a small typed memory engine for AI agents. One binary, client/
 - One memory across your AI tools: the same recall and capture in Claude Code, Codex, Hermes, Devin, and Claude Desktop, with the integration built in (one command per tool), not left for you to wire yourself. Switch tools, keep the same brain. Any MCP client can connect too, and receives the persona and protocols, not only the tools.
 - Typed, curated memory: decisions, lessons, incidents, runbooks, conventions, reminders, and more, each a first-class kind.
 - Hybrid recall: SQLite FTS5 keyword search fused with dense vectors (bge-small via zvec), ranked together.
+- A graph over your memory: link records and mint domain entities (org, product, person, and more), so a recall pulls in a hit's neighbours; browse it offline with `dmem ui`.
 - Bitemporal: two time axes, when a fact is true in the world and when you recorded it. Backdate a fact, end its validity, and recall both what was true at a past moment and what you knew at one. Nothing is overwritten.
 - Client/server in one binary: run it locally, or host it on a VPS, homelab, or cloud box and point your machines at it. Local or remote is just a URL.
 - Multitenant: one database per tenant, token-only IAM (root admin plus per-tenant tokens), built-in TLS (no reverse proxy).
@@ -62,6 +63,6 @@ For CI and scripted ops, point any command at a server without editing the confi
 
 ## Docs
 
-Full documentation is in the [project wiki](https://git.wakbijok.uk/daimon/dm-lite/-/wikis/home): install and first run, wiring each agent, run as a server, run as a client, multitenant admin, persona and governance, migrating from v1, upgrading, and building from source.
+Full documentation is in the [project wiki](https://github.com/wakbijok/dm-lite/wiki): install and first run, wiring each agent, run as a server, run as a client, multitenant admin, persona and governance, migrating from v1, upgrading, and building from source.
 
 License: MIT.
