@@ -1,0 +1,183 @@
+zenith version=1 doc-id="01KW7BE99T8Y8JCM454WZ3EA1V" {
+  project id="proj.dm-brain-6" name="dm-brain-6"
+  assets {
+  }
+  tokens format="zenith-token-v1" {
+    token id="c.bg" type="color" value="#0a0f0c"
+    token id="c.tileA" type="color" value="#0d1411"
+    token id="c.tileB" type="color" value="#0a1f15"
+    token id="c.green" type="color" value="#3fb950"
+    token id="c.bright" type="color" value="#5ef08e"
+    token id="c.white" type="color" value="#eafff1"
+    token id="c.edge" type="color" value="#327f48"
+    token id="c.edgeDim" type="color" value="#1f5230"
+    token id="c.glow" type="color" value="#3fb95066"
+    token id="c.dNode" type="color" value="#5cd8ea"
+    token id="c.dEdge" type="color" value="#3aa6b8"
+    token id="c.dGlow" type="color" value="#5cd8ea99"
+    token id="c.mNode" type="color" value="#b388f5"
+    token id="c.mEdge" type="color" value="#8a63d4"
+    token id="c.mGlow" type="color" value="#b388f599"
+
+    token id="tile.grad" type="gradient" angle=(deg)135 {
+      stop offset=0.0 color=(token)"c.tileA"
+      stop offset=1.0 color=(token)"c.tileB"
+    }
+    token id="glow.soft" type="shadow" {
+      layer color=(token)"c.glow" dx=(px)0 dy=(px)0 blur=(px)34
+    }
+    token id="glow.node" type="shadow" {
+      layer color=(token)"c.glow" dx=(px)0 dy=(px)0 blur=(px)13
+    }
+    token id="glow.d" type="shadow" {
+      layer color=(token)"c.dGlow" dx=(px)0 dy=(px)0 blur=(px)15
+    }
+    token id="glow.m" type="shadow" {
+      layer color=(token)"c.mGlow" dx=(px)0 dy=(px)0 blur=(px)15
+    }
+
+    token id="sw.edge" type="dimension" value=(px)6
+    token id="sw.edgeThin" type="dimension" value=(px)4
+    token id="sw.fissure" type="dimension" value=(px)5
+    token id="r.tile" type="dimension" value=(px)96
+  }
+  styles {
+  }
+  document id="doc.dm-brain-6" title="dm-brain-6" {
+    page id="page.1" w=(px)640 h=(px)640 background=(token)"c.bg" {
+
+      rect id="n.tile" x=(px)85 y=(px)85 w=(px)470 h=(px)470 radius=(token)"r.tile" fill=(token)"tile.grad" shadow=(token)"glow.soft"
+
+      // brain contour (green structure)
+      polyline id="e.crown" stroke=(token)"c.edge" stroke-width=(token)"sw.edge" {
+        point x=(px)200 y=(px)256
+        point x=(px)192 y=(px)210
+        point x=(px)222 y=(px)182
+        point x=(px)258 y=(px)190
+        point x=(px)278 y=(px)166
+        point x=(px)320 y=(px)160
+        point x=(px)362 y=(px)166
+        point x=(px)382 y=(px)190
+        point x=(px)418 y=(px)182
+        point x=(px)448 y=(px)210
+        point x=(px)440 y=(px)252
+      }
+      polyline id="e.rightside" stroke=(token)"c.edge" stroke-width=(token)"sw.edge" {
+        point x=(px)448 y=(px)210
+        point x=(px)478 y=(px)244
+        point x=(px)486 y=(px)292
+        point x=(px)474 y=(px)338
+        point x=(px)444 y=(px)374
+        point x=(px)398 y=(px)396
+      }
+      polyline id="e.base" stroke=(token)"c.edge" stroke-width=(token)"sw.edge" {
+        point x=(px)398 y=(px)396
+        point x=(px)344 y=(px)400
+        point x=(px)294 y=(px)400
+        point x=(px)250 y=(px)396
+      }
+      polyline id="e.cerebellum" stroke=(token)"c.edge" stroke-width=(token)"sw.edge" {
+        point x=(px)250 y=(px)396
+        point x=(px)210 y=(px)408
+        point x=(px)180 y=(px)396
+        point x=(px)168 y=(px)364
+      }
+      polyline id="e.leftside" stroke=(token)"c.edge" stroke-width=(token)"sw.edge" {
+        point x=(px)168 y=(px)364
+        point x=(px)156 y=(px)320
+        point x=(px)164 y=(px)272
+        point x=(px)200 y=(px)256
+      }
+
+      // corpus callosum + fissure (dim green structure)
+      polyline id="e.bridge" stroke=(token)"c.edgeDim" stroke-width=(token)"sw.edge" {
+        point x=(px)228 y=(px)312
+        point x=(px)272 y=(px)320
+        point x=(px)316 y=(px)314
+        point x=(px)356 y=(px)320
+      }
+      polyline id="e.fissure" stroke=(token)"c.edgeDim" stroke-width=(token)"sw.fissure" {
+        point x=(px)320 y=(px)158
+        point x=(px)313 y=(px)192
+        point x=(px)325 y=(px)226
+        point x=(px)316 y=(px)262
+      }
+
+      // 'd' edges (cyan)
+      polyline id="e.dstem" stroke=(token)"c.dEdge" stroke-width=(token)"sw.edge" {
+        point x=(px)225 y=(px)214
+        point x=(px)224 y=(px)356
+      }
+      polyline id="e.dbowl" stroke=(token)"c.dEdge" stroke-width=(token)"sw.edgeThin" {
+        point x=(px)224 y=(px)300
+        point x=(px)196 y=(px)304
+        point x=(px)182 y=(px)330
+        point x=(px)196 y=(px)356
+        point x=(px)224 y=(px)356
+      }
+
+      // 'm' edges (violet)
+      polyline id="e.march" stroke=(token)"c.mEdge" stroke-width=(token)"sw.edgeThin" {
+        point x=(px)356 y=(px)356
+        point x=(px)356 y=(px)286
+        point x=(px)360 y=(px)262
+        point x=(px)372 y=(px)246
+        point x=(px)388 y=(px)246
+        point x=(px)398 y=(px)262
+        point x=(px)400 y=(px)290
+        point x=(px)402 y=(px)264
+        point x=(px)410 y=(px)246
+        point x=(px)426 y=(px)242
+        point x=(px)440 y=(px)252
+        point x=(px)446 y=(px)272
+        point x=(px)446 y=(px)356
+      }
+      polyline id="e.mbase" stroke=(token)"c.mEdge" stroke-width=(token)"sw.edgeThin" {
+        point x=(px)356 y=(px)356
+        point x=(px)400 y=(px)356
+        point x=(px)446 y=(px)356
+      }
+      polyline id="e.mlink" stroke=(token)"c.mEdge" stroke-width=(token)"sw.edgeThin" {
+        point x=(px)400 y=(px)290
+        point x=(px)400 y=(px)356
+      }
+
+      // structure nodes (uniform green)
+      ellipse id="n.c1" x=(px)183 y=(px)201 w=(px)18 h=(px)18 fill=(token)"c.green"
+      ellipse id="n.c2" x=(px)249 y=(px)181 w=(px)18 h=(px)18 fill=(token)"c.green"
+      ellipse id="n.c3" x=(px)311 y=(px)151 w=(px)18 h=(px)18 fill=(token)"c.green"
+      ellipse id="n.c4" x=(px)373 y=(px)181 w=(px)18 h=(px)18 fill=(token)"c.green"
+      ellipse id="n.c5" x=(px)439 y=(px)201 w=(px)18 h=(px)18 fill=(token)"c.green"
+      ellipse id="n.r1" x=(px)477 y=(px)283 w=(px)18 h=(px)18 fill=(token)"c.green"
+      ellipse id="n.r2" x=(px)465 y=(px)329 w=(px)18 h=(px)18 fill=(token)"c.green"
+      ellipse id="n.r3" x=(px)389 y=(px)387 w=(px)18 h=(px)18 fill=(token)"c.green"
+      ellipse id="n.bs1" x=(px)335 y=(px)391 w=(px)18 h=(px)18 fill=(token)"c.green"
+      ellipse id="n.bs2" x=(px)285 y=(px)391 w=(px)18 h=(px)18 fill=(token)"c.green"
+      ellipse id="n.cb1" x=(px)241 y=(px)387 w=(px)18 h=(px)18 fill=(token)"c.green"
+      ellipse id="n.cb2" x=(px)171 y=(px)387 w=(px)18 h=(px)18 fill=(token)"c.green"
+      ellipse id="n.lo1" x=(px)147 y=(px)311 w=(px)18 h=(px)18 fill=(token)"c.green"
+      ellipse id="n.lo2" x=(px)191 y=(px)247 w=(px)18 h=(px)18 fill=(token)"c.green"
+      ellipse id="n.br1" x=(px)264 y=(px)312 w=(px)16 h=(px)16 fill=(token)"c.green"
+      ellipse id="n.br2" x=(px)308 y=(px)306 w=(px)16 h=(px)16 fill=(token)"c.green"
+
+      // 'd' neuron nodes (cyan, glowing)
+      ellipse id="n.d1" x=(px)215 y=(px)204 w=(px)20 h=(px)20 fill=(token)"c.dNode" shadow=(token)"glow.d"
+      ellipse id="n.d2" x=(px)214 y=(px)290 w=(px)20 h=(px)20 fill=(token)"c.dNode" shadow=(token)"glow.d"
+      ellipse id="n.d3" x=(px)214 y=(px)346 w=(px)20 h=(px)20 fill=(token)"c.dNode" shadow=(token)"glow.d"
+      ellipse id="n.d4" x=(px)172 y=(px)320 w=(px)20 h=(px)20 fill=(token)"c.dNode" shadow=(token)"glow.d"
+      ellipse id="n.d5" x=(px)187 y=(px)295 w=(px)16 h=(px)16 fill=(token)"c.dNode" shadow=(token)"glow.d"
+      ellipse id="n.d6" x=(px)187 y=(px)347 w=(px)16 h=(px)16 fill=(token)"c.dNode" shadow=(token)"glow.d"
+
+      // 'm' neuron nodes (violet, glowing)
+      ellipse id="n.m1" x=(px)347 y=(px)277 w=(px)20 h=(px)20 fill=(token)"c.mNode" shadow=(token)"glow.m"
+      ellipse id="n.m2" x=(px)371 y=(px)237 w=(px)20 h=(px)20 fill=(token)"c.mNode" shadow=(token)"glow.m"
+      ellipse id="n.m3" x=(px)391 y=(px)281 w=(px)16 h=(px)16 fill=(token)"c.mNode" shadow=(token)"glow.m"
+      ellipse id="n.m4" x=(px)409 y=(px)233 w=(px)20 h=(px)20 fill=(token)"c.mNode" shadow=(token)"glow.m"
+      ellipse id="n.m5" x=(px)437 y=(px)263 w=(px)16 h=(px)16 fill=(token)"c.mNode" shadow=(token)"glow.m"
+      ellipse id="n.m6" x=(px)347 y=(px)347 w=(px)20 h=(px)20 fill=(token)"c.mNode" shadow=(token)"glow.m"
+      ellipse id="n.m7" x=(px)391 y=(px)347 w=(px)20 h=(px)20 fill=(token)"c.mNode" shadow=(token)"glow.m"
+      ellipse id="n.m8" x=(px)437 y=(px)347 w=(px)20 h=(px)20 fill=(token)"c.mNode" shadow=(token)"glow.m"
+
+    }
+  }
+}

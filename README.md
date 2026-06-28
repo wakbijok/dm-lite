@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/dm-lite-banner.png" alt="dm-lite, the daimon-memory successor" width="840">
+</p>
+
 # dm-lite
 
 daimon-memory v2: a small typed memory engine for AI agents. One binary, client/server: run `dmem serve` locally (a managed loopback daemon) or on a host, and point the CLI and agent hooks at it (local versus remote is just the URL). Hybrid recall (keyword and dense vector), bitemporal history, and multitenant storage (one database per tenant).

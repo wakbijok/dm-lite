@@ -1,0 +1,54 @@
+zenith version=1 doc-id="01KW7C0A0BANNER0DMLITE0FIN1" {
+  project id="proj.dm-lite-banner" name="dm-lite banner"
+  assets {
+    asset id="img.icon" kind="image" src="dm-lite-icon.png"
+  }
+  tokens format="zenith-token-v1" {
+    token id="c.bg" type="color" value="#0a0f0c"
+    token id="c.fg" type="color" value="#f0f6fc"
+    token id="c.dim" type="color" value="#aeb8c4"
+    token id="c.green" type="color" value="#56e08a"
+    token id="c.cyan" type="color" value="#5cd8ea"
+    token id="c.violet" type="color" value="#b388f5"
+    token id="c.glowCore" type="color" value="#123a2333"
+    token id="c.glowEdge" type="color" value="#0a0f0c00"
+    token id="font.mono" type="fontFamily" value="Noto Sans Mono"
+    token id="font.sans" type="fontFamily" value="Noto Sans"
+    token id="w.bold" type="fontWeight" value=700
+    token id="size.word" type="dimension" value=(px)92
+    token id="size.eye" type="dimension" value=(px)26
+    token id="size.tag" type="dimension" value=(px)32
+    token id="size.ver" type="dimension" value=(px)22
+    token id="grad.glow" type="gradient" radial=#true center-x=0.5 center-y=0.5 radius=0.5 {
+      stop offset=0.0 color=(token)"c.glowCore"
+      stop offset=1.0 color=(token)"c.glowEdge"
+    }
+  }
+  styles {
+  }
+  document id="doc.dm-lite-banner" title="dm-lite banner" {
+    page id="page.1" w=(px)1280 h=(px)640 background=(token)"c.bg" {
+      ellipse id="glow" x=(px)40 y=(px)60 w=(px)560 h=(px)520 fill=(token)"grad.glow"
+
+      image id="icon" asset="img.icon" x=(px)64 y=(px)110 w=(px)420 h=(px)420 fit="contain"
+
+      text id="eyebrow" x=(px)540 y=(px)214 w=(px)680 h=(px)36 font-family=(token)"font.mono" font-size=(token)"size.eye" fill=(token)"c.green" {
+        span "the daimon-memory successor"
+      }
+
+      text id="wordmark" x=(px)538 y=(px)252 w=(px)700 h=(px)134 font-family=(token)"font.mono" font-size=(token)"size.word" font-weight=(token)"w.bold" {
+        span "d" fill=(token)"c.cyan"
+        span "m" fill=(token)"c.violet"
+        span "-lite" fill=(token)"c.fg"
+      }
+
+      text id="tagline" x=(px)540 y=(px)392 w=(px)700 h=(px)44 font-family=(token)"font.sans" font-size=(token)"size.tag" fill=(token)"c.fg" {
+        span "Persistent memory for your AI agents"
+      }
+
+      text id="ver" x=(px)540 y=(px)452 w=(px)700 h=(px)32 font-family=(token)"font.mono" font-size=(token)"size.ver" fill=(token)"c.dim" {
+        span "v0.1.0  ·  first stable release"
+      }
+    }
+  }
+}
