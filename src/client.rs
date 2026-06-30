@@ -5,7 +5,7 @@
 
 use crate::config::ServerLink;
 use crate::entry::{Edge, Entry, Kind};
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
 
 pub struct RemoteClient {
@@ -25,7 +25,7 @@ impl RemoteClient {
             let cert = reqwest::Certificate::from_pem(&pem).map_err(|e| anyhow!("parse ca_cert: {e}"))?;
             b = b.add_root_certificate(cert);
         }
-        let http = b.build().map_err(|e| anyhow!("build http client: {e}"))?;
+        let http = b.build().context("build http client")?;
         Ok(Self {
             base: link.url.trim_end_matches('/').to_string(),
             token: link.token.clone(),
@@ -40,7 +40,9 @@ impl RemoteClient {
             .bearer_auth(&self.token)
             .json(&body)
             .send()
-            .map_err(|e| anyhow!("POST {path}: {e}"))?;
+            // `.context` (not `anyhow!("{e}")`) preserves the reqwest error as a source, so
+            // `main`'s `{:#}` walks the whole chain (reqwest -> connect -> rustls -> root cause).
+            .with_context(|| format!("POST {path}"))?;
         let status = resp.status();
         let text = resp.text().unwrap_or_default();
         if !status.is_success() {
@@ -58,7 +60,7 @@ impl RemoteClient {
             .get(format!("{}{}", self.base, path))
             .bearer_auth(&self.token)
             .send()
-            .map_err(|e| anyhow!("GET {path}: {e}"))?;
+            .with_context(|| format!("GET {path}"))?;
         let status = resp.status();
         let text = resp.text().unwrap_or_default();
         if !status.is_success() {
