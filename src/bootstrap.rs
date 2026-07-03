@@ -34,20 +34,26 @@ pub fn has_memory_hooks(config_path: &Path) -> bool {
 }
 
 /// Merge dm's hooks into a config file's `hooks` key (or, with `remove`, drop them). Idempotent:
-/// always drops any prior dm entries (matched by the dm binary path) first.
-fn install_into(config_path: &Path, dm: &str, remove: bool) -> Result<()> {
+/// always drops any prior dm entries (matched by the dm binary path) first. Returns false when
+/// the existing file is not strict JSON: these are the user's LIVE settings (permissions, env,
+/// other tools' hooks) - replacing an unparseable file with `{}` destroys all of it, so refuse
+/// and let the caller say so. A parseable file is backed up to `<file>.dmbak` before rewrite.
+fn install_into(config_path: &Path, dm: &str, remove: bool) -> Result<bool> {
     let mut root: Value = if config_path.exists() {
         let raw = std::fs::read_to_string(config_path)
             .with_context(|| format!("read {}", config_path.display()))?;
-        if raw.contains("//") || raw.contains("/*") {
-            eprintln!("  warn: {} may contain comments; they could be lost on rewrite", config_path.display());
+        match serde_json::from_str(&raw) {
+            Ok(v) => v,
+            Err(_) => return Ok(false),
         }
-        serde_json::from_str(&raw).unwrap_or_else(|_| json!({}))
     } else {
         json!({})
     };
     if !root.is_object() {
         root = json!({});
+    }
+    if config_path.exists() {
+        let _ = std::fs::copy(config_path, PathBuf::from(format!("{}.dmbak", config_path.display())));
     }
     let hooks = root
         .as_object_mut()
@@ -105,7 +111,7 @@ fn install_into(config_path: &Path, dm: &str, remove: bool) -> Result<()> {
     let mut out = serde_json::to_string_pretty(&root)?;
     out.push('\n');
     std::fs::write(config_path, out).with_context(|| format!("write {}", config_path.display()))?;
-    Ok(())
+    Ok(true)
 }
 
 /// Ensure `doc[key]` is a table (create an empty one if it is missing or a non-table).
@@ -512,10 +518,21 @@ fn claude_desktop_install(dm: &str, remove: bool) -> Result<()> {
     }
     let existing: Value = if path.exists() {
         let raw = std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-        serde_json::from_str(&raw).unwrap_or_else(|_| json!({}))
+        match serde_json::from_str(&raw) {
+            Ok(v) => v,
+            Err(e) => {
+                // Users hand-edit this file for MCP servers; replacing an unparseable copy
+                // with only our entry would drop every other server. Refuse instead.
+                println!("  skip Claude Desktop -> {} is not valid JSON ({e}); fix it and re-run (nothing was changed).", path.display());
+                return Ok(());
+            }
+        }
     } else {
         json!({})
     };
+    if path.exists() {
+        let _ = std::fs::copy(&path, PathBuf::from(format!("{}.dmbak", path.display())));
+    }
     let root = desktop_merge(existing, dm, remove);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -568,7 +585,7 @@ const DMEM = __DMEM__; // absolute dmem path, substituted by `dmem bootstrap --o
 const TIMEOUT_MS = 8000;
 const NUDGE_COOLDOWN_MS = 15 * 60_000;
 
-export const DmemPlugin = async ({ $, client }: any) => {
+export const DmemPlugin = async ({ client }: any) => {
   // The file can be discovered twice (config `plugin` entry + directory scan); register once.
   const g = globalThis as any;
   if (g.__dmemPluginLoaded) return {};
@@ -579,22 +596,24 @@ export const DmemPlugin = async ({ $, client }: any) => {
   let lastRecall: { key: string; text: string } | null = null; // transform fires twice per turn
   let lastNudgeAt = 0;
 
-  // Shell out to dmem; empty string on ANY failure (missing binary, non-zero exit, timeout).
-  // `stdin` rides a Response redirect: argv escaping differs across bundled shell versions
-  // (spaced values can arrive quote-wrapped), but stdin bytes are always verbatim.
+  // Shell out to dmem via Bun.spawn: argv reaches the child verbatim (no shell parsing, so
+  // no quote-wrapping surprises), the prompt rides stdin, and the timeout KILLS the child -
+  // a wedged dmem (server unreachable, cold-start download) must not accumulate processes
+  // across a long session. Empty string on ANY failure.
   const dmem = async (args: string[], stdin?: string): Promise<string> => {
     try {
-      const cmd =
-        stdin === undefined
-          ? $`${DMEM} ${args}`
-          : $`${DMEM} ${args} < ${new Response(stdin)}`;
-      const run = cmd.quiet().nothrow();
-      const out: any = await Promise.race([
-        run,
-        new Promise((resolve) => setTimeout(() => resolve(null), TIMEOUT_MS)),
-      ]);
-      if (!out || out.exitCode !== 0) return "";
-      return out.stdout.toString("utf8").trim();
+      const proc = Bun.spawn([DMEM, ...args], {
+        stdin: stdin === undefined ? "ignore" : new Response(stdin),
+        stdout: "pipe",
+        stderr: "ignore",
+      });
+      const timer = setTimeout(() => {
+        try { proc.kill(); } catch {}
+      }, TIMEOUT_MS);
+      const out = await new Response(proc.stdout).text();
+      const code = await proc.exited;
+      clearTimeout(timer);
+      return code === 0 ? out.trim() : "";
     } catch {
       return "";
     }
@@ -610,14 +629,22 @@ export const DmemPlugin = async ({ $, client }: any) => {
           .map((p: any) => p.text)
           .join("\n")
           .trim();
-        if (sid && text) lastPrompt.set(sid, text);
+        if (sid && text) {
+          // refresh insertion order, then evict the oldest session past the cap - the stash
+          // must not grow without bound across a long multi-session TUI run
+          lastPrompt.delete(sid);
+          lastPrompt.set(sid, text);
+          if (lastPrompt.size > 64) lastPrompt.delete(lastPrompt.keys().next().value);
+        }
       } catch {}
     },
 
     // Persona + protocols (fetched once, cached) and per-prompt recall -> system prompt.
     "experimental.chat.system.transform": async (input: any, output: any) => {
       try {
-        if (persona === null) persona = await dmem(["hook", "session_start", "--raw"]);
+        // cache only a NON-EMPTY persona: a failed first fetch (dmem still starting) must
+        // retry on later turns, not stick as permanently absent for the process lifetime
+        if (!persona) persona = (await dmem(["hook", "session_start", "--raw"])) || null;
         if (persona) output.system.push(persona);
         const sid = input?.sessionID;
         const prompt = sid ? lastPrompt.get(sid) : undefined;
@@ -809,7 +836,10 @@ pub fn run_mode(devin: bool, claude: bool, codex: bool, hermes: bool, opencode: 
             println!("  skip {} (no {} found)", name, path.parent().map(|p| p.display().to_string()).unwrap_or_default());
             continue;
         }
-        install_into(path, &dm, remove)?;
+        if !install_into(path, &dm, remove)? {
+            println!("  skip {} -> {} is not valid JSON; fix it and re-run (nothing was changed).", name, path.display());
+            continue;
+        }
         // Parity with codex/hermes: also wire the MCP save tools via the agent's own `mcp` CLI.
         // Hooks alone give persona + recall; the remember/log_* tools come from the MCP server.
         let (cli, add, rm): (&str, Vec<&str>, Vec<&str>) = if i == 0 {
@@ -922,6 +952,24 @@ mod tests {
         // a malformed (non-object) config becomes a clean object with our entry
         let from_garbage = desktop_merge(serde_json::json!("not an object"), "/abs/dmem", false);
         assert_eq!(from_garbage["mcpServers"]["dmem"]["command"], "/abs/dmem");
+    }
+
+    #[test]
+    fn install_refuses_unparseable_config_and_backs_up_valid_ones() {
+        let dir = std::env::temp_dir().join(format!("dmboot3-{}-{}", std::process::id(), crate::entry::now_ms()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = dir.join("config.json");
+        // a trailing comma (the classic hand-edit slip) must refuse, byte-identical
+        let broken = "{ \"permissions\": { \"allow\": [\"Bash(git *)\",] } }";
+        std::fs::write(&cfg, broken).unwrap();
+        assert!(!install_into(&cfg, "/path/to/dmem", false).unwrap(), "unparseable config refused");
+        assert_eq!(std::fs::read_to_string(&cfg).unwrap(), broken, "refused file untouched");
+        // a valid config is backed up before the rewrite and its keys survive
+        std::fs::write(&cfg, r#"{"env":{"KEEP":"1"}}"#).unwrap();
+        assert!(install_into(&cfg, "/path/to/dmem", false).unwrap());
+        assert!(dir.join("config.json.dmbak").exists(), "backup written before rewrite");
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(v["env"]["KEEP"], "1", "unrelated keys preserved");
     }
 
     #[test]
