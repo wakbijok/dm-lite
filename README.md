@@ -8,7 +8,7 @@ daimon-memory v2: a small typed memory engine for AI agents. One binary, client/
 
 ## Features
 
-- One memory across your AI tools: the same recall and capture in Claude Code, Codex, Hermes, Devin, and Claude Desktop, with the integration built in (one command per tool), not left for you to wire yourself. Switch tools, keep the same brain. Any MCP client can connect too, and receives the persona and protocols, not only the tools.
+- One memory across your AI tools: the same recall and capture in Claude Code, Codex, Hermes, Devin, OpenCode, and Claude Desktop, with the integration built in (one command per tool), not left for you to wire yourself. Switch tools, keep the same brain. Any MCP client can connect too, and receives the persona and protocols, not only the tools.
 - Typed, curated memory: decisions, lessons, incidents, runbooks, conventions, reminders, and more, each a first-class kind.
 - Hybrid recall: SQLite FTS5 keyword search fused with dense vectors (bge-small via zvec), ranked together.
 - A graph over your memory: link records and mint domain entities (org, product, person, and more), so a recall pulls in a hit's neighbours; browse it offline with `dmem ui`.
@@ -38,7 +38,7 @@ dmem recall "vector store decision"
 Wire it into an agent (one command each, or `--all`):
 
 ```bash
-dmem bootstrap --claude     # or --codex / --hermes / --devin / --claude-desktop / --all
+dmem bootstrap --claude     # or --codex / --hermes / --devin / --opencode / --claude-desktop / --all
 ```
 
 Out of the box this runs on one machine: the server and your client live together. To run the server on one host and connect clients from elsewhere, see the wiki.
