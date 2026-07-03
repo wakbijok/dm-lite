@@ -88,6 +88,10 @@ enum Cmd {
         /// emit Hermes-shape output ({"context": ...}) and read Hermes hook-input fields
         #[arg(long, global = true)]
         hermes: bool,
+        /// emit the text verbatim (no JSON envelope) for hosts that inject strings directly
+        /// (e.g. the OpenCode plugin pushes hook output onto the system prompt)
+        #[arg(long, global = true, conflicts_with = "hermes")]
+        raw: bool,
     },
     /// Save a typed Decision.
     LogDecision {
@@ -435,13 +439,13 @@ fn run() -> Result<()> {
         Cmd::Bootstrap { devin, claude, codex, hermes, claude_desktop, all, remove } => {
             bootstrap::run_mode(devin || all, claude || all, codex || all, hermes || all, claude_desktop || all, remove)
         }
-        Cmd::Hook { event, hermes } => match event {
-            HookCmd::SessionStart => hooks::session_start(hermes),
+        Cmd::Hook { event, hermes, raw } => match event {
+            HookCmd::SessionStart => hooks::session_start(hermes, raw),
             HookCmd::UserPromptSubmit { prompt } => {
                 let arg = if prompt.is_empty() { None } else { Some(prompt.join(" ")) };
-                hooks::user_prompt_submit(arg, hermes)
+                hooks::user_prompt_submit(arg, hermes, raw)
             }
-            HookCmd::SessionEnd => hooks::session_end(),
+            HookCmd::SessionEnd => hooks::session_end(raw),
         },
         Cmd::LogDecision { title, context, decision, rationale, namespace } => {
             let uri = Memory::open()?.log_decision(&title, &context, &decision, &rationale, &namespace)?;

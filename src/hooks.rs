@@ -1,26 +1,37 @@
-//! Hook handlers invoked by the host agent (Devin, Claude Code, Codex, Hermes) on lifecycle
-//! events. By default they emit a Claude-Code-compatible additionalContext payload on stdout,
-//! which Devin, Claude Code, and Codex (same hook shape) inject into the model context. With
-//! `--hermes` they emit Hermes's `{"context": ...}` shape and read Hermes's hook-input fields
-//! instead - Hermes has no context-injecting SessionStart, so persona rides the first
-//! pre_llm_call (see `user_prompt_submit`).
+//! Hook handlers invoked by the host agent (Devin, Claude Code, Codex, Hermes, OpenCode) on
+//! lifecycle events. By default they emit a Claude-Code-compatible additionalContext payload on
+//! stdout, which Devin, Claude Code, and Codex (same hook shape) inject into the model context.
+//! With `--hermes` they emit Hermes's `{"context": ...}` shape and read Hermes's hook-input
+//! fields instead - Hermes has no context-injecting SessionStart, so persona rides the first
+//! pre_llm_call (see `user_prompt_submit`). With `--raw` they emit the text verbatim (no JSON
+//! envelope) for hosts that inject strings directly - the OpenCode plugin pushes hook output
+//! onto the system prompt as-is.
 
 use crate::render;
 use crate::tools::Memory;
 use anyhow::Result;
 use std::io::Read;
 
-/// Emit a hook injection in the host's shape. Empty text = inject nothing (turn proceeds).
-fn emit(event: &str, text: &str, hermes: bool) {
+/// Format a hook injection in the host's shape. None = inject nothing (turn proceeds).
+fn format_output(event: &str, text: &str, hermes: bool, raw: bool) -> Option<String> {
     if text.trim().is_empty() {
-        return;
+        return None;
     }
-    let out = if hermes {
-        serde_json::json!({ "context": text })
+    Some(if raw {
+        text.to_string()
+    } else if hermes {
+        serde_json::json!({ "context": text }).to_string()
     } else {
         serde_json::json!({ "hookSpecificOutput": { "hookEventName": event, "additionalContext": text } })
-    };
-    println!("{}", out);
+            .to_string()
+    })
+}
+
+/// Emit a hook injection on stdout. Empty text = inject nothing.
+fn emit(event: &str, text: &str, hermes: bool, raw: bool) {
+    if let Some(out) = format_output(event, text, hermes, raw) {
+        println!("{}", out);
+    }
 }
 
 /// Read the hook event JSON from stdin once (best-effort), returning both the raw text (for
@@ -65,11 +76,18 @@ fn debug_log(event: &str, hermes: bool, raw_stdin: &str, prompt: &str, first_tur
 /// rides the per-prompt UserPromptSubmit hook, NOT here, so the payload stays under Claude Code's
 /// 10,000-char hook-stdout cap (see render::SESSION_BUDGET; over the cap CC persists the block to
 /// a file and injects only a ~2KB preview, dropping the protocols from live context).
-pub fn session_start(hermes: bool) -> Result<()> {
+pub fn session_start(hermes: bool, raw: bool) -> Result<()> {
     let m = Memory::open()?;
     let persona = m.persona().unwrap_or_default();
     let reminders = m.reminders(5).unwrap_or_default();
-    emit("SessionStart", &render::render_session(&persona, &reminders), hermes);
+    // Raw consumers inject straight into a system prompt, so use the plain-markdown bootstrap
+    // projection (no injection fence); hook-JSON consumers keep the fenced session block.
+    let text = if raw {
+        render::render_bootstrap(&persona, &reminders)
+    } else {
+        render::render_session(&persona, &reminders)
+    };
+    emit("SessionStart", &text, hermes, raw);
     Ok(())
 }
 
@@ -85,11 +103,21 @@ fn should_nudge(latest_save_ms: Option<i64>, now_ms: i64) -> bool {
     }
 }
 
-/// SessionEnd: intentionally a no-op. Claude Code's SessionEnd schema forbids injecting
-/// context (the session is ending), so the save-discipline nudge rides UserPromptSubmit
-/// instead (see `user_prompt_submit`). Kept as a valid subcommand so any older wiring that
-/// still calls it exits cleanly with no output.
-pub fn session_end() -> Result<()> {
+/// SessionEnd: a no-op for hook-JSON hosts - Claude Code's SessionEnd schema forbids injecting
+/// context (the session is ending), so there the save-discipline nudge rides UserPromptSubmit
+/// instead (see `user_prompt_submit`), and any older wiring that still calls it exits cleanly
+/// with no output. With `--raw` it becomes a real end-of-session check for hosts that CAN act
+/// on it (the OpenCode plugin calls it on session.idle and shows a toast): print the nudge when
+/// this session's work looks uncaptured, nothing otherwise.
+pub fn session_end(raw: bool) -> Result<()> {
+    if !raw {
+        return Ok(());
+    }
+    let m = Memory::open()?;
+    let latest = m.latest_save_ms().ok().flatten();
+    if should_nudge(latest, crate::entry::now_ms()) {
+        emit("SessionEnd", &render::render_nudge(), false, true);
+    }
     Ok(())
 }
 
@@ -98,7 +126,7 @@ pub fn session_end() -> Result<()> {
 /// uncaptured. Claude/Codex put the prompt at top-level `prompt`; Hermes passes it as
 /// `extra.user_message` (is_first_turn is still captured for diagnostics). For Hermes the
 /// persona/protocols are NOT injected here; they live in SOUL.md (always-on system prompt).
-pub fn user_prompt_submit(arg: Option<String>, hermes: bool) -> Result<()> {
+pub fn user_prompt_submit(arg: Option<String>, hermes: bool, raw: bool) -> Result<()> {
     let (raw_in, input) = read_stdin();
     let prompt = arg
         .filter(|s| !s.trim().is_empty())
@@ -151,7 +179,7 @@ pub fn user_prompt_submit(arg: Option<String>, hermes: bool) -> Result<()> {
     }
     let text = blocks.join("\n");
     debug_log("user_prompt_submit", hermes, &raw_in, &prompt, first_turn, text.len());
-    emit("UserPromptSubmit", &text, hermes);
+    emit("UserPromptSubmit", &text, hermes, raw);
     Ok(())
 }
 
@@ -165,6 +193,29 @@ mod tests {
         assert!(should_nudge(None, now), "no saves -> nudge");
         assert!(should_nudge(Some(now - 31 * 60_000), now), "stale (>30m) -> nudge");
         assert!(!should_nudge(Some(now - 5 * 60_000), now), "fresh (<30m) -> no nudge");
+    }
+
+    #[test]
+    fn format_output_shapes_per_host() {
+        // default: Claude-Code hook JSON envelope
+        let cc = format_output("SessionStart", "hello", false, false).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&cc).unwrap();
+        assert_eq!(v["hookSpecificOutput"]["hookEventName"], "SessionStart");
+        assert_eq!(v["hookSpecificOutput"]["additionalContext"], "hello");
+        // hermes: {"context": ...}
+        let he = format_output("SessionStart", "hello", true, false).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&he).unwrap();
+        assert_eq!(v["context"], "hello");
+        // raw: the text verbatim, NOT JSON (quotes/newlines must survive unescaped)
+        let text = "line one\nsays \"hi\"";
+        assert_eq!(format_output("SessionStart", text, false, true).unwrap(), text);
+    }
+
+    #[test]
+    fn format_output_empty_text_injects_nothing() {
+        assert!(format_output("SessionStart", "", false, false).is_none());
+        assert!(format_output("SessionStart", "  \n ", false, true).is_none());
+        assert!(format_output("SessionStart", "", true, false).is_none());
     }
 
     #[test]
