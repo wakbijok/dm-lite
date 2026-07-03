@@ -72,6 +72,9 @@ enum Cmd {
         codex: bool,
         #[arg(long)]
         hermes: bool,
+        /// OpenCode (TypeScript plugin for persona/recall/idle-nudge + an mcp.dmem entry).
+        #[arg(long)]
+        opencode: bool,
         /// Claude Desktop (MCP only; no hooks). Adds an mcpServers.dmem entry.
         #[arg(long = "claude-desktop")]
         claude_desktop: bool,
@@ -436,8 +439,8 @@ fn run() -> Result<()> {
     match cli.cmd {
         #[cfg(feature = "wizard")]
         Cmd::Setup => setup::run(),
-        Cmd::Bootstrap { devin, claude, codex, hermes, claude_desktop, all, remove } => {
-            bootstrap::run_mode(devin || all, claude || all, codex || all, hermes || all, claude_desktop || all, remove)
+        Cmd::Bootstrap { devin, claude, codex, hermes, opencode, claude_desktop, all, remove } => {
+            bootstrap::run_mode(devin || all, claude || all, codex || all, hermes || all, opencode || all, claude_desktop || all, remove)
         }
         Cmd::Hook { event, hermes, raw } => match event {
             HookCmd::SessionStart => hooks::session_start(hermes, raw),
@@ -813,6 +816,15 @@ fn status() -> Result<()> {
     if let Some(h) = dirs::home_dir() {
         println!("devin  : {}", wired(&h.join(".config/devin/config.json"), "dmem hook"));
         println!("claude : {}", wired(&h.join(".claude/settings.json"), "dmem hook"));
+        // OpenCode merges config.json < opencode.json < opencode.jsonc; probe the winner.
+        let oc = ["opencode.jsonc", "opencode.json", "config.json"]
+            .iter()
+            .map(|f| h.join(".config/opencode").join(f))
+            .find(|p| p.exists());
+        match oc {
+            Some(p) => println!("opencode: {}", wired(&p, "dmem")),
+            None => println!("opencode: not found"),
+        }
     }
     Ok(())
 }
