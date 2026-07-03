@@ -657,7 +657,8 @@ fn generate_self_signed(addr: &str) -> Result<(String, String)> {
         let _ = std::fs::create_dir_all(&tdir);
         let cpath = tdir.join("cert.pem");
         let _ = std::fs::write(&cpath, &cert_pem);
-        let _ = std::fs::write(tdir.join("key.pem"), &key_pem);
+        // the private key is a secret: 0600, unlike the (public) cert beside it
+        let _ = crate::config::write_secret(&tdir.join("key.pem"), &key_pem);
         eprintln!("dmem serve: generated self-signed cert at {}", cpath.display());
         eprintln!("           clients: set `ca_cert` to that file (or `insecure = true`)");
     }
