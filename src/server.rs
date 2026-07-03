@@ -452,7 +452,12 @@ async fn neighbors_h(State(st): State<AppState>, headers: HeaderMap, Json(req): 
 
 async fn recall_expanded_h(State(st): State<AppState>, headers: HeaderMap, Json(req): Json<RecallExpandedReq>) -> ApiResp {
     with_tenant(&st, &headers, false, move |m| {
-        Ok(json!(m.recall_expanded(&req.query, req.limit.unwrap_or(6).min(MAX_LIMIT), req.depth.unwrap_or(1).min(5))?))
+        // Split shape so clients can render the graph's contribution distinguishably; older
+        // clients that expected a flat array must upgrade alongside the server (single-admin
+        // deployment; the hook path degrades to plain /recall on a decode failure).
+        let (seeds, neighbors) =
+            m.recall_expanded_split(&req.query, req.limit.unwrap_or(6).min(MAX_LIMIT), req.depth.unwrap_or(1).min(5))?;
+        Ok(json!({ "seeds": seeds, "neighbors": neighbors }))
     })
     .await
 }

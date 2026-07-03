@@ -160,12 +160,28 @@ pub fn user_prompt_submit(arg: Option<String>, hermes: bool, raw: bool) -> Resul
     // connected-but-not-similar context rides along (only where edges exist; lean otherwise).
     // Depth is env-dialable via DM_RECALL_EXPAND (default 1; 0 = plain recall).
     let depth = crate::config::recall_expand_depth();
-    let hits = if depth == 0 {
-        m.recall(&prompt, 6).unwrap_or_default()
-    } else {
-        m.recall_expanded(&prompt, 6, depth).unwrap_or_default()
+    let plain = |what: &str| {
+        m.recall(&prompt, 6).unwrap_or_else(|e| {
+            eprintln!("dmem hook: {what} recall failed ({e:#}); injecting nothing");
+            Vec::new()
+        })
     };
-    let recall = render::render_recall(&hits);
+    // A degraded graph path must NOT take recall down with it: on expansion failure (server
+    // skew, transient network) fall back to the plain seeds and say so on stderr, instead of
+    // silently injecting nothing - "memory had nothing to say" and "memory is broken" must
+    // stay distinguishable.
+    let (seeds, neighbors) = if depth == 0 {
+        (plain("plain"), Vec::new())
+    } else {
+        match m.recall_expanded_split(&prompt, 6, depth) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("dmem hook: graph-expanded recall failed ({e:#}); falling back to plain recall");
+                (plain("fallback plain"), Vec::new())
+            }
+        }
+    };
+    let recall = render::render_recall_split(&seeds, &neighbors);
     if !recall.trim().is_empty() {
         blocks.push(recall);
     }

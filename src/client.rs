@@ -208,7 +208,25 @@ impl RemoteClient {
         serde_json::from_value(v).map_err(|e| anyhow!("decode neighbors: {e}"))
     }
     pub fn recall_expanded(&self, query: &str, limit: usize, depth: usize) -> Result<Vec<Entry>> {
-        self.list("/recall_expanded", json!({ "query": query, "limit": limit, "depth": depth }))
+        let (mut seeds, neighbors) = self.recall_expanded_split(query, limit, depth)?;
+        seeds.extend(neighbors);
+        Ok(seeds)
+    }
+    pub fn recall_expanded_split(&self, query: &str, limit: usize, depth: usize) -> Result<(Vec<Entry>, Vec<Entry>)> {
+        let v = self.post("/recall_expanded", json!({ "query": query, "limit": limit, "depth": depth }))?;
+        // New servers return {"seeds": [...], "neighbors": [...]}; an older server returns a
+        // flat array - treat that as all-seeds so version skew degrades to unmarked output,
+        // not an error.
+        if v.is_array() {
+            return serde_json::from_value(v)
+                .map(|seeds| (seeds, Vec::new()))
+                .map_err(|e| anyhow!("decode /recall_expanded (flat): {e}"));
+        }
+        let seeds = serde_json::from_value(v.get("seeds").cloned().unwrap_or_else(|| json!([])))
+            .map_err(|e| anyhow!("decode /recall_expanded seeds: {e}"))?;
+        let neighbors = serde_json::from_value(v.get("neighbors").cloned().unwrap_or_else(|| json!([])))
+            .map_err(|e| anyhow!("decode /recall_expanded neighbors: {e}"))?;
+        Ok((seeds, neighbors))
     }
     pub fn reindex_links(&self) -> Result<usize> {
         let v = self.post("/reindex_links", json!({}))?;
