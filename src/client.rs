@@ -16,7 +16,11 @@ pub struct RemoteClient {
 
 impl RemoteClient {
     pub fn new(link: &ServerLink) -> Result<Self> {
-        let mut b = reqwest::blocking::Client::builder().timeout(std::time::Duration::from_secs(15));
+        // connect_timeout bounds the unreachable-server case: without it a packet-dropping
+        // host eats the FULL per-prompt hook budget (8s) before Claude Code kills the hook.
+        let mut b = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(15))
+            .connect_timeout(std::time::Duration::from_secs(3));
         if link.insecure {
             b = b.danger_accept_invalid_certs(true);
         }
