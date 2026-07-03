@@ -16,7 +16,8 @@ created_ms,valid_from_ms,valid_to_ms,system_from_ms,system_to_ms";
 
 /// The "current slice" predicate: the currently-recorded version (system_to NULL) that is
 /// still true-in-world at the bound `now` param. `?` placeholders are filled per query.
-const CURRENT: &str = "system_to_ms IS NULL AND (valid_to_ms IS NULL OR valid_to_ms > ?)";
+const CURRENT: &str =
+    "system_to_ms IS NULL AND valid_from_ms <= ? AND (valid_to_ms IS NULL OR valid_to_ms > ?)";
 
 pub struct SqliteStore {
     conn: Connection,
@@ -31,6 +32,7 @@ impl SqliteStore {
         conn.execute_batch(
             r#"
             PRAGMA journal_mode=WAL;
+            PRAGMA synchronous=NORMAL;
             PRAGMA busy_timeout=5000;
             CREATE TABLE IF NOT EXISTS entries (
                 id             INTEGER PRIMARY KEY,
@@ -108,10 +110,13 @@ impl SqliteStore {
                  UPDATE entries SET system_to_ms = valid_to_ms, valid_to_ms = NULL \
                      WHERE valid_to_ms IS NOT NULL;",
             )?;
-            // New-column indexes (safe now that the columns exist).
+            // New-column indexes (safe now that the columns exist). idx_entries_sysfrom serves
+            // latest_save_ms's MAX() as an O(1) seek - it runs on every prompt and the table is
+            // append-only, so an unindexed scan grows without bound.
             self.conn.execute_batch(
-                "CREATE INDEX IF NOT EXISTS idx_entries_uri    ON entries(uri);
-                 CREATE INDEX IF NOT EXISTS idx_entries_syscur ON entries(system_to_ms);",
+                "CREATE INDEX IF NOT EXISTS idx_entries_uri     ON entries(uri);
+                 CREATE INDEX IF NOT EXISTS idx_entries_syscur  ON entries(system_to_ms);
+                 CREATE INDEX IF NOT EXISTS idx_entries_sysfrom ON entries(system_from_ms);",
             )?;
             Ok(())
         })();
@@ -162,7 +167,7 @@ impl SqliteStore {
         let mut stmt = self.conn.prepare(&format!(
             "SELECT {COLS} FROM entries WHERE uri=?1 AND {CURRENT} ORDER BY system_from_ms DESC LIMIT 1"
         ))?;
-        let mut rows = stmt.query(params![uri, now])?;
+        let mut rows = stmt.query(params![uri, now, now])?;
         if let Some(r) = rows.next()? {
             Ok(Some(Self::row_to_entry(r)?))
         } else {
@@ -177,6 +182,23 @@ impl SqliteStore {
              ON CONFLICT(uri) DO UPDATE SET access_count = access_count + 1, last_access_ms = ?2",
             params![uri, now_ms],
         )?;
+        Ok(())
+    }
+
+    /// Bump many access signals in ONE transaction: recall calls this per hit set, and one
+    /// commit instead of `limit` autocommits keeps the read path to a single WAL fsync.
+    pub fn bump_signals(&self, uris: &[&str], now_ms: i64) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO signals(uri, access_count, last_access_ms) VALUES(?1, 1, ?2) \
+                 ON CONFLICT(uri) DO UPDATE SET access_count = access_count + 1, last_access_ms = ?2",
+            )?;
+            for uri in uris {
+                stmt.execute(params![uri, now_ms])?;
+            }
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -361,7 +383,7 @@ impl MemoryStore for SqliteStore {
         let mut stmt = self.conn.prepare(&format!(
             "SELECT {}, entries_fts.rank AS kw_rank FROM entries_fts JOIN entries e ON e.id = entries_fts.idref \
              WHERE entries_fts MATCH ?1 AND e.system_to_ms IS NULL \
-             AND (e.valid_to_ms IS NULL OR e.valid_to_ms > ?2) \
+             AND e.valid_from_ms <= ?2 AND (e.valid_to_ms IS NULL OR e.valid_to_ms > ?2) \
              AND e.kind <> 'skill' \
              ORDER BY entries_fts.rank LIMIT ?3",
             COLS.split(',').map(|c| format!("e.{c}")).collect::<Vec<_>>().join(",")
@@ -386,7 +408,7 @@ impl MemoryStore for SqliteStore {
              ORDER BY importance DESC, created_ms DESC LIMIT ?"
         ))?;
         let rows = stmt
-            .query_map(params![now, limit as i64], Self::row_to_entry)?
+            .query_map(params![now, now, limit as i64], Self::row_to_entry)?
             .filter_map(|r| r.ok())
             .collect();
         Ok(rows)
@@ -399,7 +421,7 @@ impl MemoryStore for SqliteStore {
              ORDER BY importance DESC, created_ms DESC LIMIT ?"
         ))?;
         let rows = stmt
-            .query_map(params![kind, now, limit as i64], Self::row_to_entry)?
+            .query_map(params![kind, now, now, limit as i64], Self::row_to_entry)?
             .filter_map(|r| r.ok())
             .collect();
         Ok(rows)
@@ -628,6 +650,27 @@ mod tests {
         assert!(hits.iter().any(|e| e.title.contains("LanceDB")), "should recall the LanceDB decision");
         let hits2 = s.recall("avx2", 5).unwrap();
         assert!(hits2.iter().any(|e| e.title == "AVX2 gate"));
+    }
+
+    #[test]
+    fn future_valid_facts_are_not_current_but_are_as_of_visible() {
+        let s = mem_store();
+        let now = now_ms();
+        let future = now + 30 * 24 * 3_600_000; // valid a month from now
+        let e = mk_valid("Price change", "the price becomes X", future, None);
+        s.put(&e).unwrap();
+        // the current slice must NOT see it on any read path...
+        assert!(s.get(&e.uri).unwrap().is_none(), "get() must exclude a future-valid fact");
+        assert!(s.recall("price becomes", 5).unwrap().is_empty(), "recall must exclude it");
+        assert!(s.recent(10).unwrap().is_empty(), "recent must exclude it");
+        assert!(s.by_kind("memory", 10).unwrap().is_empty(), "by_kind must exclude it");
+        // ...while the as-of slice at its validity start does (the two slices must agree)
+        let asof = s.recall_as_of("price becomes", 5, now_ms(), future + 1).unwrap();
+        assert!(asof.iter().any(|x| x.uri == e.uri), "as-of at validity must see it");
+        // and a normally-saved (valid-from-now) record is still immediately visible
+        let n = mk(Kind::Memory, "ns", "Normal fact", "saved and true right now");
+        s.put(&n).unwrap();
+        assert!(s.get(&n.uri).unwrap().is_some(), "present-valid record stays visible");
     }
 
     #[test]
