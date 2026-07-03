@@ -539,12 +539,11 @@ impl LocalMemory {
         scored.into_iter().take(limit).map(|(e, _)| e).collect()
     }
 
-    /// Best-effort: bump the access signal for each recalled record. Never fails recall.
+    /// Best-effort: bump the access signals for the recalled set in one transaction.
+    /// Never fails recall.
     fn bump_recalled(&self, entries: &[Entry]) {
-        let now = now_ms();
-        for e in entries {
-            let _ = self.store.bump_signal(&e.uri, now);
-        }
+        let uris: Vec<&str> = entries.iter().map(|e| e.uri.as_str()).collect();
+        let _ = self.store.bump_signals(&uris, now_ms());
     }
 
     pub fn recent(&self, limit: usize) -> Result<Vec<Entry>> {
