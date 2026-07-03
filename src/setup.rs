@@ -118,6 +118,14 @@ pub fn run() -> Result<()> {
     let claude_present = home.join(".claude").exists();
     let codex_present = codex_cfg.exists();
     let hermes_present = hermes_cfg.exists();
+    // OpenCode merges config.json < opencode.json < opencode.jsonc; probe the winning file.
+    let opencode_dir = home.join(".config/opencode");
+    let opencode_present = opencode_dir.exists();
+    let opencode_cfg = ["opencode.jsonc", "opencode.json", "config.json"]
+        .iter()
+        .map(|f| opencode_dir.join(f))
+        .find(|p| p.exists())
+        .unwrap_or_else(|| opencode_dir.join("opencode.json"));
     // Devin/Claude use the JSON SessionStart-hook probe; Codex/Hermes have no such shape, so a
     // plain text probe flags a config that already references a daimon/dmem memory wiring.
     let json_label = |present: bool, cfg: &std::path::Path, name: &str| -> String {
@@ -159,20 +167,22 @@ pub fn run() -> Result<()> {
         json_label(claude_present, &claude_cfg, "Claude Code"),
         plain_label(codex_present, &codex_cfg, "Codex"),
         plain_label(hermes_present, &hermes_cfg, "Hermes"),
+        plain_label(opencode_present, &opencode_cfg, "OpenCode"),
         cd_label,
     ];
     let chosen = MultiSelect::with_theme(&theme)
         .with_prompt("Wire dmem into which agents? (nothing is pre-selected; space toggles, enter confirms)")
         .items(&items)
-        .defaults(&[false, false, false, false, false])
+        .defaults(&[false, false, false, false, false, false])
         .interact()?;
     let devin = chosen.contains(&0);
     let claude = chosen.contains(&1);
     let codex = chosen.contains(&2);
     let hermes = chosen.contains(&3);
-    let claude_desktop = chosen.contains(&4);
-    if devin || claude || codex || hermes || claude_desktop {
-        crate::bootstrap::run(devin, claude, codex, hermes, claude_desktop)?;
+    let opencode = chosen.contains(&4);
+    let claude_desktop = chosen.contains(&5);
+    if devin || claude || codex || hermes || opencode || claude_desktop {
+        crate::bootstrap::run(devin, claude, codex, hermes, opencode, claude_desktop)?;
     } else {
         println!("(skipped agent wiring - undo any wiring later with `dmem bootstrap --remove`)");
     }
