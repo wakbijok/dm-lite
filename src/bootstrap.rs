@@ -576,12 +576,19 @@ export const DmemPlugin = async ({ $, client }: any) => {
 
   let persona: string | null = null; // cached for the plugin lifetime
   const lastPrompt = new Map<string, string>(); // sessionID -> latest user text
+  let lastRecall: { key: string; text: string } | null = null; // transform fires twice per turn
   let lastNudgeAt = 0;
 
   // Shell out to dmem; empty string on ANY failure (missing binary, non-zero exit, timeout).
-  const dmem = async (args: string[]): Promise<string> => {
+  // `stdin` rides a Response redirect: argv escaping differs across bundled shell versions
+  // (spaced values can arrive quote-wrapped), but stdin bytes are always verbatim.
+  const dmem = async (args: string[], stdin?: string): Promise<string> => {
     try {
-      const run = $`${DMEM} ${args}`.quiet().nothrow();
+      const cmd =
+        stdin === undefined
+          ? $`${DMEM} ${args}`
+          : $`${DMEM} ${args} < ${new Response(stdin)}`;
+      const run = cmd.quiet().nothrow();
       const out: any = await Promise.race([
         run,
         new Promise((resolve) => setTimeout(() => resolve(null), TIMEOUT_MS)),
@@ -612,9 +619,18 @@ export const DmemPlugin = async ({ $, client }: any) => {
       try {
         if (persona === null) persona = await dmem(["hook", "session_start", "--raw"]);
         if (persona) output.system.push(persona);
-        const prompt = input?.sessionID ? lastPrompt.get(input.sessionID) : undefined;
+        const sid = input?.sessionID;
+        const prompt = sid ? lastPrompt.get(sid) : undefined;
         if (prompt) {
-          const recall = await dmem(["hook", "user_prompt_submit", "--raw", prompt]);
+          // The prompt travels as the stdin JSON payload (the Claude-Code hook shape dmem
+          // already parses), never argv. Memoized: the transform also fires for auxiliary
+          // model calls (e.g. title generation) within the same turn.
+          const key = sid + " " + prompt;
+          const recall =
+            lastRecall?.key === key
+              ? lastRecall.text
+              : await dmem(["hook", "user_prompt_submit", "--raw"], JSON.stringify({ prompt }));
+          lastRecall = { key, text: recall };
           if (recall) output.system.push(recall);
         }
       } catch {}
