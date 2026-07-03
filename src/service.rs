@@ -153,7 +153,8 @@ mod platform {
              </dict></plist>\n",
             name = NAME, bin = bin, addr = xml_escape(addr), tenant_env = tenant_env, token = xml_escape(token), data_dir = xml_escape(data_dir), log = log
         );
-        std::fs::write(&p, content)?;
+        // the plist embeds the tenant bearer token - 0600, never the default umask
+        crate::config::write_secret(&p, &content)?;
         let ps = p.to_string_lossy().into_owned();
         let _ = Command::new("launchctl").args(["unload", &ps]).output();
         run_ok("launchctl", &["load", "-w", &ps])
@@ -226,7 +227,8 @@ mod platform {
              [Install]\nWantedBy=default.target\n",
             bin = bin, addr = addr, tenant_env = tenant_env, token = token, data_dir = data_dir
         );
-        std::fs::write(&u, content)?;
+        // the unit embeds the tenant bearer token - 0600, never the default umask
+        crate::config::write_secret(&u, &content)?;
         run_ok("systemctl", &["--user", "daemon-reload"])?;
         run_ok("systemctl", &["--user", "enable", "--now", NAME])
     }

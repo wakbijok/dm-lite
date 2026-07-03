@@ -23,7 +23,7 @@ fn tool_schemas() -> Value {
                 "limit":{"type":"integer","description":"max results (default 6, capped at 1000)"},
                 "as_of":{"type":"integer","description":"system-time epoch-ms: recall the store as it was BELIEVED at this instant"},
                 "valid_at":{"type":"integer","description":"valid-time epoch-ms: recall what was TRUE at this instant (defaults to as_of)"},
-                "expand":{"type":"integer","description":"graph: also pull each hit's neighborhood within this many hops (0 = off)"}
+                "expand":{"type":"integer","description":"graph: also pull each hit's neighborhood within this many hops (default 1 - linked records ride along automatically; 0 = content matches only; ignored when as_of/valid_at is set)"}
             },"required":["query"]}
         },
         {
@@ -176,20 +176,26 @@ fn call_tool(mem: &Memory, name: &str, args: &Value) -> std::result::Result<Stri
             let limit = (args.get("limit").and_then(|v| v.as_u64()).unwrap_or(6) as usize).min(1000);
             let as_of = args.get("as_of").and_then(|v| v.as_i64());
             let valid_at = args.get("valid_at").and_then(|v| v.as_i64());
-            let expand = args.get("expand").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-            let hits = if as_of.is_some() || valid_at.is_some() {
+            // Graph expansion defaults ON (1 hop), mirroring the per-prompt hook: models
+            // essentially never opt into optional integer params, so an opt-in default left
+            // the graph unused on the whole tool surface.
+            let expand = args.get("expand").and_then(|v| v.as_u64()).unwrap_or(1) as usize;
+            let block = if as_of.is_some() || valid_at.is_some() {
                 // bitemporal slice: default the missing axis to the other (then to now)
                 let now = crate::entry::now_ms();
                 let sys = as_of.unwrap_or(now);
                 let val = valid_at.or(as_of).unwrap_or(now);
-                mem.recall_as_of(s(args, "query"), limit, sys, val).map_err(|e| e.to_string())?
+                let hits = mem.recall_as_of(s(args, "query"), limit, sys, val).map_err(|e| e.to_string())?;
+                render::render_recall(&hits)
             } else if expand > 0 {
                 // graph-augmented: seeds by content, then their bounded-hop neighborhood (cap 5)
-                mem.recall_expanded(s(args, "query"), limit, expand.min(5)).map_err(|e| e.to_string())?
+                let (seeds, neighbors) =
+                    mem.recall_expanded_split(s(args, "query"), limit, expand.min(5)).map_err(|e| e.to_string())?;
+                render::render_recall_split(&seeds, &neighbors)
             } else {
-                mem.recall(s(args, "query"), limit).map_err(|e| e.to_string())?
+                let hits = mem.recall(s(args, "query"), limit).map_err(|e| e.to_string())?;
+                render::render_recall(&hits)
             };
-            let block = render::render_recall(&hits);
             Ok(if block.is_empty() { "(no matches)".into() } else { block })
         }
         "remember" => {
@@ -368,8 +374,9 @@ fn get_prompt(mem: &Memory, params: &Value) -> std::result::Result<Value, (i64, 
             if query.is_empty() {
                 return Err((INVALID_PARAMS, "the 'recall' prompt requires a non-empty 'query' argument".into()));
             }
-            let hits = mem.recall(query, 8).map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
-            let block = render::render_recall(&hits);
+            let (seeds, neighbors) =
+                mem.recall_expanded_split(query, 8, 1).map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+            let block = render::render_recall_split(&seeds, &neighbors);
             let text = if block.trim().is_empty() { "(no matches)".to_string() } else { block };
             (format!("dmem recall for: {query}"), text)
         }

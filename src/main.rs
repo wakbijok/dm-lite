@@ -159,8 +159,10 @@ enum Cmd {
         /// Bitemporal: recall facts VALID AT this epoch-ms (what was true then); defaults to as-of.
         #[arg(long = "valid-at", visible_alias = "valid_at")]
         valid_at: Option<i64>,
-        /// Graph: also pull each hit's neighborhood within this many hops (0 = off; ignored when --as-of/--valid-at is set).
-        #[arg(long, default_value_t = 0)]
+        /// Graph: also pull each hit's neighborhood within this many hops (default 1 - linked
+        /// records ride along, marked `linked`; 0 = content matches only; ignored when
+        /// --as-of/--valid-at is set).
+        #[arg(long, default_value_t = 1)]
         expand: usize,
     },
     /// Show recent high-importance memory.
@@ -482,21 +484,24 @@ fn run() -> Result<()> {
         Cmd::Recall { query, limit, as_of, valid_at, expand } => {
             let q = query.join(" ");
             let m = Memory::open()?;
-            let hits = if as_of.is_some() || valid_at.is_some() {
+            let (seeds, neighbors) = if as_of.is_some() || valid_at.is_some() {
                 let now = entry::now_ms();
                 let sys = as_of.unwrap_or(now);
                 let val = valid_at.or(as_of).unwrap_or(now);
-                m.recall_as_of(&q, limit, sys, val)?
+                (m.recall_as_of(&q, limit, sys, val)?, Vec::new())
             } else if expand > 0 {
-                m.recall_expanded(&q, limit, expand)?
+                m.recall_expanded_split(&q, limit, expand)?
             } else {
-                m.recall(&q, limit)?
+                (m.recall(&q, limit)?, Vec::new())
             };
-            if hits.is_empty() {
+            if seeds.is_empty() && neighbors.is_empty() {
                 println!("(no matches for '{}')", q);
             } else {
-                for e in hits {
+                for e in seeds {
                     println!("- ({}) {}  [{}]", e.kind.as_str(), e.title, e.uri);
+                }
+                for e in neighbors {
+                    println!("- ({}, linked) {}  [{}]", e.kind.as_str(), e.title, e.uri);
                 }
             }
             Ok(())

@@ -539,12 +539,11 @@ impl LocalMemory {
         scored.into_iter().take(limit).map(|(e, _)| e).collect()
     }
 
-    /// Best-effort: bump the access signal for each recalled record. Never fails recall.
+    /// Best-effort: bump the access signals for the recalled set in one transaction.
+    /// Never fails recall.
     fn bump_recalled(&self, entries: &[Entry]) {
-        let now = now_ms();
-        for e in entries {
-            let _ = self.store.bump_signal(&e.uri, now);
-        }
+        let uris: Vec<&str> = entries.iter().map(|e| e.uri.as_str()).collect();
+        let _ = self.store.bump_signals(&uris, now_ms());
     }
 
     pub fn recent(&self, limit: usize) -> Result<Vec<Entry>> {
@@ -633,21 +632,40 @@ impl LocalMemory {
     /// Graph-augmented recall: find seeds by content, then pull their bounded-hop neighborhood and
     /// hydrate it, so connected-but-not-similar records ride along. Seeds first, then neighbors.
     pub fn recall_expanded(&self, query: &str, limit: usize, depth: usize) -> Result<Vec<Entry>> {
+        let (mut seeds, neighbors) = self.recall_expanded_split(query, limit, depth)?;
+        seeds.extend(neighbors);
+        Ok(seeds)
+    }
+
+    /// Graph-augmented recall, split: the content-matched seeds and their live N-hop
+    /// neighborhood as separate lists, so callers can render the graph's contribution
+    /// distinguishably. Neighbor slots fill from an over-fetched candidate pool: edges are
+    /// non-cascading (a forgotten endpoint keeps its edges), so dead URIs are skipped WITHOUT
+    /// consuming the cap, and `kind=skill` records never ride recall (they surface only via
+    /// the skills projection - same invariant as the keyword and vector channels).
+    pub fn recall_expanded_split(&self, query: &str, limit: usize, depth: usize) -> Result<(Vec<Entry>, Vec<Entry>)> {
         let seeds = self.recall(query, limit)?;
-        if depth == 0 {
-            return Ok(seeds);
+        if depth == 0 || seeds.is_empty() {
+            return Ok((seeds, Vec::new()));
         }
         let seed_uris: Vec<String> = seeds.iter().map(|e| e.uri.clone()).collect();
         let mut seen: std::collections::HashSet<String> = seed_uris.iter().cloned().collect();
-        let mut out = seeds;
-        for uri in self.store.neighbors(&seed_uris, depth, limit)? {
-            if seen.insert(uri.clone()) {
-                if let Some(e) = self.store.get(&uri)? {
-                    out.push(e);
+        let mut neighbors: Vec<Entry> = Vec::new();
+        for uri in self.store.neighbors(&seed_uris, depth, limit.saturating_mul(4))? {
+            if neighbors.len() >= limit {
+                break;
+            }
+            if !seen.insert(uri.clone()) {
+                continue;
+            }
+            if let Some(e) = self.store.get(&uri)? {
+                if e.kind == Kind::Skill {
+                    continue;
                 }
+                neighbors.push(e);
             }
         }
-        Ok(out)
+        Ok((seeds, neighbors))
     }
 
     /// Rebuild edges from the `[[name]]` references in every current record's body. Batch, not
@@ -917,6 +935,13 @@ impl Memory {
             Memory::Remote(r) => r.recall_expanded(query, limit, depth),
         }
     }
+    pub fn recall_expanded_split(&self, query: &str, limit: usize, depth: usize) -> Result<(Vec<Entry>, Vec<Entry>)> {
+        match self {
+            Memory::Local(l) => l.recall_expanded_split(query, limit, depth),
+            #[cfg(feature = "client")]
+            Memory::Remote(r) => r.recall_expanded_split(query, limit, depth),
+        }
+    }
     pub fn reindex_links(&self) -> Result<usize> {
         match self {
             Memory::Local(l) => l.reindex_links(),
@@ -1011,6 +1036,23 @@ mod tests {
         // a query that only hits alpha still pulls beta in, via the edge
         let hits = m.recall_expanded("Alpha refers context", 3, 1).unwrap();
         assert!(hits.iter().any(|e| e.body.contains("Beta the target")), "neighbor pulled in via the graph");
+    }
+
+    #[test]
+    fn expanded_split_skips_skills_and_dead_endpoints() {
+        let m = LocalMemory::for_test(tmp_store());
+        let alpha = m.remember("Alpha hub links to everything relevant", "resources/notes", None, None).unwrap();
+        let live = m.remember("Beta the live neighbor rides along", "resources/notes", None, None).unwrap();
+        let skill = m.import_record(Kind::Skill, "agent/skills", "Secret skill", "skill body must never ride recall").unwrap();
+        m.link(&alpha, &live, "mentions").unwrap();
+        m.link(&alpha, &skill, "mentions").unwrap();
+        // edges are non-cascading: a dead endpoint keeps its edge but must not consume slots
+        m.link(&alpha, "daimon://resources/notes/memory/long-forgotten", "mentions").unwrap();
+        let (seeds, neighbors) = m.recall_expanded_split("Alpha hub relevant", 3, 1).unwrap();
+        assert!(seeds.iter().any(|e| e.uri == alpha), "seed found by content");
+        assert!(neighbors.iter().any(|e| e.uri == live), "live neighbor hydrated");
+        assert!(neighbors.iter().all(|e| e.kind != Kind::Skill), "skills never ride recall (invariant)");
+        assert!(neighbors.iter().all(|e| e.uri != "daimon://resources/notes/memory/long-forgotten"), "dead endpoint dropped");
     }
 
     #[test]

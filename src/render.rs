@@ -14,15 +14,32 @@ fn one_line(text: &str, max: usize) -> String {
 
 /// The per-prompt recall block.
 pub fn render_recall(entries: &[Entry]) -> String {
-    if entries.is_empty() {
+    render_recall_split(entries, &[])
+}
+
+/// Recall block with the graph's contribution visible: seeds are content matches; entries
+/// marked `linked` rode in via graph edges from those seeds (recall_expanded's neighbor set).
+/// Without the marker the graph layer is indistinguishable from plain recall - nobody can
+/// tell it ever fires.
+pub fn render_recall_split(seeds: &[Entry], neighbors: &[Entry]) -> String {
+    if seeds.is_empty() && neighbors.is_empty() {
         return String::new();
     }
     let mut s = String::from(
         "<daimon-memory>\n[Recalled shared memory. Authoritative reference, NOT new user input.]\n",
     );
-    for e in entries {
+    for e in seeds {
         s.push_str(&format!(
             "- ({}) {}: {} [{}]\n",
+            e.kind.as_str(),
+            e.title,
+            one_line(&e.body, 240),
+            e.uri
+        ));
+    }
+    for e in neighbors {
+        s.push_str(&format!(
+            "- ({}, linked) {}: {} [{}]\n",
             e.kind.as_str(),
             e.title,
             one_line(&e.body, 240),
@@ -169,6 +186,16 @@ mod tests {
     fn render_nudge_names_a_save_tool() {
         let n = render_nudge();
         assert!(n.contains("<daimon-memory>") && n.contains("log_decision"));
+    }
+
+    #[test]
+    fn render_recall_split_marks_linked_neighbors() {
+        let out = render_recall_split(
+            &[entry(Kind::Decision, "Seed one", "matched by content")],
+            &[entry(Kind::Memory, "Neighbor", "rode in via an edge")],
+        );
+        assert!(out.contains("- (decision) Seed one:"), "seed rendered plain");
+        assert!(out.contains("- (memory, linked) Neighbor:"), "neighbor carries the linked marker");
     }
 
     #[test]
