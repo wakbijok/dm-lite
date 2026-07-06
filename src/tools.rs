@@ -588,10 +588,19 @@ impl LocalMemory {
         }
     }
 
-    /// Persona + protocol records (the boot layer), most important first.
+    /// Persona + protocol records (the boot layer), most important first. Agent-less callers
+    /// (embedded mode, hooks, bootstrap) see the legacy full set.
     pub fn persona(&self) -> Result<Vec<Entry>> {
-        let mut out = self.store.by_kind("persona", 5)?;
-        out.extend(self.store.by_kind("protocol", 5)?);
+        self.persona_for(None)
+    }
+
+    /// The boot layer VISIBLE TO an agent identity: shared governance (persona/protocol records
+    /// outside the `agents/` namespace tree) plus that agent's own `agents/<agent>/...` records;
+    /// other agents' personas are excluded, so a token's identity decides which "I am ..." it is
+    /// served. `None` = every record (exactly the pre-agent behaviour).
+    pub fn persona_for(&self, agent: Option<&str>) -> Result<Vec<Entry>> {
+        let mut out = self.store.by_kind_for_agent("persona", agent, 5)?;
+        out.extend(self.store.by_kind_for_agent("protocol", agent, 5)?);
         Ok(out)
     }
 
@@ -1014,6 +1023,26 @@ mod tests {
             "a clearly higher-ranked hit must not be displaced by a deeper, much-accessed one"
         );
         assert_eq!(out.len(), 6);
+    }
+
+    #[test]
+    fn persona_for_serves_own_identity_plus_shared_governance() {
+        let m = LocalMemory::for_test(tmp_store());
+        m.import_record(Kind::Persona, "shared/governance", "House Rules", "shared boundaries").unwrap();
+        m.import_record(Kind::Persona, "agents/izu/persona", "Izu Persona", "I am Izu").unwrap();
+        m.import_record(Kind::Persona, "agents/shesta/persona", "Shesta Persona", "I am Shesta").unwrap();
+        m.import_record(Kind::Protocol, "agent/protocol", "Behavioral Discipline", "recall before reasoning").unwrap();
+
+        let izu: Vec<String> = m.persona_for(Some("izu")).unwrap().into_iter().map(|e| e.title).collect();
+        assert!(izu.contains(&"Izu Persona".to_string()), "own persona served");
+        assert!(izu.contains(&"House Rules".to_string()), "shared governance served");
+        assert!(izu.contains(&"Behavioral Discipline".to_string()), "protocols are shared");
+        assert!(!izu.contains(&"Shesta Persona".to_string()), "another agent's persona never leaks");
+
+        // agent-less: the legacy full set (backward compatibility until migration)
+        let all: Vec<String> = m.persona().unwrap().into_iter().map(|e| e.title).collect();
+        assert!(all.contains(&"Izu Persona".to_string()) && all.contains(&"Shesta Persona".to_string()));
+        assert_eq!(all.len(), 4);
     }
 
     #[test]
