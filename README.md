@@ -15,6 +15,7 @@ daimon-memory v2: a small typed memory engine for AI agents. One binary, client/
 - Bitemporal: two time axes, when a fact is true in the world and when you recorded it. Backdate a fact, end its validity, and recall both what was true at a past moment and what you knew at one. Nothing is overwritten.
 - Client/server in one binary: run it locally, or host it on a VPS, homelab, or cloud box and point your machines at it. Local or remote is just a URL.
 - Multitenant: one database per tenant, token-only IAM (root admin plus per-tenant tokens), built-in TLS (no reverse proxy).
+- Per-agent identity on a shared memory: a token can carry an agent label, so each agent is served its own persona (namespace `agents/<agent>/`) while house rules, protocols, and the memory itself stay shared across the tenant; writes are attributed with an `author:<agent>` tag.
 - Self-updating: `dmem upgrade` pulls the latest release in place.
 
 ## Quickstart
@@ -42,6 +43,10 @@ dmem bootstrap --claude     # or --codex / --hermes / --devin / --opencode / --c
 ```
 
 Out of the box this runs on one machine: the server and your client live together. To run the server on one host and connect clients from elsewhere, see the wiki.
+
+## Per-agent identity (shared memory, separate personas)
+
+Several agents can share one tenant's memory while each receives only its own persona. Mint a token per agent (`dmem admin add <tenant> --agent izu`, or the env form `DM_TOKEN_<TENANT>__<AGENT>=secret` - double underscore separates tenant from agent). A token with an agent label is served the shared governance records (persona/protocol records outside the `agents/` namespace tree) plus that agent's own `agents/<agent>/...` persona - never another agent's - and its writes are stamped with an `author:<agent>` tag. Agent-less tokens keep the full legacy behaviour, so existing setups are unaffected until you opt in.
 
 ## Offline / air-gapped
 
