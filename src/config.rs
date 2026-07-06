@@ -204,6 +204,24 @@ pub fn canonical_tenant(raw: &str) -> String {
     }
 }
 
+/// Canonical per-agent identity label: the tenant alphabet (lowercased [a-z0-9_-]) so an agent
+/// maps to exactly one `agents/<agent>/` namespace regardless of case, but empty means "no
+/// agent" (None) rather than a default. Used by token minting, env-token parsing, and the
+/// per-agent persona query, so all three agree on what an agent is called.
+#[cfg_attr(not(feature = "server"), allow(dead_code))]
+pub fn canonical_agent(raw: &str) -> Option<String> {
+    let safe: String = raw
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect();
+    if safe.is_empty() {
+        None
+    } else {
+        Some(safe)
+    }
+}
+
 /// Database file for a tenant. Database-per-tenant: physical isolation per tenant.
 pub fn db_path(tenant: &str) -> Result<PathBuf> {
     let dir = data_dir()?.join("tenants");
