@@ -406,7 +406,9 @@ async fn recent_h(State(st): State<AppState>, headers: HeaderMap, Json(req): Jso
 }
 
 async fn persona_h(State(st): State<AppState>, headers: HeaderMap) -> ApiResp {
-    with_tenant(&st, &headers, false, |m, _agent| Ok(json!(m.persona()?))).await
+    // The token's agent identity picks the persona set: an agent gets shared governance + its
+    // own agents/<agent>/ records; an agent-less token keeps the legacy everything.
+    with_tenant(&st, &headers, false, |m, agent| Ok(json!(m.persona_for(agent.as_deref())?))).await
 }
 
 async fn reminders_h(State(st): State<AppState>, headers: HeaderMap, Json(req): Json<RecentReq>) -> ApiResp {
@@ -981,6 +983,58 @@ mod tests {
         assert!(s.contains("postfix"), "recall should return the just-saved record: {s}");
 
         std::env::remove_var("DM_TOKEN_RT1");
+        std::env::remove_var("DM_DATA_DIR");
+    }
+
+    // The identity-bleed regression this branch exists for: an agent token gets its OWN persona
+    // plus shared governance over the wire, never another agent's; an agent-less token on the
+    // SAME tenant still sees the legacy full set.
+    // ENV_LOCK must span the awaits (the env vars must stay set for the whole request), same as
+    // the other route tests here; silence the lint instead of growing its baseline count.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn persona_route_serves_the_tokens_agent_only() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("dmpers-{}-{}", std::process::id(), crate::entry::now_ms()));
+        std::env::set_var("DM_DATA_DIR", &dir);
+        std::env::set_var("DM_TOKEN_PT1__IZU", "izutok");
+        std::env::set_var("DM_TOKEN_PT1", "plaintok");
+        let m = Memory::open_tenant("pt1").unwrap();
+        m.import_record(crate::entry::Kind::Persona, "agents/izu/persona", "Izu Persona", "I am Izu").unwrap();
+        m.import_record(crate::entry::Kind::Persona, "agents/shesta/persona", "Shesta Persona", "I am Shesta").unwrap();
+        m.import_record(crate::entry::Kind::Persona, "shared/governance", "House Rules", "shared rules").unwrap();
+
+        let app = router(Arc::new(BearerAuth::from_env().unwrap()), None);
+        let call = |tok: &str| {
+            let app = app.clone();
+            let tok = format!("Bearer {tok}");
+            async move {
+                let resp = app
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri("/persona")
+                            .header("authorization", tok)
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status(), StatusCode::OK);
+                let body = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+                String::from_utf8_lossy(&body).to_string()
+            }
+        };
+
+        let s = call("izutok").await;
+        assert!(s.contains("Izu Persona") && s.contains("House Rules"), "own persona + shared governance: {s}");
+        assert!(!s.contains("Shesta Persona"), "another agent's persona must not leak: {s}");
+
+        let s = call("plaintok").await;
+        assert!(s.contains("Izu Persona") && s.contains("Shesta Persona"), "agent-less token keeps legacy behaviour: {s}");
+
+        std::env::remove_var("DM_TOKEN_PT1__IZU");
+        std::env::remove_var("DM_TOKEN_PT1");
         std::env::remove_var("DM_DATA_DIR");
     }
 }

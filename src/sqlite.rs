@@ -427,6 +427,32 @@ impl MemoryStore for SqliteStore {
         Ok(rows)
     }
 
+    fn by_kind_for_agent(&self, kind: &str, agent: Option<&str>, limit: usize) -> Result<Vec<Entry>> {
+        // Canonicalize defensively so the namespace patterns below always see the same agent
+        // spelling the token layer minted ([a-z0-9_-]); an empty/invalid label degrades to the
+        // legacy full set rather than silently matching nothing.
+        let agent = match agent.and_then(crate::config::canonical_agent) {
+            Some(a) => a,
+            None => return self.by_kind(kind, limit),
+        };
+        let now = crate::entry::now_ms();
+        // GLOB, not LIKE: `_` is a LIKE wildcard but a literal in GLOB, and agent labels may
+        // contain it. The canonical agent alphabet has no GLOB metacharacters (*?[]), so the
+        // patterns are safe by construction.
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {COLS} FROM entries WHERE kind=?1 AND {CURRENT} \
+             AND (namespace NOT GLOB 'agents/*' OR namespace = ?4 OR namespace GLOB ?5) \
+             ORDER BY importance DESC, created_ms DESC LIMIT ?6"
+        ))?;
+        let own = format!("agents/{agent}");
+        let own_tree = format!("agents/{agent}/*");
+        let rows = stmt
+            .query_map(params![kind, now, now, own, own_tree, limit as i64], Self::row_to_entry)?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    }
+
     fn recall_as_of(&self, query: &str, limit: usize, as_of_ms: i64, valid_ms: i64) -> Result<Vec<Entry>> {
         // As-of can't use the FTS index (it holds only the current version of each record),
         // so scan `entries` for the as-of slice and keyword-filter in Rust. History is small
@@ -639,6 +665,39 @@ mod tests {
             .unwrap()
             .filter_map(|x| x.ok())
             .collect()
+    }
+
+    #[test]
+    fn by_kind_for_agent_scopes_the_agents_tree() {
+        let s = mem_store();
+        s.put(&mk(Kind::Persona, "shared/governance", "House Rules", "shared house rules")).unwrap();
+        s.put(&mk(Kind::Persona, "agent/persona", "Operator Persona", "legacy persona (outside agents/)")).unwrap();
+        s.put(&mk(Kind::Persona, "agents/izu/persona", "Izu Persona", "I am Izu")).unwrap();
+        s.put(&mk(Kind::Persona, "agents/shesta/persona", "Shesta Persona", "I am Shesta")).unwrap();
+        s.put(&mk(Kind::Protocol, "agent/protocol", "Behavioral Discipline", "shared protocol")).unwrap();
+
+        // agent identity: shared governance + OWN agents/ records, never another agent's
+        let izu: Vec<String> = s.by_kind_for_agent("persona", Some("izu"), 10).unwrap().into_iter().map(|e| e.title).collect();
+        assert!(izu.contains(&"House Rules".to_string()), "shared governance goes to every agent");
+        assert!(izu.contains(&"Operator Persona".to_string()), "legacy records outside agents/ stay visible");
+        assert!(izu.contains(&"Izu Persona".to_string()), "own persona included");
+        assert!(!izu.contains(&"Shesta Persona".to_string()), "another agent's persona is excluded");
+
+        // protocols are shared (none live under agents/ here)
+        let proto = s.by_kind_for_agent("protocol", Some("izu"), 10).unwrap();
+        assert_eq!(proto.len(), 1);
+
+        // no agent identity: the legacy full set, byte-identical to by_kind
+        let all = s.by_kind_for_agent("persona", None, 10).unwrap();
+        assert_eq!(all.len(), s.by_kind("persona", 10).unwrap().len());
+        assert_eq!(all.len(), 4, "agent-less sees every persona record");
+
+        // an agent with a `_` in its label matches literally (GLOB, not LIKE: no wildcard bleed)
+        s.put(&mk(Kind::Persona, "agents/devXin/persona", "Not Dev_in", "wildcard bait")).unwrap();
+        s.put(&mk(Kind::Persona, "agents/dev_in/persona", "Dev_in Persona", "I am dev_in")).unwrap();
+        let dev: Vec<String> = s.by_kind_for_agent("persona", Some("dev_in"), 10).unwrap().into_iter().map(|e| e.title).collect();
+        assert!(dev.contains(&"Dev_in Persona".to_string()));
+        assert!(!dev.contains(&"Not Dev_in".to_string()), "underscore must not act as a wildcard");
     }
 
     #[test]

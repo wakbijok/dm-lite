@@ -208,7 +208,6 @@ pub fn canonical_tenant(raw: &str) -> String {
 /// maps to exactly one `agents/<agent>/` namespace regardless of case, but empty means "no
 /// agent" (None) rather than a default. Used by token minting, env-token parsing, and the
 /// per-agent persona query, so all three agree on what an agent is called.
-#[cfg_attr(not(feature = "server"), allow(dead_code))]
 pub fn canonical_agent(raw: &str) -> Option<String> {
     let safe: String = raw
         .to_lowercase()
