@@ -13,9 +13,6 @@ use std::path::{Path, PathBuf};
 pub struct Identity {
     pub tenant: Option<String>,
     pub is_admin: bool,
-    // allow(dead_code): read by the identity-threading layer in the follow-up commit;
-    // this commit only mints and resolves it.
-    #[allow(dead_code)]
     pub agent: Option<String>,
 }
 
