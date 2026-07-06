@@ -429,8 +429,8 @@ async fn forget_h(State(st): State<AppState>, headers: HeaderMap, Json(req): Jso
 
 async fn remember_h(State(st): State<AppState>, headers: HeaderMap, Json(req): Json<RememberReq>) -> ApiResp {
     // client_err: a bad valid interval (valid_to <= valid_from) is client input -> 400, not 500.
-    with_tenant(&st, &headers, true, move |m, _agent| {
-        Ok(json!({ "uri": m.remember(&req.text, ns_or(&req.namespace, "resources/notes"), req.valid_from, req.valid_to)? }))
+    with_tenant(&st, &headers, true, move |m, agent| {
+        Ok(json!({ "uri": m.remember(&req.text, ns_or(&req.namespace, "resources/notes"), req.valid_from, req.valid_to, agent.as_deref())? }))
     })
     .await
 }
@@ -491,45 +491,45 @@ async fn reindex_links_h(State(st): State<AppState>, headers: HeaderMap) -> ApiR
 }
 
 async fn decision_h(State(st): State<AppState>, headers: HeaderMap, Json(req): Json<DecisionReq>) -> ApiResp {
-    with_tenant(&st, &headers, true, move |m, _agent| {
+    with_tenant(&st, &headers, true, move |m, agent| {
         let ns = ns_or(&req.namespace, "resources/notes");
-        Ok(json!({ "uri": m.log_decision(&req.title, &req.context, &req.decision, &req.rationale, ns)? }))
+        Ok(json!({ "uri": m.log_decision(&req.title, &req.context, &req.decision, &req.rationale, ns, agent.as_deref())? }))
     })
     .await
 }
 
 async fn lesson_h(State(st): State<AppState>, headers: HeaderMap, Json(req): Json<LessonReq>) -> ApiResp {
-    with_tenant(&st, &headers, true, move |m, _agent| {
-        Ok(json!({ "uri": m.log_lesson(&req.title, &req.lesson, ns_or(&req.namespace, "agent/lessons"))? }))
+    with_tenant(&st, &headers, true, move |m, agent| {
+        Ok(json!({ "uri": m.log_lesson(&req.title, &req.lesson, ns_or(&req.namespace, "agent/lessons"), agent.as_deref())? }))
     })
     .await
 }
 
 async fn incident_h(State(st): State<AppState>, headers: HeaderMap, Json(req): Json<IncidentReq>) -> ApiResp {
-    with_tenant(&st, &headers, true, move |m, _agent| {
+    with_tenant(&st, &headers, true, move |m, agent| {
         let ns = ns_or(&req.namespace, "resources/incidents");
-        Ok(json!({ "uri": m.log_incident(&req.title, &req.impact, &req.resolution, ns)? }))
+        Ok(json!({ "uri": m.log_incident(&req.title, &req.impact, &req.resolution, ns, agent.as_deref())? }))
     })
     .await
 }
 
 async fn runbook_h(State(st): State<AppState>, headers: HeaderMap, Json(req): Json<RunbookReq>) -> ApiResp {
-    with_tenant(&st, &headers, true, move |m, _agent| {
-        Ok(json!({ "uri": m.log_runbook(&req.title, &req.steps, ns_or(&req.namespace, "resources/runbooks"))? }))
+    with_tenant(&st, &headers, true, move |m, agent| {
+        Ok(json!({ "uri": m.log_runbook(&req.title, &req.steps, ns_or(&req.namespace, "resources/runbooks"), agent.as_deref())? }))
     })
     .await
 }
 
 async fn convention_h(State(st): State<AppState>, headers: HeaderMap, Json(req): Json<ConventionReq>) -> ApiResp {
-    with_tenant(&st, &headers, true, move |m, _agent| {
-        Ok(json!({ "uri": m.log_convention(&req.title, &req.rule, ns_or(&req.namespace, "resources/conventions"))? }))
+    with_tenant(&st, &headers, true, move |m, agent| {
+        Ok(json!({ "uri": m.log_convention(&req.title, &req.rule, ns_or(&req.namespace, "resources/conventions"), agent.as_deref())? }))
     })
     .await
 }
 
 async fn reminder_h(State(st): State<AppState>, headers: HeaderMap, Json(req): Json<ReminderReq>) -> ApiResp {
-    with_tenant(&st, &headers, true, move |m, _agent| {
-        Ok(json!({ "uri": m.add_reminder(&req.title, &req.text, ns_or(&req.namespace, "agent/reminders"))? }))
+    with_tenant(&st, &headers, true, move |m, agent| {
+        Ok(json!({ "uri": m.add_reminder(&req.title, &req.text, ns_or(&req.namespace, "agent/reminders"), agent.as_deref())? }))
     })
     .await
 }
@@ -893,7 +893,7 @@ mod tests {
         std::env::set_var("DM_TOKEN_T1SRV", "tok1");
         // seed a record into tenant t1srv
         let m = Memory::open_tenant("t1srv").unwrap();
-        m.remember("the vector substrate is zvec", "resources/notes", None, None).unwrap();
+        m.remember("the vector substrate is zvec", "resources/notes", None, None, None).unwrap();
 
         let app = router(Arc::new(BearerAuth::from_env().unwrap()), None);
 
@@ -1035,6 +1035,53 @@ mod tests {
 
         std::env::remove_var("DM_TOKEN_PT1__IZU");
         std::env::remove_var("DM_TOKEN_PT1");
+        std::env::remove_var("DM_DATA_DIR");
+    }
+
+    // Write attribution over the wire: a save through an agent token comes back from recall
+    // with the author:<agent> tag stamped by the server (the client sends no attribution).
+    #[allow(clippy::await_holding_lock)] // ENV_LOCK must span the awaits, as above
+    #[tokio::test]
+    async fn remember_with_agent_token_stamps_author() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("dmattr-{}-{}", std::process::id(), crate::entry::now_ms()));
+        std::env::set_var("DM_DATA_DIR", &dir);
+        std::env::set_var("DM_TOKEN_AT1__SHESTA", "shestatok");
+        let app = router(Arc::new(BearerAuth::from_env().unwrap()), None);
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/remember")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer shestatok")
+                    .body(Body::from(r#"{"text":"the report template lives in projects docs","namespace":"resources/notes"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/recall")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer shestatok")
+                    .body(Body::from(r#"{"query":"report template docs","limit":5}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        let s = String::from_utf8_lossy(&body);
+        assert!(s.contains("author:shesta"), "recalled record carries the token's agent as author: {s}");
+
+        std::env::remove_var("DM_TOKEN_AT1__SHESTA");
         std::env::remove_var("DM_DATA_DIR");
     }
 }
