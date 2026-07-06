@@ -164,7 +164,7 @@ fn resolve_identity(st: &AppState, headers: &HeaderMap) -> Option<crate::iam::Id
     }
     st.auth
         .tenant_for(Some(h))
-        .map(|t| crate::iam::Identity { tenant: Some(t), is_admin: false })
+        .map(|t| crate::iam::Identity { tenant: Some(t), is_admin: false, agent: None })
 }
 
 /// Resolve the request's member tenant (admin tokens have no tenant -> None -> 401 here).
@@ -550,6 +550,9 @@ struct AdminAddReq {
     display: String,
     #[serde(default)]
     label: String,
+    /// Optional per-agent identity label for the minted token (None = agent-less).
+    #[serde(default)]
+    agent: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -560,8 +563,8 @@ struct AdminTargetReq {
 async fn admin_add_h(State(st): State<AppState>, headers: HeaderMap, Json(req): Json<AdminAddReq>) -> ApiResp {
     with_admin(&st, &headers, || {
         let iam = crate::iam::Iam::open()?;
-        let (tenant, token) = iam.create_tenant(&req.tenant, &req.display, &req.label)?;
-        Ok(json!({ "tenant": tenant, "token": token }))
+        let (tenant, token) = iam.create_tenant(&req.tenant, &req.display, &req.label, req.agent.as_deref())?;
+        Ok(json!({ "tenant": tenant, "token": token, "agent": req.agent.as_deref().and_then(crate::config::canonical_agent) }))
     })
 }
 
@@ -571,7 +574,7 @@ async fn admin_list_h(State(st): State<AppState>, headers: HeaderMap) -> ApiResp
         let rows: Vec<_> = iam
             .list()?
             .into_iter()
-            .map(|(t, s, n)| json!({ "tenant": t, "status": s, "tokens": n }))
+            .map(|(t, s, n, agents)| json!({ "tenant": t, "status": s, "tokens": n, "agents": agents }))
             .collect();
         Ok(json!(rows))
     })

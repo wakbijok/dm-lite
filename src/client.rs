@@ -80,8 +80,8 @@ impl RemoteClient {
 
     // --- admin (root-token) operations ---
 
-    pub fn admin_add(&self, tenant: &str, label: &str, display: &str) -> Result<(String, String)> {
-        let v = self.post("/admin/tenant", json!({ "tenant": tenant, "label": label, "display": display }))?;
+    pub fn admin_add(&self, tenant: &str, label: &str, display: &str, agent: Option<&str>) -> Result<(String, String)> {
+        let v = self.post("/admin/tenant", json!({ "tenant": tenant, "label": label, "display": display, "agent": agent }))?;
         Ok((
             v.get("tenant").and_then(|x| x.as_str()).unwrap_or_default().to_string(),
             v.get("token").and_then(|x| x.as_str()).unwrap_or_default().to_string(),
