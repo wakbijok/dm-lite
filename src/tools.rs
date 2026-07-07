@@ -110,6 +110,18 @@ pub(crate) fn parse_wikilinks(s: &str) -> Vec<String> {
     out
 }
 
+/// Stamp write attribution into a record's tags as `author:<agent>`, unless an author tag is
+/// already present (the first attribution wins; a re-save through another path must not
+/// silently re-assign a record). `None` (agent-less callers: embedded mode, legacy tokens)
+/// leaves the tags untouched, so pre-agent behaviour is byte-identical.
+pub(crate) fn stamp_author(tags: &mut Vec<String>, author: Option<&str>) {
+    if let Some(a) = author {
+        if !tags.iter().any(|t| t.starts_with("author:")) {
+            tags.push(format!("author:{a}"));
+        }
+    }
+}
+
 /// Render a domain-entity record body from a name, kind, and key/value attributes (the
 /// knowledge-graph layer). Attributes go in a small structured block; relations between entities
 /// are edges (the graph), not body content. The name becomes the record title.
@@ -225,15 +237,18 @@ impl LocalMemory {
         Ok(Self { store })
     }
 
-    fn save(&self, kind: Kind, namespace: &str, title: &str, body: String, importance: i64, tags: Vec<String>) -> Result<String> {
-        self.save_valid(kind, namespace, title, body, importance, tags, None, None)
+    #[allow(clippy::too_many_arguments)]
+    fn save(&self, kind: Kind, namespace: &str, title: &str, body: String, importance: i64, tags: Vec<String>, author: Option<&str>) -> Result<String> {
+        self.save_valid(kind, namespace, title, body, importance, tags, None, None, author)
     }
 
     /// As `save`, but with a caller-supplied valid interval (the bitemporal application-time axis).
     /// `valid_from = None` means now; `valid_to = None` means open (still true). The store's put
-    /// does the valid-time splitting against any existing segments of this entity.
+    /// does the valid-time splitting against any existing segments of this entity. `author`
+    /// stamps write attribution (see `stamp_author`); None writes exactly as before.
     #[allow(clippy::too_many_arguments)]
-    fn save_valid(&self, kind: Kind, namespace: &str, title: &str, body: String, importance: i64, tags: Vec<String>, valid_from: Option<i64>, valid_to: Option<i64>) -> Result<String> {
+    fn save_valid(&self, kind: Kind, namespace: &str, title: &str, body: String, importance: i64, mut tags: Vec<String>, valid_from: Option<i64>, valid_to: Option<i64>, author: Option<&str>) -> Result<String> {
+        stamp_author(&mut tags, author);
         let uri = make_uri(namespace, kind, title);
         let mut e = Entry::new_now(
             uri.clone(),
@@ -315,37 +330,37 @@ impl LocalMemory {
         Ok(uri)
     }
 
-    pub fn log_decision(&self, title: &str, context: &str, decision: &str, rationale: &str, namespace: &str) -> Result<String> {
+    pub fn log_decision(&self, title: &str, context: &str, decision: &str, rationale: &str, namespace: &str, author: Option<&str>) -> Result<String> {
         require(title, "title")?;
         require(decision, "decision")?;
         let body = format!(
             "# {}\n\n**Context:** {}\n\n**Decision:** {}\n\n**Rationale:** {}\n",
             title, context, decision, rationale
         );
-        self.save(Kind::Decision, namespace, title, body, 70, vec!["decision".into()])
+        self.save(Kind::Decision, namespace, title, body, 70, vec!["decision".into()], author)
     }
 
-    pub fn log_lesson(&self, title: &str, lesson: &str, namespace: &str) -> Result<String> {
+    pub fn log_lesson(&self, title: &str, lesson: &str, namespace: &str, author: Option<&str>) -> Result<String> {
         require(title, "title")?;
         require(lesson, "lesson")?;
         let body = format!("# {}\n\n**Lesson:** {}\n", title, lesson);
-        self.save(Kind::AgentLesson, namespace, title, body, 60, vec!["agent_lesson".into()])
+        self.save(Kind::AgentLesson, namespace, title, body, 60, vec!["agent_lesson".into()], author)
     }
 
-    pub fn log_incident(&self, title: &str, impact: &str, resolution: &str, namespace: &str) -> Result<String> {
+    pub fn log_incident(&self, title: &str, impact: &str, resolution: &str, namespace: &str, author: Option<&str>) -> Result<String> {
         require(title, "title")?;
         require(impact, "impact")?;
         let body = format!(
             "# {}\n\n**Impact:** {}\n\n**Resolution:** {}\n",
             title, impact, resolution
         );
-        self.save(Kind::IncidentSummary, namespace, title, body, 65, vec!["incident_summary".into()])
+        self.save(Kind::IncidentSummary, namespace, title, body, 65, vec!["incident_summary".into()], author)
     }
 
-    pub fn remember(&self, text: &str, namespace: &str, valid_from: Option<i64>, valid_to: Option<i64>) -> Result<String> {
+    pub fn remember(&self, text: &str, namespace: &str, valid_from: Option<i64>, valid_to: Option<i64>, author: Option<&str>) -> Result<String> {
         require(text, "text")?;
         let title = first_line(text);
-        self.save_valid(Kind::Memory, namespace, &title, text.to_string(), 50, vec![], valid_from, valid_to)
+        self.save_valid(Kind::Memory, namespace, &title, text.to_string(), 50, vec![], valid_from, valid_to, author)
     }
 
     /// Application-time invalidation: this entity's fact is no longer true from `valid_to_ms` on.
@@ -353,31 +368,32 @@ impl LocalMemory {
         self.store.invalidate(uri, valid_to_ms)
     }
 
-    pub fn add_reminder(&self, title: &str, text: &str, namespace: &str) -> Result<String> {
+    pub fn add_reminder(&self, title: &str, text: &str, namespace: &str, author: Option<&str>) -> Result<String> {
         require(title, "title")?;
         require(text, "text")?;
         let body = format!("# {}\n\n**Reminder:** {}\n", title, text);
-        self.save(Kind::Reminder, namespace, title, body, 55, vec!["reminder".into()])
+        self.save(Kind::Reminder, namespace, title, body, 55, vec!["reminder".into()], author)
     }
 
-    pub fn log_runbook(&self, title: &str, steps: &str, namespace: &str) -> Result<String> {
+    pub fn log_runbook(&self, title: &str, steps: &str, namespace: &str, author: Option<&str>) -> Result<String> {
         require(title, "title")?;
         require(steps, "steps")?;
         let body = format!("# {}\n\n**Runbook:** {}\n", title, steps);
-        self.save(Kind::Runbook, namespace, title, body, 60, vec!["runbook".into()])
+        self.save(Kind::Runbook, namespace, title, body, 60, vec!["runbook".into()], author)
     }
 
-    pub fn log_convention(&self, title: &str, rule: &str, namespace: &str) -> Result<String> {
+    pub fn log_convention(&self, title: &str, rule: &str, namespace: &str, author: Option<&str>) -> Result<String> {
         require(title, "title")?;
         require(rule, "rule")?;
         let body = format!("# {}\n\n**Convention:** {}\n", title, rule);
-        self.save(Kind::ProjectConvention, namespace, title, body, 65, vec!["project_convention".into()])
+        self.save(Kind::ProjectConvention, namespace, title, body, 65, vec!["project_convention".into()], author)
     }
 
     /// Import a record of any kind from a template/file (the write path for persona/protocol).
+    /// No attribution here: imports are migration/seeding, preserving the original record as-is.
     pub fn import_record(&self, kind: Kind, namespace: &str, title: &str, body: &str) -> Result<String> {
         require(title, "title")?;
-        self.save(kind, namespace, title, body.to_string(), crate::entry::default_importance(kind), vec![])
+        self.save(kind, namespace, title, body.to_string(), crate::entry::default_importance(kind), vec![], None)
     }
 
     /// Count of live records per kind (for `dm status`).
@@ -588,10 +604,19 @@ impl LocalMemory {
         }
     }
 
-    /// Persona + protocol records (the boot layer), most important first.
+    /// Persona + protocol records (the boot layer), most important first. Agent-less callers
+    /// (embedded mode, hooks, bootstrap) see the legacy full set.
     pub fn persona(&self) -> Result<Vec<Entry>> {
-        let mut out = self.store.by_kind("persona", 5)?;
-        out.extend(self.store.by_kind("protocol", 5)?);
+        self.persona_for(None)
+    }
+
+    /// The boot layer VISIBLE TO an agent identity: shared governance (persona/protocol records
+    /// outside the `agents/` namespace tree) plus that agent's own `agents/<agent>/...` records;
+    /// other agents' personas are excluded, so a token's identity decides which "I am ..." it is
+    /// served. `None` = every record (exactly the pre-agent behaviour).
+    pub fn persona_for(&self, agent: Option<&str>) -> Result<Vec<Entry>> {
+        let mut out = self.store.by_kind_for_agent("persona", agent, 5)?;
+        out.extend(self.store.by_kind_for_agent("protocol", agent, 5)?);
         Ok(out)
     }
 
@@ -825,7 +850,9 @@ impl Memory {
     }
     pub fn remember(&self, text: &str, namespace: &str, valid_from: Option<i64>, valid_to: Option<i64>) -> Result<String> {
         match self {
-            Memory::Local(l) => l.remember(text, namespace, valid_from, valid_to),
+            // Embedded mode carries no agent identity; attribution is a server-side concern
+            // (the remote path is stamped by the server from the token).
+            Memory::Local(l) => l.remember(text, namespace, valid_from, valid_to, None),
             #[cfg(feature = "client")]
             Memory::Remote(r) => r.remember(text, namespace, valid_from, valid_to),
         }
@@ -839,42 +866,42 @@ impl Memory {
     }
     pub fn log_decision(&self, title: &str, context: &str, decision: &str, rationale: &str, namespace: &str) -> Result<String> {
         match self {
-            Memory::Local(l) => l.log_decision(title, context, decision, rationale, namespace),
+            Memory::Local(l) => l.log_decision(title, context, decision, rationale, namespace, None),
             #[cfg(feature = "client")]
             Memory::Remote(r) => r.log_decision(title, context, decision, rationale, namespace),
         }
     }
     pub fn log_lesson(&self, title: &str, lesson: &str, namespace: &str) -> Result<String> {
         match self {
-            Memory::Local(l) => l.log_lesson(title, lesson, namespace),
+            Memory::Local(l) => l.log_lesson(title, lesson, namespace, None),
             #[cfg(feature = "client")]
             Memory::Remote(r) => r.log_lesson(title, lesson, namespace),
         }
     }
     pub fn log_incident(&self, title: &str, impact: &str, resolution: &str, namespace: &str) -> Result<String> {
         match self {
-            Memory::Local(l) => l.log_incident(title, impact, resolution, namespace),
+            Memory::Local(l) => l.log_incident(title, impact, resolution, namespace, None),
             #[cfg(feature = "client")]
             Memory::Remote(r) => r.log_incident(title, impact, resolution, namespace),
         }
     }
     pub fn add_reminder(&self, title: &str, text: &str, namespace: &str) -> Result<String> {
         match self {
-            Memory::Local(l) => l.add_reminder(title, text, namespace),
+            Memory::Local(l) => l.add_reminder(title, text, namespace, None),
             #[cfg(feature = "client")]
             Memory::Remote(r) => r.add_reminder(title, text, namespace),
         }
     }
     pub fn log_runbook(&self, title: &str, steps: &str, namespace: &str) -> Result<String> {
         match self {
-            Memory::Local(l) => l.log_runbook(title, steps, namespace),
+            Memory::Local(l) => l.log_runbook(title, steps, namespace, None),
             #[cfg(feature = "client")]
             Memory::Remote(r) => r.log_runbook(title, steps, namespace),
         }
     }
     pub fn log_convention(&self, title: &str, rule: &str, namespace: &str) -> Result<String> {
         match self {
-            Memory::Local(l) => l.log_convention(title, rule, namespace),
+            Memory::Local(l) => l.log_convention(title, rule, namespace, None),
             #[cfg(feature = "client")]
             Memory::Remote(r) => r.log_convention(title, rule, namespace),
         }
@@ -1017,9 +1044,61 @@ mod tests {
     }
 
     #[test]
+    fn stamp_author_sets_once_and_never_reassigns() {
+        let mut tags = vec!["decision".to_string()];
+        stamp_author(&mut tags, Some("izu"));
+        assert!(tags.contains(&"author:izu".to_string()));
+        // a later write path with a different agent must not re-assign attribution
+        stamp_author(&mut tags, Some("devin"));
+        assert_eq!(tags.iter().filter(|t| t.starts_with("author:")).count(), 1);
+        assert!(tags.contains(&"author:izu".to_string()), "first attribution wins");
+        // agent-less: byte-identical tags
+        let mut plain = vec!["reminder".to_string()];
+        stamp_author(&mut plain, None);
+        assert_eq!(plain, vec!["reminder".to_string()]);
+    }
+
+    #[test]
+    fn authenticated_agent_writes_carry_author_attribution() {
+        let m = LocalMemory::for_test(tmp_store());
+        let uri = m.log_decision("Pick zvec", "", "zvec it is", "", "resources/notes", Some("izu")).unwrap();
+        let hit = m.recall("pick zvec", 5).unwrap().into_iter().find(|e| e.uri == uri).expect("recalled");
+        assert!(hit.tags.contains(&"author:izu".to_string()), "typed save stamps the author: {:?}", hit.tags);
+
+        let uri = m.remember("the bridge runs on narya", "resources/notes", None, None, Some("shesta")).unwrap();
+        let hit = m.recall("bridge narya", 5).unwrap().into_iter().find(|e| e.uri == uri).expect("recalled");
+        assert!(hit.tags.contains(&"author:shesta".to_string()), "free-form save stamps the author");
+
+        // agent-less write: no author tag, exactly as before
+        let uri = m.add_reminder("check backups", "verify k10 export", "agent/reminders", None).unwrap();
+        let hit = m.reminders(5).unwrap().into_iter().find(|e| e.uri == uri).expect("listed");
+        assert!(!hit.tags.iter().any(|t| t.starts_with("author:")), "agent-less write stays unstamped");
+    }
+
+    #[test]
+    fn persona_for_serves_own_identity_plus_shared_governance() {
+        let m = LocalMemory::for_test(tmp_store());
+        m.import_record(Kind::Persona, "shared/governance", "House Rules", "shared boundaries").unwrap();
+        m.import_record(Kind::Persona, "agents/izu/persona", "Izu Persona", "I am Izu").unwrap();
+        m.import_record(Kind::Persona, "agents/shesta/persona", "Shesta Persona", "I am Shesta").unwrap();
+        m.import_record(Kind::Protocol, "agent/protocol", "Behavioral Discipline", "recall before reasoning").unwrap();
+
+        let izu: Vec<String> = m.persona_for(Some("izu")).unwrap().into_iter().map(|e| e.title).collect();
+        assert!(izu.contains(&"Izu Persona".to_string()), "own persona served");
+        assert!(izu.contains(&"House Rules".to_string()), "shared governance served");
+        assert!(izu.contains(&"Behavioral Discipline".to_string()), "protocols are shared");
+        assert!(!izu.contains(&"Shesta Persona".to_string()), "another agent's persona never leaks");
+
+        // agent-less: the legacy full set (backward compatibility until migration)
+        let all: Vec<String> = m.persona().unwrap().into_iter().map(|e| e.title).collect();
+        assert!(all.contains(&"Izu Persona".to_string()) && all.contains(&"Shesta Persona".to_string()));
+        assert_eq!(all.len(), 4);
+    }
+
+    #[test]
     fn remember_valid_and_invalidate_wire_through_the_api() {
         let m = LocalMemory::for_test(tmp_store());
-        let uri = m.remember("status is green", "resources/notes", Some(100), None).unwrap();
+        let uri = m.remember("status is green", "resources/notes", Some(100), None, None).unwrap();
         assert_eq!(m.invalidate(&uri, 300).unwrap(), 1, "one segment invalidated");
         assert!(m.recall("green", 5).unwrap().is_empty(), "no longer valid now");
         let past = m.recall_as_of("green", 5, now_ms(), 200).unwrap();
@@ -1029,8 +1108,8 @@ mod tests {
     #[test]
     fn reindex_links_resolves_wikilinks_and_recall_expands() {
         let m = LocalMemory::for_test(tmp_store());
-        m.remember("Beta the target", "resources/notes", None, None).unwrap();
-        m.remember("Alpha refers to [[Beta the target]] for context", "resources/notes", None, None).unwrap();
+        m.remember("Beta the target", "resources/notes", None, None, None).unwrap();
+        m.remember("Alpha refers to [[Beta the target]] for context", "resources/notes", None, None, None).unwrap();
         let n = m.reindex_links().unwrap();
         assert!(n >= 1, "the [[Beta the target]] reference should resolve and link");
         // a query that only hits alpha still pulls beta in, via the edge
@@ -1041,8 +1120,8 @@ mod tests {
     #[test]
     fn expanded_split_skips_skills_and_dead_endpoints() {
         let m = LocalMemory::for_test(tmp_store());
-        let alpha = m.remember("Alpha hub links to everything relevant", "resources/notes", None, None).unwrap();
-        let live = m.remember("Beta the live neighbor rides along", "resources/notes", None, None).unwrap();
+        let alpha = m.remember("Alpha hub links to everything relevant", "resources/notes", None, None, None).unwrap();
+        let live = m.remember("Beta the live neighbor rides along", "resources/notes", None, None, None).unwrap();
         let skill = m.import_record(Kind::Skill, "agent/skills", "Secret skill", "skill body must never ride recall").unwrap();
         m.link(&alpha, &live, "mentions").unwrap();
         m.link(&alpha, &skill, "mentions").unwrap();
@@ -1152,8 +1231,8 @@ mod tests {
         let _g = RECALL_ENV_LOCK.lock().unwrap();
         std::env::set_var("DM_RECALL_FLOOR", "0");
         let m = LocalMemory::for_test(tmp_store());
-        m.remember("alpha bravo charlie delta", "resources/notes", None, None).unwrap();
-        m.remember("alpha only here", "resources/notes", None, None).unwrap();
+        m.remember("alpha bravo charlie delta", "resources/notes", None, None, None).unwrap();
+        m.remember("alpha only here", "resources/notes", None, None, None).unwrap();
         let disabled: std::collections::HashSet<String> =
             m.recall("alpha", 10).unwrap().into_iter().map(|e| e.uri).collect();
         let prefloor: std::collections::HashSet<String> =
@@ -1290,7 +1369,7 @@ mod floor_eval {
 
         let mut uri_of: HashMap<&str, String> = HashMap::new();
         for (label, text) in corpus() {
-            uri_of.insert(label, m.remember(text, "resources/eval", None, None).unwrap());
+            uri_of.insert(label, m.remember(text, "resources/eval", None, None, None).unwrap());
         }
         let channels = |qs: Vec<(&'static str, Vec<&'static str>)>| -> Vec<QChannels> {
             qs.into_iter()

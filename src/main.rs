@@ -380,6 +380,9 @@ enum AdminCmd {
         label: String,
         #[arg(long, default_value = "")]
         display: String,
+        /// Per-agent identity for the token (persona selection + write attribution); omit for agent-less.
+        #[arg(long)]
+        agent: Option<String>,
     },
     /// List tenants and live token counts.
     List,
@@ -718,20 +721,25 @@ fn run() -> Result<()> {
             })?;
             let rc = client::RemoteClient::new(link)?;
             match a {
-                AdminCmd::Add { tenant, label, display } => {
-                    let (t, tok) = rc.admin_add(&tenant, &label, &display)?;
-                    println!("created tenant '{t}'. one-time token (save it now, shown once):");
+                AdminCmd::Add { tenant, label, display, agent } => {
+                    let (t, tok) = rc.admin_add(&tenant, &label, &display, agent.as_deref())?;
+                    match &agent {
+                        Some(a) => println!("created tenant '{t}' (token agent: {a}). one-time token (save it now, shown once):"),
+                        None => println!("created tenant '{t}'. one-time token (save it now, shown once):"),
+                    }
                     println!("    {tok}");
                     println!("the user runs:  dmem login {} {tok}", link.url);
                 }
                 AdminCmd::List => {
                     if let Some(arr) = rc.admin_list()?.as_array() {
                         for row in arr {
+                            let agents = row.get("agents").and_then(|x| x.as_str()).unwrap_or("");
                             println!(
-                                "- {:<20} {:<10} {} token(s)",
+                                "- {:<20} {:<10} {} token(s){}",
                                 row.get("tenant").and_then(|x| x.as_str()).unwrap_or("?"),
                                 row.get("status").and_then(|x| x.as_str()).unwrap_or("?"),
-                                row.get("tokens").and_then(|x| x.as_i64()).unwrap_or(0)
+                                row.get("tokens").and_then(|x| x.as_i64()).unwrap_or(0),
+                                if agents.is_empty() { String::new() } else { format!("  agents: {agents}") }
                             );
                         }
                     }

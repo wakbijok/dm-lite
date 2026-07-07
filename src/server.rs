@@ -44,34 +44,56 @@ const MAX_LIMIT: usize = 1000;
 /// is generous and stops an unbounded-body memory blowup.
 const MAX_BODY_BYTES: usize = 512 * 1024;
 
-/// Resolve an `Authorization` header to a tenant. The seam: BearerAuth now, JWT could drop
-/// in later without touching handlers.
+/// Resolve an `Authorization` header to a caller identity (tenant + optional agent). The seam:
+/// BearerAuth now, JWT could drop in later without touching handlers.
 pub trait Authenticator: Send + Sync {
-    fn tenant_for(&self, auth_header: Option<&str>) -> Option<String>;
+    fn identity_for(&self, auth_header: Option<&str>) -> Option<crate::iam::Identity>;
 }
 
-/// Multi-token bearer auth: a token -> tenant map built from `DM_TOKEN_<TENANT>` env vars. Keyed
-/// by the SHA-256 of the secret (not the raw secret) so a lookup compares fixed-length digests.
+/// Multi-token bearer auth: a token -> (tenant, agent) map built from `DM_TOKEN_<TENANT>` and
+/// `DM_TOKEN_<TENANT>__<AGENT>` env vars. Keyed by the SHA-256 of the secret (not the raw
+/// secret) so a lookup compares fixed-length digests.
 pub struct BearerAuth {
-    map: HashMap<String, String>,
+    map: HashMap<String, (String, Option<String>)>,
+}
+
+/// Render a parsed (tenant, agent) identity back in the env-var spelling, for error messages.
+fn ident_str(i: &(String, Option<String>)) -> String {
+    match &i.1 {
+        Some(a) => format!("{}__{}", i.0, a),
+        None => i.0.clone(),
+    }
 }
 
 impl BearerAuth {
-    /// Build the token-hash -> tenant map from `DM_TOKEN_<TENANT>` env vars. Fails fast on an
-    /// ambiguous config: the same secret mapping to two different tenants would otherwise
-    /// resolve nondeterministically (HashMap iteration order), silently breaking isolation.
+    /// Build the token-hash -> identity map from the env. `DM_TOKEN_<TENANT>=secret` is an
+    /// agent-less token (exactly as before); `DM_TOKEN_<TENANT>__<AGENT>=secret` also carries a
+    /// per-agent identity. The FIRST double underscore splits tenant from agent (single
+    /// underscores stay part of the tenant name; a trailing `__` means agent-less). Fails fast
+    /// on an ambiguous config: the same secret mapping to two different identities would
+    /// otherwise resolve nondeterministically (HashMap iteration order), silently breaking
+    /// tenant isolation or agent attribution.
     pub fn from_env() -> Result<Self> {
-        let mut map: HashMap<String, String> = HashMap::new();
+        let mut map: HashMap<String, (String, Option<String>)> = HashMap::new();
         for (k, v) in std::env::vars() {
-            if let Some(tenant) = k.strip_prefix("DM_TOKEN_") {
-                if tenant.is_empty() || v.is_empty() {
+            if let Some(rest) = k.strip_prefix("DM_TOKEN_") {
+                let (tenant_raw, agent_raw) = match rest.split_once("__") {
+                    Some((t, a)) => (t, Some(a)),
+                    None => (rest, None),
+                };
+                if tenant_raw.is_empty() || v.is_empty() {
                     continue;
                 }
-                let tenant = crate::config::canonical_tenant(tenant);
-                if let Some(prev) = map.insert(sha256_hex(&v), tenant.clone()) {
-                    if prev != tenant {
+                let ident = (
+                    crate::config::canonical_tenant(tenant_raw),
+                    agent_raw.and_then(crate::config::canonical_agent),
+                );
+                if let Some(prev) = map.insert(sha256_hex(&v), ident.clone()) {
+                    if prev != ident {
                         anyhow::bail!(
-                            "ambiguous DM_TOKEN config: one bearer secret maps to both tenants '{prev}' and '{tenant}'"
+                            "ambiguous DM_TOKEN config: one bearer secret maps to both '{}' and '{}'",
+                            ident_str(&prev),
+                            ident_str(&ident)
                         );
                     }
                 }
@@ -96,9 +118,13 @@ fn parse_bearer(h: &str) -> Option<&str> {
 }
 
 impl Authenticator for BearerAuth {
-    fn tenant_for(&self, auth_header: Option<&str>) -> Option<String> {
+    fn identity_for(&self, auth_header: Option<&str>) -> Option<crate::iam::Identity> {
         let token = parse_bearer(auth_header?)?;
-        self.map.get(&sha256_hex(token)).cloned()
+        self.map.get(&sha256_hex(token)).map(|(tenant, agent)| crate::iam::Identity {
+            tenant: Some(tenant.clone()),
+            is_admin: false,
+            agent: agent.clone(),
+        })
     }
 }
 
@@ -162,14 +188,7 @@ fn resolve_identity(st: &AppState, headers: &HeaderMap) -> Option<crate::iam::Id
             }
         }
     }
-    st.auth
-        .tenant_for(Some(h))
-        .map(|t| crate::iam::Identity { tenant: Some(t), is_admin: false })
-}
-
-/// Resolve the request's member tenant (admin tokens have no tenant -> None -> 401 here).
-fn tenant_of(st: &AppState, headers: &HeaderMap) -> Option<String> {
-    resolve_identity(st, headers).and_then(|id| id.tenant)
+    st.auth.identity_for(Some(h))
 }
 
 /// Run `f` only for a valid ADMIN token (403 for a member, 401 for none).
@@ -329,17 +348,20 @@ fn ns_or<'a>(ns: &'a Option<String>, default: &'a str) -> &'a str {
 }
 
 /// Auth, get the request's (cached) tenant handle, run the blocking `f` on the blocking pool, and
-/// JSON-encode its result. `client_err` maps a failure to 400 (bad input) instead of 500. `f` runs
-/// under the tenant's Mutex via spawn_blocking, so SQLite/zvec work never blocks an async worker
-/// and same-tenant requests serialize (SQLite writes serialize anyway) while different tenants run
-/// in parallel.
+/// JSON-encode its result. `f` receives the token's agent identity (None for agent-less and
+/// legacy tokens) alongside the tenant's memory: the tenant handle is CACHED PER TENANT and
+/// shared by every agent on it (one shared memory), so the agent must ride the request, never
+/// the handle. `client_err` maps a failure to 400 (bad input) instead of 500. `f` runs under the
+/// tenant's Mutex via spawn_blocking, so SQLite/zvec work never blocks an async worker and
+/// same-tenant requests serialize (SQLite writes serialize anyway) while different tenants run
+/// in parallel. (Admin tokens have no tenant -> 401 here.)
 async fn with_tenant<F>(st: &AppState, headers: &HeaderMap, client_err: bool, f: F) -> ApiResp
 where
-    F: FnOnce(&LocalMemory) -> Result<serde_json::Value> + Send + 'static,
+    F: FnOnce(&LocalMemory, Option<String>) -> Result<serde_json::Value> + Send + 'static,
 {
-    let tenant = match tenant_of(st, headers) {
-        Some(t) => t,
-        None => return err(StatusCode::UNAUTHORIZED, "invalid or missing bearer token"),
+    let (tenant, agent) = match resolve_identity(st, headers) {
+        Some(crate::iam::Identity { tenant: Some(t), agent, .. }) => (t, agent),
+        _ => return err(StatusCode::UNAUTHORIZED, "invalid or missing bearer token"),
     };
     let handle = match st.memory_for(&tenant) {
         Ok(h) => h,
@@ -347,7 +369,7 @@ where
     };
     let res = tokio::task::spawn_blocking(move || {
         let guard = handle.lock().unwrap_or_else(|p| p.into_inner());
-        f(&guard)
+        f(&guard, agent)
     })
     .await;
     match res {
@@ -368,7 +390,7 @@ async fn healthz() -> ApiResp {
 }
 
 async fn recall_h(State(st): State<AppState>, headers: HeaderMap, Json(req): Json<RecallReq>) -> ApiResp {
-    with_tenant(&st, &headers, false, move |m| {
+    with_tenant(&st, &headers, false, move |m, _agent| {
         let limit = req.limit.unwrap_or(6).min(MAX_LIMIT);
         let hits = match req.as_of {
             Some(ts) => m.recall_as_of(&req.query, limit, ts, req.valid.unwrap_or(ts))?,
@@ -380,33 +402,35 @@ async fn recall_h(State(st): State<AppState>, headers: HeaderMap, Json(req): Jso
 }
 
 async fn recent_h(State(st): State<AppState>, headers: HeaderMap, Json(req): Json<RecentReq>) -> ApiResp {
-    with_tenant(&st, &headers, false, move |m| Ok(json!(m.recent(req.limit.unwrap_or(10).min(MAX_LIMIT))?))).await
+    with_tenant(&st, &headers, false, move |m, _agent| Ok(json!(m.recent(req.limit.unwrap_or(10).min(MAX_LIMIT))?))).await
 }
 
 async fn persona_h(State(st): State<AppState>, headers: HeaderMap) -> ApiResp {
-    with_tenant(&st, &headers, false, |m| Ok(json!(m.persona()?))).await
+    // The token's agent identity picks the persona set: an agent gets shared governance + its
+    // own agents/<agent>/ records; an agent-less token keeps the legacy everything.
+    with_tenant(&st, &headers, false, |m, agent| Ok(json!(m.persona_for(agent.as_deref())?))).await
 }
 
 async fn reminders_h(State(st): State<AppState>, headers: HeaderMap, Json(req): Json<RecentReq>) -> ApiResp {
-    with_tenant(&st, &headers, false, move |m| Ok(json!(m.reminders(req.limit.unwrap_or(5).min(MAX_LIMIT))?))).await
+    with_tenant(&st, &headers, false, move |m, _agent| Ok(json!(m.reminders(req.limit.unwrap_or(5).min(MAX_LIMIT))?))).await
 }
 
 async fn latest_save_h(State(st): State<AppState>, headers: HeaderMap) -> ApiResp {
-    with_tenant(&st, &headers, false, |m| Ok(json!({ "latest_save_ms": m.latest_save_ms()? }))).await
+    with_tenant(&st, &headers, false, |m, _agent| Ok(json!({ "latest_save_ms": m.latest_save_ms()? }))).await
 }
 
 async fn history_h(State(st): State<AppState>, headers: HeaderMap, Json(req): Json<HistoryReq>) -> ApiResp {
-    with_tenant(&st, &headers, false, move |m| Ok(json!(m.history(&req.uri, req.limit.unwrap_or(20).min(MAX_LIMIT))?))).await
+    with_tenant(&st, &headers, false, move |m, _agent| Ok(json!(m.history(&req.uri, req.limit.unwrap_or(20).min(MAX_LIMIT))?))).await
 }
 
 async fn forget_h(State(st): State<AppState>, headers: HeaderMap, Json(req): Json<ForgetReq>) -> ApiResp {
-    with_tenant(&st, &headers, false, move |m| Ok(json!({ "forgotten": m.forget(&req.uri)? }))).await
+    with_tenant(&st, &headers, false, move |m, _agent| Ok(json!({ "forgotten": m.forget(&req.uri)? }))).await
 }
 
 async fn remember_h(State(st): State<AppState>, headers: HeaderMap, Json(req): Json<RememberReq>) -> ApiResp {
     // client_err: a bad valid interval (valid_to <= valid_from) is client input -> 400, not 500.
-    with_tenant(&st, &headers, true, move |m| {
-        Ok(json!({ "uri": m.remember(&req.text, ns_or(&req.namespace, "resources/notes"), req.valid_from, req.valid_to)? }))
+    with_tenant(&st, &headers, true, move |m, agent| {
+        Ok(json!({ "uri": m.remember(&req.text, ns_or(&req.namespace, "resources/notes"), req.valid_from, req.valid_to, agent.as_deref())? }))
     })
     .await
 }
@@ -414,14 +438,14 @@ async fn remember_h(State(st): State<AppState>, headers: HeaderMap, Json(req): J
 async fn invalidate_h(State(st): State<AppState>, headers: HeaderMap, Json(req): Json<InvalidateReq>) -> ApiResp {
     // client_err: a non-positive cut is client input -> 400 (consistent with the other write
     // handlers); genuine storage faults are rare and accept the same generic 400 those do.
-    with_tenant(&st, &headers, true, move |m| {
+    with_tenant(&st, &headers, true, move |m, _agent| {
         Ok(json!({ "invalidated": m.invalidate(&req.uri, req.valid_to)? }))
     })
     .await
 }
 
 async fn link_h(State(st): State<AppState>, headers: HeaderMap, Json(req): Json<LinkReq>) -> ApiResp {
-    with_tenant(&st, &headers, true, move |m| {
+    with_tenant(&st, &headers, true, move |m, _agent| {
         m.link(&req.from, &req.to, &req.rel)?;
         Ok(json!({ "linked": 1 }))
     })
@@ -429,29 +453,29 @@ async fn link_h(State(st): State<AppState>, headers: HeaderMap, Json(req): Json<
 }
 
 async fn unlink_h(State(st): State<AppState>, headers: HeaderMap, Json(req): Json<LinkReq>) -> ApiResp {
-    with_tenant(&st, &headers, true, move |m| {
+    with_tenant(&st, &headers, true, move |m, _agent| {
         Ok(json!({ "unlinked": m.unlink(&req.from, &req.to, &req.rel)? }))
     })
     .await
 }
 
 async fn edges_h(State(st): State<AppState>, headers: HeaderMap, Json(req): Json<EdgesReq>) -> ApiResp {
-    with_tenant(&st, &headers, false, move |m| Ok(json!(m.edges_of(&req.uri)?))).await
+    with_tenant(&st, &headers, false, move |m, _agent| Ok(json!(m.edges_of(&req.uri)?))).await
 }
 
 async fn edges_all_h(State(st): State<AppState>, headers: HeaderMap, Json(req): Json<EdgesAllReq>) -> ApiResp {
-    with_tenant(&st, &headers, false, move |m| Ok(json!(m.all_edges(req.limit.unwrap_or(5000).min(50_000))?))).await
+    with_tenant(&st, &headers, false, move |m, _agent| Ok(json!(m.all_edges(req.limit.unwrap_or(5000).min(50_000))?))).await
 }
 
 async fn neighbors_h(State(st): State<AppState>, headers: HeaderMap, Json(req): Json<NeighborsReq>) -> ApiResp {
-    with_tenant(&st, &headers, false, move |m| {
+    with_tenant(&st, &headers, false, move |m, _agent| {
         Ok(json!(m.neighbors(&req.seeds, req.depth.unwrap_or(1).min(5), req.limit.unwrap_or(50).min(MAX_LIMIT))?))
     })
     .await
 }
 
 async fn recall_expanded_h(State(st): State<AppState>, headers: HeaderMap, Json(req): Json<RecallExpandedReq>) -> ApiResp {
-    with_tenant(&st, &headers, false, move |m| {
+    with_tenant(&st, &headers, false, move |m, _agent| {
         // Split shape so clients can render the graph's contribution distinguishably; older
         // clients that expected a flat array must upgrade alongside the server (single-admin
         // deployment; the hook path degrades to plain /recall on a decode failure).
@@ -463,49 +487,49 @@ async fn recall_expanded_h(State(st): State<AppState>, headers: HeaderMap, Json(
 }
 
 async fn reindex_links_h(State(st): State<AppState>, headers: HeaderMap) -> ApiResp {
-    with_tenant(&st, &headers, true, move |m| Ok(json!({ "linked": m.reindex_links()? }))).await
+    with_tenant(&st, &headers, true, move |m, _agent| Ok(json!({ "linked": m.reindex_links()? }))).await
 }
 
 async fn decision_h(State(st): State<AppState>, headers: HeaderMap, Json(req): Json<DecisionReq>) -> ApiResp {
-    with_tenant(&st, &headers, true, move |m| {
+    with_tenant(&st, &headers, true, move |m, agent| {
         let ns = ns_or(&req.namespace, "resources/notes");
-        Ok(json!({ "uri": m.log_decision(&req.title, &req.context, &req.decision, &req.rationale, ns)? }))
+        Ok(json!({ "uri": m.log_decision(&req.title, &req.context, &req.decision, &req.rationale, ns, agent.as_deref())? }))
     })
     .await
 }
 
 async fn lesson_h(State(st): State<AppState>, headers: HeaderMap, Json(req): Json<LessonReq>) -> ApiResp {
-    with_tenant(&st, &headers, true, move |m| {
-        Ok(json!({ "uri": m.log_lesson(&req.title, &req.lesson, ns_or(&req.namespace, "agent/lessons"))? }))
+    with_tenant(&st, &headers, true, move |m, agent| {
+        Ok(json!({ "uri": m.log_lesson(&req.title, &req.lesson, ns_or(&req.namespace, "agent/lessons"), agent.as_deref())? }))
     })
     .await
 }
 
 async fn incident_h(State(st): State<AppState>, headers: HeaderMap, Json(req): Json<IncidentReq>) -> ApiResp {
-    with_tenant(&st, &headers, true, move |m| {
+    with_tenant(&st, &headers, true, move |m, agent| {
         let ns = ns_or(&req.namespace, "resources/incidents");
-        Ok(json!({ "uri": m.log_incident(&req.title, &req.impact, &req.resolution, ns)? }))
+        Ok(json!({ "uri": m.log_incident(&req.title, &req.impact, &req.resolution, ns, agent.as_deref())? }))
     })
     .await
 }
 
 async fn runbook_h(State(st): State<AppState>, headers: HeaderMap, Json(req): Json<RunbookReq>) -> ApiResp {
-    with_tenant(&st, &headers, true, move |m| {
-        Ok(json!({ "uri": m.log_runbook(&req.title, &req.steps, ns_or(&req.namespace, "resources/runbooks"))? }))
+    with_tenant(&st, &headers, true, move |m, agent| {
+        Ok(json!({ "uri": m.log_runbook(&req.title, &req.steps, ns_or(&req.namespace, "resources/runbooks"), agent.as_deref())? }))
     })
     .await
 }
 
 async fn convention_h(State(st): State<AppState>, headers: HeaderMap, Json(req): Json<ConventionReq>) -> ApiResp {
-    with_tenant(&st, &headers, true, move |m| {
-        Ok(json!({ "uri": m.log_convention(&req.title, &req.rule, ns_or(&req.namespace, "resources/conventions"))? }))
+    with_tenant(&st, &headers, true, move |m, agent| {
+        Ok(json!({ "uri": m.log_convention(&req.title, &req.rule, ns_or(&req.namespace, "resources/conventions"), agent.as_deref())? }))
     })
     .await
 }
 
 async fn reminder_h(State(st): State<AppState>, headers: HeaderMap, Json(req): Json<ReminderReq>) -> ApiResp {
-    with_tenant(&st, &headers, true, move |m| {
-        Ok(json!({ "uri": m.add_reminder(&req.title, &req.text, ns_or(&req.namespace, "agent/reminders"))? }))
+    with_tenant(&st, &headers, true, move |m, agent| {
+        Ok(json!({ "uri": m.add_reminder(&req.title, &req.text, ns_or(&req.namespace, "agent/reminders"), agent.as_deref())? }))
     })
     .await
 }
@@ -527,7 +551,7 @@ struct ImportReq {
 }
 
 async fn import_h(State(st): State<AppState>, headers: HeaderMap, Json(req): Json<ImportReq>) -> ApiResp {
-    with_tenant(&st, &headers, true, move |m| {
+    with_tenant(&st, &headers, true, move |m, _agent| {
         let kind = crate::entry::Kind::from_str(&req.kind)
             .ok_or_else(|| anyhow::anyhow!("unknown kind: {}", req.kind))?;
         let ns = if req.namespace.is_empty() { "resources/notes" } else { &req.namespace };
@@ -550,6 +574,9 @@ struct AdminAddReq {
     display: String,
     #[serde(default)]
     label: String,
+    /// Optional per-agent identity label for the minted token (None = agent-less).
+    #[serde(default)]
+    agent: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -560,8 +587,8 @@ struct AdminTargetReq {
 async fn admin_add_h(State(st): State<AppState>, headers: HeaderMap, Json(req): Json<AdminAddReq>) -> ApiResp {
     with_admin(&st, &headers, || {
         let iam = crate::iam::Iam::open()?;
-        let (tenant, token) = iam.create_tenant(&req.tenant, &req.display, &req.label)?;
-        Ok(json!({ "tenant": tenant, "token": token }))
+        let (tenant, token) = iam.create_tenant(&req.tenant, &req.display, &req.label, req.agent.as_deref())?;
+        Ok(json!({ "tenant": tenant, "token": token, "agent": req.agent.as_deref().and_then(crate::config::canonical_agent) }))
     })
 }
 
@@ -571,7 +598,7 @@ async fn admin_list_h(State(st): State<AppState>, headers: HeaderMap) -> ApiResp
         let rows: Vec<_> = iam
             .list()?
             .into_iter()
-            .map(|(t, s, n)| json!({ "tenant": t, "status": s, "tokens": n }))
+            .map(|(t, s, n, agents)| json!({ "tenant": t, "status": s, "tokens": n, "agents": agents }))
             .collect();
         Ok(json!(rows))
     })
@@ -772,12 +799,50 @@ mod tests {
         let _g = ENV_LOCK.lock().unwrap();
         std::env::set_var("DM_TOKEN_ACME", "secret123");
         let a = BearerAuth::from_env().unwrap();
-        assert_eq!(a.tenant_for(Some("Bearer secret123")).as_deref(), Some("acme"));
-        assert_eq!(a.tenant_for(Some("bearer secret123")).as_deref(), Some("acme")); // case-insensitive
-        assert_eq!(a.tenant_for(Some("Bearer nope")), None);
-        assert_eq!(a.tenant_for(Some("Basic secret123")), None);
-        assert_eq!(a.tenant_for(None), None);
+        let id = a.identity_for(Some("Bearer secret123")).expect("token resolves");
+        assert_eq!(id.tenant.as_deref(), Some("acme"));
+        assert!(id.agent.is_none(), "plain DM_TOKEN_<TENANT> stays agent-less");
+        assert!(!id.is_admin);
+        // case-insensitive scheme
+        assert_eq!(a.identity_for(Some("bearer secret123")).unwrap().tenant.as_deref(), Some("acme"));
+        assert!(a.identity_for(Some("Bearer nope")).is_none());
+        assert!(a.identity_for(Some("Basic secret123")).is_none());
+        assert!(a.identity_for(None).is_none());
         std::env::remove_var("DM_TOKEN_ACME");
+    }
+
+    #[test]
+    fn env_token_agent_forms_parse() {
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var("DM_TOKEN_WAKSPACE__IZU", "agtok1"); // tenant + agent
+        std::env::set_var("DM_TOKEN_MY_TENANT__SHESTA", "agtok2"); // single underscores stay in the tenant
+        std::env::set_var("DM_TOKEN_EDGE__", "agtok3"); // trailing __ = agent-less
+        std::env::set_var("DM_TOKEN___GHOST", "agtok4"); // empty tenant = ignored
+        std::env::set_var("DM_TOKEN_T2__A__B", "agtok5"); // FIRST __ splits; the rest is the agent
+        let a = BearerAuth::from_env().unwrap();
+
+        let id = a.identity_for(Some("Bearer agtok1")).expect("agent token resolves");
+        assert_eq!(id.tenant.as_deref(), Some("wakspace"));
+        assert_eq!(id.agent.as_deref(), Some("izu"), "env agent label is canonicalized (lowercase)");
+        assert!(!id.is_admin);
+
+        let id = a.identity_for(Some("Bearer agtok2")).unwrap();
+        assert_eq!(id.tenant.as_deref(), Some("my_tenant"), "single underscores belong to the tenant");
+        assert_eq!(id.agent.as_deref(), Some("shesta"));
+
+        let id = a.identity_for(Some("Bearer agtok3")).unwrap();
+        assert_eq!(id.tenant.as_deref(), Some("edge"));
+        assert!(id.agent.is_none(), "trailing __ means agent-less");
+
+        assert!(a.identity_for(Some("Bearer agtok4")).is_none(), "empty tenant is skipped");
+
+        let id = a.identity_for(Some("Bearer agtok5")).unwrap();
+        assert_eq!(id.tenant.as_deref(), Some("t2"));
+        assert_eq!(id.agent.as_deref(), Some("a__b"), "only the first __ splits");
+
+        for k in ["DM_TOKEN_WAKSPACE__IZU", "DM_TOKEN_MY_TENANT__SHESTA", "DM_TOKEN_EDGE__", "DM_TOKEN___GHOST", "DM_TOKEN_T2__A__B"] {
+            std::env::remove_var(k);
+        }
     }
 
     #[test]
@@ -789,6 +854,17 @@ mod tests {
         assert!(r.is_err(), "same secret -> two tenants must be rejected");
         std::env::remove_var("DM_TOKEN_ACME");
         std::env::remove_var("DM_TOKEN_GLOBEX");
+    }
+
+    #[test]
+    fn duplicate_secret_to_different_agents_fails_fast() {
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var("DM_TOKEN_ACME2__IZU", "shared2");
+        std::env::set_var("DM_TOKEN_ACME2__DEVIN", "shared2");
+        let r = BearerAuth::from_env();
+        assert!(r.is_err(), "same secret -> same tenant but two agents must be rejected (attribution)");
+        std::env::remove_var("DM_TOKEN_ACME2__IZU");
+        std::env::remove_var("DM_TOKEN_ACME2__DEVIN");
     }
 
     #[test]
@@ -817,7 +893,7 @@ mod tests {
         std::env::set_var("DM_TOKEN_T1SRV", "tok1");
         // seed a record into tenant t1srv
         let m = Memory::open_tenant("t1srv").unwrap();
-        m.remember("the vector substrate is zvec", "resources/notes", None, None).unwrap();
+        m.remember("the vector substrate is zvec", "resources/notes", None, None, None).unwrap();
 
         let app = router(Arc::new(BearerAuth::from_env().unwrap()), None);
 
@@ -907,6 +983,105 @@ mod tests {
         assert!(s.contains("postfix"), "recall should return the just-saved record: {s}");
 
         std::env::remove_var("DM_TOKEN_RT1");
+        std::env::remove_var("DM_DATA_DIR");
+    }
+
+    // The identity-bleed regression this branch exists for: an agent token gets its OWN persona
+    // plus shared governance over the wire, never another agent's; an agent-less token on the
+    // SAME tenant still sees the legacy full set.
+    // ENV_LOCK must span the awaits (the env vars must stay set for the whole request), same as
+    // the other route tests here; silence the lint instead of growing its baseline count.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn persona_route_serves_the_tokens_agent_only() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("dmpers-{}-{}", std::process::id(), crate::entry::now_ms()));
+        std::env::set_var("DM_DATA_DIR", &dir);
+        std::env::set_var("DM_TOKEN_PT1__IZU", "izutok");
+        std::env::set_var("DM_TOKEN_PT1", "plaintok");
+        let m = Memory::open_tenant("pt1").unwrap();
+        m.import_record(crate::entry::Kind::Persona, "agents/izu/persona", "Izu Persona", "I am Izu").unwrap();
+        m.import_record(crate::entry::Kind::Persona, "agents/shesta/persona", "Shesta Persona", "I am Shesta").unwrap();
+        m.import_record(crate::entry::Kind::Persona, "shared/governance", "House Rules", "shared rules").unwrap();
+
+        let app = router(Arc::new(BearerAuth::from_env().unwrap()), None);
+        let call = |tok: &str| {
+            let app = app.clone();
+            let tok = format!("Bearer {tok}");
+            async move {
+                let resp = app
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri("/persona")
+                            .header("authorization", tok)
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status(), StatusCode::OK);
+                let body = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+                String::from_utf8_lossy(&body).to_string()
+            }
+        };
+
+        let s = call("izutok").await;
+        assert!(s.contains("Izu Persona") && s.contains("House Rules"), "own persona + shared governance: {s}");
+        assert!(!s.contains("Shesta Persona"), "another agent's persona must not leak: {s}");
+
+        let s = call("plaintok").await;
+        assert!(s.contains("Izu Persona") && s.contains("Shesta Persona"), "agent-less token keeps legacy behaviour: {s}");
+
+        std::env::remove_var("DM_TOKEN_PT1__IZU");
+        std::env::remove_var("DM_TOKEN_PT1");
+        std::env::remove_var("DM_DATA_DIR");
+    }
+
+    // Write attribution over the wire: a save through an agent token comes back from recall
+    // with the author:<agent> tag stamped by the server (the client sends no attribution).
+    #[allow(clippy::await_holding_lock)] // ENV_LOCK must span the awaits, as above
+    #[tokio::test]
+    async fn remember_with_agent_token_stamps_author() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("dmattr-{}-{}", std::process::id(), crate::entry::now_ms()));
+        std::env::set_var("DM_DATA_DIR", &dir);
+        std::env::set_var("DM_TOKEN_AT1__SHESTA", "shestatok");
+        let app = router(Arc::new(BearerAuth::from_env().unwrap()), None);
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/remember")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer shestatok")
+                    .body(Body::from(r#"{"text":"the report template lives in projects docs","namespace":"resources/notes"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/recall")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer shestatok")
+                    .body(Body::from(r#"{"query":"report template docs","limit":5}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        let s = String::from_utf8_lossy(&body);
+        assert!(s.contains("author:shesta"), "recalled record carries the token's agent as author: {s}");
+
+        std::env::remove_var("DM_TOKEN_AT1__SHESTA");
         std::env::remove_var("DM_DATA_DIR");
     }
 }

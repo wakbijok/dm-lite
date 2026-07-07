@@ -32,6 +32,14 @@ pub trait MemoryStore {
     /// All live records of a kind (for persona/protocol injection).
     fn by_kind(&self, kind: &str, limit: usize) -> Result<Vec<Entry>>;
 
+    /// Live records of a kind VISIBLE TO an agent identity (the per-agent governance query).
+    /// `None` = no agent identity: every record, exactly `by_kind` (legacy tokens, embedded
+    /// mode). `Some(a)` = records whose namespace lies outside the `agents/` tree (shared
+    /// governance goes to everyone) plus those under `agents/<a>` (that agent's own); another
+    /// agent's `agents/<b>/...` records are excluded. Filtering happens at the query so the
+    /// LIMIT applies to the visible set, not before it.
+    fn by_kind_for_agent(&self, kind: &str, agent: Option<&str>, limit: usize) -> Result<Vec<Entry>>;
+
     /// Recall as the store existed AS OF system-time `as_of_ms`, for facts VALID AT
     /// `valid_ms`. Keyword-only (the FTS + vector indexes hold only the current version);
     /// a linear scan over history reconstructs the past slice. Best first.
