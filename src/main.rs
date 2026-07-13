@@ -62,7 +62,7 @@ enum Cmd {
     #[cfg(feature = "wizard")]
     Setup,
     /// Wire (or with --remove, unwire) dmem into your agents (hooks for Devin/Claude Code/Codex/
-    /// Hermes; an MCP entry for hook-less Claude Desktop).
+    /// Hermes/Grok; an MCP entry for hook-less Claude Desktop).
     Bootstrap {
         #[arg(long)]
         devin: bool,
@@ -75,6 +75,9 @@ enum Cmd {
         /// OpenCode (TypeScript plugin for persona/recall/idle-nudge + an mcp.dmem entry).
         #[arg(long)]
         opencode: bool,
+        /// Grok CLI (Claude-Code-compatible plugin for persona/recall hooks + an MCP entry).
+        #[arg(long)]
+        grok: bool,
         /// Claude Desktop (MCP only; no hooks). Adds an mcpServers.dmem entry.
         #[arg(long = "claude-desktop")]
         claude_desktop: bool,
@@ -444,8 +447,8 @@ fn run() -> Result<()> {
     match cli.cmd {
         #[cfg(feature = "wizard")]
         Cmd::Setup => setup::run(),
-        Cmd::Bootstrap { devin, claude, codex, hermes, opencode, claude_desktop, all, remove } => {
-            bootstrap::run_mode(devin || all, claude || all, codex || all, hermes || all, opencode || all, claude_desktop || all, remove)
+        Cmd::Bootstrap { devin, claude, codex, hermes, opencode, grok, claude_desktop, all, remove } => {
+            bootstrap::run_mode(devin || all, claude || all, codex || all, hermes || all, opencode || all, grok || all, claude_desktop || all, remove)
         }
         Cmd::Hook { event, hermes, raw } => match event {
             HookCmd::SessionStart => hooks::session_start(hermes, raw),

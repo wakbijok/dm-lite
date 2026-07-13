@@ -808,16 +808,95 @@ fn opencode_install(dm: &str, remove: bool) -> Result<()> {
     Ok(())
 }
 
-pub fn run(devin: bool, claude: bool, codex: bool, hermes: bool, opencode: bool, claude_desktop: bool) -> Result<()> {
-    run_mode(devin, claude, codex, hermes, opencode, claude_desktop, false)
+/// Write the dm-lite Grok plugin tree. Grok's plugin system reads the Claude Code manifest
+/// format (`.claude-plugin/plugin.json` + CC-shape hooks.json) and its hooks emit/consume the
+/// same `hookSpecificOutput.additionalContext` protocol, so the same `dmem hook ...` commands
+/// drive persona on SessionStart and recall on UserPromptSubmit.
+fn grok_write_plugin(plug_dir: &Path, dm: &str) -> Result<()> {
+    std::fs::create_dir_all(plug_dir.join(".claude-plugin"))?;
+    std::fs::create_dir_all(plug_dir.join("hooks"))?;
+    let manifest = json!({
+        "name": "dmem",
+        "version": env!("CARGO_PKG_VERSION"),
+        "description": "Shared cross-tool memory for Grok, backed by dm-lite (dmem). Persona + recent context on session start, deterministic hybrid recall per prompt, and remember/recall memory tools.",
+        "license": "MIT",
+        "hooks": "./hooks/hooks.json"
+    });
+    std::fs::write(plug_dir.join(".claude-plugin/plugin.json"), serde_json::to_string_pretty(&manifest)? + "\n")?;
+    let hooks = json!({
+        "hooks": {
+            "SessionStart": [ { "matcher": "*", "hooks": [
+                { "type": "command", "command": format!("{dm} hook session_start"), "timeout": 10 } ] } ],
+            "UserPromptSubmit": [ { "matcher": "*", "hooks": [
+                { "type": "command", "command": format!("{dm} hook user_prompt_submit"), "timeout": 8 } ] } ]
+        }
+    });
+    std::fs::write(plug_dir.join("hooks/hooks.json"), serde_json::to_string_pretty(&hooks)? + "\n")?;
+    Ok(())
+}
+
+/// Grok CLI: wire dmem as an MCP server (save tools, via `grok mcp add` - the canonical way,
+/// same pattern as claude/devin) AND a hook plugin (persona + auto-recall, via
+/// `grok plugin install` on a locally written plugin tree - Grok accepts a direct local path,
+/// no marketplace needed). `--trust` is passed because bootstrap runs without a TTY and the
+/// user explicitly asked for this wiring; the plugin's only commands are `dmem hook ...`.
+fn grok_install(dm: &str, remove: bool) -> Result<()> {
+    let grok_dir = home()?.join(".grok");
+    if !grok_dir.exists() {
+        println!("  skip Grok (no ~/.grok - install it first: irm https://x.ai/cli/install.ps1 | iex)");
+        return Ok(());
+    }
+    let plug_dir = grok_dir.join("dmem-plugin");
+
+    if remove {
+        let _ = std::process::Command::new("grok").args(["plugin", "uninstall", "dmem"]).output();
+        let _ = std::process::Command::new("grok").args(["mcp", "remove", "dmem"]).output();
+        let _ = std::fs::remove_dir_all(&plug_dir);
+        println!("  unwired Grok (hook plugin + MCP entry removed)");
+        return Ok(());
+    }
+
+    grok_write_plugin(&plug_dir, dm)?;
+    let plug_ok = matches!(
+        std::process::Command::new("grok").args(["plugin", "install", plug_dir.to_string_lossy().as_ref(), "--trust"]).output(),
+        Ok(o) if o.status.success()
+    );
+    let mcp_ok = agent_mcp(
+        "grok",
+        &["mcp", "add", "dmem", "--", dm, "mcp"],
+        &["mcp", "remove", "dmem"],
+        remove,
+    );
+    match (plug_ok, mcp_ok) {
+        (true, true) => println!("  wired Grok -> {} (hook plugin: persona + auto-recall; MCP save tools)", plug_dir.display()),
+        (true, false) => {
+            println!("  wired Grok hook plugin -> {}. MCP step failed; run manually:", plug_dir.display());
+            println!("    grok mcp add dmem -- {dm} mcp");
+        }
+        (false, true) => {
+            println!("  wired Grok MCP save tools. Plugin install failed; run manually:");
+            println!("    grok plugin install {} --trust", plug_dir.display());
+        }
+        (false, false) => {
+            println!("  wrote the Grok plugin tree -> {} but the `grok` CLI was not reachable; run manually:", plug_dir.display());
+            println!("    grok plugin install {} --trust", plug_dir.display());
+            println!("    grok mcp add dmem -- {dm} mcp");
+        }
+    }
+    Ok(())
+}
+
+pub fn run(devin: bool, claude: bool, codex: bool, hermes: bool, opencode: bool, grok: bool, claude_desktop: bool) -> Result<()> {
+    run_mode(devin, claude, codex, hermes, opencode, grok, claude_desktop, false)
 }
 
 /// Wire or (with `remove`) unwire dmem into the selected agents. Devin + Claude Code use the
 /// generic Claude-compatible settings.json hook merge; Codex uses a bespoke `~/.codex/config.toml`
 /// MCP+plugin installer; Hermes uses a `~/.hermes/config.yaml` MCP+shell-hook installer; OpenCode
-/// gets a TypeScript plugin + `mcp.dmem` entry in ~/.config/opencode; Claude Desktop (hook-less)
+/// gets a TypeScript plugin + `mcp.dmem` entry in ~/.config/opencode; Grok gets a CC-format hook
+/// plugin (`grok plugin install`) + an MCP entry (`grok mcp add`); Claude Desktop (hook-less)
 /// gets an MCP entry in claude_desktop_config.json.
-pub fn run_mode(devin: bool, claude: bool, codex: bool, hermes: bool, opencode: bool, claude_desktop: bool, remove: bool) -> Result<()> {
+pub fn run_mode(devin: bool, claude: bool, codex: bool, hermes: bool, opencode: bool, grok: bool, claude_desktop: bool, remove: bool) -> Result<()> {
     let dm = dm_bin()?;
     let h = home()?;
     let mut did_any = false;
@@ -873,13 +952,18 @@ pub fn run_mode(devin: bool, claude: bool, codex: bool, hermes: bool, opencode: 
         did_any = true;
     }
 
+    if grok {
+        grok_install(&dm, remove)?;
+        did_any = true;
+    }
+
     if claude_desktop {
         claude_desktop_install(&dm, remove)?;
         did_any = true;
     }
 
     if !did_any {
-        println!("Nothing changed. Pass --devin / --claude / --codex / --hermes / --opencode / --claude-desktop (or --all), and ensure the agent is installed.");
+        println!("Nothing changed. Pass --devin / --claude / --codex / --hermes / --opencode / --grok / --claude-desktop (or --all), and ensure the agent is installed.");
         return Ok(());
     }
     println!();
@@ -887,7 +971,7 @@ pub fn run_mode(devin: bool, claude: bool, codex: bool, hermes: bool, opencode: 
         println!("Done. dmem hooks removed (the agent's other hooks/plugins are untouched).");
     } else {
         println!("Done. dmem is wired in (SessionStart -> persona/recent, UserPromptSubmit -> recall + save nudge).");
-        println!("Undo any time with:  dmem bootstrap --remove --devin / --claude / --codex / --hermes / --opencode / --claude-desktop");
+        println!("Undo any time with:  dmem bootstrap --remove --devin / --claude / --codex / --hermes / --opencode / --grok / --claude-desktop");
     }
     Ok(())
 }
