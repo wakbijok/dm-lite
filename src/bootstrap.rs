@@ -808,80 +808,40 @@ fn opencode_install(dm: &str, remove: bool) -> Result<()> {
     Ok(())
 }
 
-/// Write the dm-lite Grok plugin tree. Grok's plugin system reads the Claude Code manifest
-/// format (`.claude-plugin/plugin.json` + CC-shape hooks.json) and its hooks emit/consume the
-/// same `hookSpecificOutput.additionalContext` protocol, so the same `dmem hook ...` commands
-/// drive persona on SessionStart and recall on UserPromptSubmit.
-fn grok_write_plugin(plug_dir: &Path, dm: &str) -> Result<()> {
-    std::fs::create_dir_all(plug_dir.join(".claude-plugin"))?;
-    std::fs::create_dir_all(plug_dir.join("hooks"))?;
-    let manifest = json!({
-        "name": "dmem",
-        "version": env!("CARGO_PKG_VERSION"),
-        "description": "Shared cross-tool memory for Grok, backed by dm-lite (dmem). Persona + recent context on session start, deterministic hybrid recall per prompt, and remember/recall memory tools.",
-        "license": "MIT",
-        "hooks": "./hooks/hooks.json"
-    });
-    std::fs::write(plug_dir.join(".claude-plugin/plugin.json"), serde_json::to_string_pretty(&manifest)? + "\n")?;
-    let hooks = json!({
-        "hooks": {
-            "SessionStart": [ { "matcher": "*", "hooks": [
-                { "type": "command", "command": format!("{dm} hook session_start"), "timeout": 10 } ] } ],
-            "UserPromptSubmit": [ { "matcher": "*", "hooks": [
-                { "type": "command", "command": format!("{dm} hook user_prompt_submit"), "timeout": 8 } ] } ]
-        }
-    });
-    std::fs::write(plug_dir.join("hooks/hooks.json"), serde_json::to_string_pretty(&hooks)? + "\n")?;
-    Ok(())
-}
-
-/// Grok CLI: wire dmem as an MCP server (save tools, via `grok mcp add` - the canonical way,
-/// same pattern as claude/devin) AND a hook plugin (persona + auto-recall, via
-/// `grok plugin install` on a locally written plugin tree - Grok accepts a direct local path,
-/// no marketplace needed). `--trust` is passed because bootstrap runs without a TTY and the
-/// user explicitly asked for this wiring; the plugin's only commands are `dmem hook ...`.
+/// Grok CLI: wire dmem as an MCP server via `grok mcp add` - the canonical route, same pattern
+/// as claude/devin. MCP ONLY, deliberately: Grok v0 hooks are observe/block-only - its embedded
+/// hook docs state that for passive events (SessionStart etc.) "stdout is ignored", and no
+/// context-injection output field exists (verified against Grok CLI 0.2.99: the binary carries
+/// `decision`/`systemMessage` output keys but no `additionalContext` equivalent). A CC-style
+/// hook plugin would therefore spawn dmem every prompt and have its persona/recall output
+/// silently discarded. Until Grok grows context injection, persona rides the MCP server's
+/// `initialize.instructions` (hosts that surface it) and recall is tool-driven.
 fn grok_install(dm: &str, remove: bool) -> Result<()> {
     let grok_dir = home()?.join(".grok");
     if !grok_dir.exists() {
-        println!("  skip Grok (no ~/.grok - install it first: irm https://x.ai/cli/install.ps1 | iex)");
+        println!("  skip Grok (no ~/.grok - install it first: https://x.ai/cli)");
         return Ok(());
     }
-    let plug_dir = grok_dir.join("dmem-plugin");
-
-    if remove {
+    // Clean up the hook-plugin experiment from pre-release builds of this target.
+    let stale_plug = grok_dir.join("dmem-plugin");
+    if stale_plug.exists() {
         let _ = std::process::Command::new("grok").args(["plugin", "uninstall", "dmem"]).output();
-        let _ = std::process::Command::new("grok").args(["mcp", "remove", "dmem"]).output();
-        let _ = std::fs::remove_dir_all(&plug_dir);
-        println!("  unwired Grok (hook plugin + MCP entry removed)");
-        return Ok(());
+        let _ = std::fs::remove_dir_all(&stale_plug);
     }
-
-    grok_write_plugin(&plug_dir, dm)?;
-    let plug_ok = matches!(
-        std::process::Command::new("grok").args(["plugin", "install", plug_dir.to_string_lossy().as_ref(), "--trust"]).output(),
-        Ok(o) if o.status.success()
-    );
     let mcp_ok = agent_mcp(
         "grok",
         &["mcp", "add", "dmem", "--", dm, "mcp"],
         &["mcp", "remove", "dmem"],
         remove,
     );
-    match (plug_ok, mcp_ok) {
-        (true, true) => println!("  wired Grok -> {} (hook plugin: persona + auto-recall; MCP save tools)", plug_dir.display()),
-        (true, false) => {
-            println!("  wired Grok hook plugin -> {}. MCP step failed; run manually:", plug_dir.display());
-            println!("    grok mcp add dmem -- {dm} mcp");
-        }
-        (false, true) => {
-            println!("  wired Grok MCP save tools. Plugin install failed; run manually:");
-            println!("    grok plugin install {} --trust", plug_dir.display());
-        }
-        (false, false) => {
-            println!("  wrote the Grok plugin tree -> {} but the `grok` CLI was not reachable; run manually:", plug_dir.display());
-            println!("    grok plugin install {} --trust", plug_dir.display());
-            println!("    grok mcp add dmem -- {dm} mcp");
-        }
+    if remove {
+        println!("  unwired Grok (MCP entry removed)");
+    } else if mcp_ok {
+        println!("  wired Grok -> ~/.grok/config.toml (MCP: recall/remember/log_* tools)");
+        println!("    note: Grok v0 hooks cannot inject context (passive-hook stdout is ignored),");
+        println!("    so there is no per-prompt auto-recall here - the model recalls via the MCP tools.");
+    } else {
+        println!("  Grok MCP step failed; run manually:  grok mcp add dmem -- {dm} mcp");
     }
     Ok(())
 }
@@ -893,9 +853,9 @@ pub fn run(devin: bool, claude: bool, codex: bool, hermes: bool, opencode: bool,
 /// Wire or (with `remove`) unwire dmem into the selected agents. Devin + Claude Code use the
 /// generic Claude-compatible settings.json hook merge; Codex uses a bespoke `~/.codex/config.toml`
 /// MCP+plugin installer; Hermes uses a `~/.hermes/config.yaml` MCP+shell-hook installer; OpenCode
-/// gets a TypeScript plugin + `mcp.dmem` entry in ~/.config/opencode; Grok gets a CC-format hook
-/// plugin (`grok plugin install`) + an MCP entry (`grok mcp add`); Claude Desktop (hook-less)
-/// gets an MCP entry in claude_desktop_config.json.
+/// gets a TypeScript plugin + `mcp.dmem` entry in ~/.config/opencode; Grok gets an MCP entry via
+/// `grok mcp add` (its v0 hooks cannot inject context, so no hook plugin); Claude Desktop
+/// (hook-less) gets an MCP entry in claude_desktop_config.json.
 pub fn run_mode(devin: bool, claude: bool, codex: bool, hermes: bool, opencode: bool, grok: bool, claude_desktop: bool, remove: bool) -> Result<()> {
     let dm = dm_bin()?;
     let h = home()?;

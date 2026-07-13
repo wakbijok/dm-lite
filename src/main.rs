@@ -75,7 +75,7 @@ enum Cmd {
         /// OpenCode (TypeScript plugin for persona/recall/idle-nudge + an mcp.dmem entry).
         #[arg(long)]
         opencode: bool,
-        /// Grok CLI (Claude-Code-compatible plugin for persona/recall hooks + an MCP entry).
+        /// Grok CLI (MCP entry only: Grok v0 hooks cannot inject context, so recall is tool-driven).
         #[arg(long)]
         grok: bool,
         /// Claude Desktop (MCP only; no hooks). Adds an mcpServers.dmem entry.
