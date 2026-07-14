@@ -381,8 +381,9 @@ pub fn active_embedder_diag() -> EmbedderDiag {
     #[cfg(all(feature = "candle", not(feature = "fastembed")))]
     {
         let m = std::env::var("DM_CANDLE_MODEL").unwrap_or_else(|_| "BAAI/bge-small-en-v1.5".to_string());
+        let name = if m == "BAAI/bge-small-en-v1.5" { "candle-bge-small" } else { "candle-custom" };
         let (dir, present) = hf_model_cache(&m);
-        return EmbedderDiag { name: "candle-bge-small", model_id: Some(m), neural: true, cache_dir: dir, cache_present: present };
+        return EmbedderDiag { name, model_id: Some(m), neural: true, cache_dir: dir, cache_present: present };
     }
     #[cfg(all(feature = "model2vec", not(feature = "fastembed"), not(feature = "candle")))]
     {
