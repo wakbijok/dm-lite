@@ -113,7 +113,10 @@ pub fn run() -> Result<()> {
     let devin_cfg = home.join(".config/devin/config.json");
     let claude_cfg = home.join(".claude/settings.json");
     let codex_cfg = home.join(".codex/config.toml");
-    let hermes_cfg = home.join(".hermes/config.yaml");
+    // Hermes home varies by platform (~/.hermes vs %LOCALAPPDATA%\hermes) - one resolver.
+    let hermes_cfg = crate::bootstrap::hermes_dir()
+        .map(|d| d.join("config.yaml"))
+        .unwrap_or_else(|_| home.join(".hermes/config.yaml"));
     let devin_present = home.join(".config/devin").exists();
     let claude_present = home.join(".claude").exists();
     let codex_present = codex_cfg.exists();

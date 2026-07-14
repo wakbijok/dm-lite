@@ -269,6 +269,25 @@ fn codex_install(dm: &str, remove: bool) -> Result<()> {
     Ok(())
 }
 
+/// Hermes-agent's home: `~/.hermes` everywhere EXCEPT hermes-on-Windows, which keeps its
+/// config under `%LOCALAPPDATA%\hermes` (found 14-07-2026: bootstrap silently skipped on
+/// izuhomeland because ~/.hermes/config.yaml never exists there, so the agent ran with NO
+/// shared memory and nobody noticed). Prefer whichever root already holds a config.yaml;
+/// fall back to the platform-classic dot-dir so the "skip Hermes" message stays truthful.
+pub(crate) fn hermes_dir() -> Result<PathBuf> {
+    let dot = home()?.join(".hermes");
+    if dot.join("config.yaml").exists() {
+        return Ok(dot);
+    }
+    if let Some(local) = dirs::data_local_dir() {
+        let lad = local.join("hermes");
+        if lad.join("config.yaml").exists() {
+            return Ok(lad);
+        }
+    }
+    Ok(dot)
+}
+
 /// serde_yaml emits YAML 1.2, but Hermes loads its config with PyYAML (1.1), where the bare
 /// tokens off/on/yes/no/y/n are booleans. serde only ever emits those bare for STRING values
 /// (1.2 keeps them strings), so any such bare value in our output is a string PyYAML would
@@ -307,7 +326,7 @@ fn yaml_quote_pyyaml_unsafe(yaml: &str) -> String {
 /// rather than flipping the global `hooks_auto_accept`, so dmem's hook registers without a TTY
 /// prompt while every other shell hook still requires the user's explicit consent.
 fn hermes_allowlist(hook_cmd: &str, remove: bool) -> Result<()> {
-    let path = home()?.join(".hermes/shell-hooks-allowlist.json");
+    let path = hermes_dir()?.join("shell-hooks-allowlist.json");
     let mut doc: Value = if path.exists() {
         std::fs::read_to_string(&path)
             .ok()
@@ -346,7 +365,7 @@ const SOUL_LEAD: &str = "You ARE the persona defined below, and the protocols be
 /// cannot guarantee. Recent/recalled memory stays on the hook. Content OUTSIDE the markers (the
 /// user's own SOUL.md edits) is preserved. SOUL.md is reloaded by Hermes each message (no restart).
 fn hermes_sync_soul(remove: bool) -> Result<()> {
-    let soul = home()?.join(".hermes/SOUL.md");
+    let soul = hermes_dir()?.join("SOUL.md");
     let existing = std::fs::read_to_string(&soul).unwrap_or_default();
     // Drop any prior dmem-managed block, keep everything else verbatim.
     let outside = match (existing.find(SOUL_BEGIN), existing.find(SOUL_END)) {
@@ -389,9 +408,9 @@ fn hermes_sync_soul(remove: bool) -> Result<()> {
 /// edited YAML is re-parsed before it overwrites the config.
 fn hermes_install(dm: &str, remove: bool) -> Result<()> {
     use serde_yaml_ng::{Mapping, Value as Y};
-    let cfg = home()?.join(".hermes/config.yaml");
+    let cfg = hermes_dir()?.join("config.yaml");
     if !cfg.exists() {
-        println!("  skip Hermes (no ~/.hermes/config.yaml)");
+        println!("  skip Hermes (no config.yaml in ~/.hermes or the local-appdata hermes dir)");
         return Ok(());
     }
     let raw = std::fs::read_to_string(&cfg).with_context(|| format!("read {}", cfg.display()))?;
