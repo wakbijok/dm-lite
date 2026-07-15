@@ -269,6 +269,25 @@ fn codex_install(dm: &str, remove: bool) -> Result<()> {
     Ok(())
 }
 
+/// Hermes-agent's home: `~/.hermes` everywhere EXCEPT hermes-on-Windows, which keeps its
+/// config under `%LOCALAPPDATA%\hermes` (found 14-07-2026: bootstrap silently skipped on
+/// izuhomeland because ~/.hermes/config.yaml never exists there, so the agent ran with NO
+/// shared memory and nobody noticed). Prefer whichever root already holds a config.yaml;
+/// fall back to the platform-classic dot-dir so the "skip Hermes" message stays truthful.
+pub(crate) fn hermes_dir() -> Result<PathBuf> {
+    let dot = home()?.join(".hermes");
+    if dot.join("config.yaml").exists() {
+        return Ok(dot);
+    }
+    if let Some(local) = dirs::data_local_dir() {
+        let lad = local.join("hermes");
+        if lad.join("config.yaml").exists() {
+            return Ok(lad);
+        }
+    }
+    Ok(dot)
+}
+
 /// serde_yaml emits YAML 1.2, but Hermes loads its config with PyYAML (1.1), where the bare
 /// tokens off/on/yes/no/y/n are booleans. serde only ever emits those bare for STRING values
 /// (1.2 keeps them strings), so any such bare value in our output is a string PyYAML would
@@ -307,7 +326,7 @@ fn yaml_quote_pyyaml_unsafe(yaml: &str) -> String {
 /// rather than flipping the global `hooks_auto_accept`, so dmem's hook registers without a TTY
 /// prompt while every other shell hook still requires the user's explicit consent.
 fn hermes_allowlist(hook_cmd: &str, remove: bool) -> Result<()> {
-    let path = home()?.join(".hermes/shell-hooks-allowlist.json");
+    let path = hermes_dir()?.join("shell-hooks-allowlist.json");
     let mut doc: Value = if path.exists() {
         std::fs::read_to_string(&path)
             .ok()
@@ -346,7 +365,7 @@ const SOUL_LEAD: &str = "You ARE the persona defined below, and the protocols be
 /// cannot guarantee. Recent/recalled memory stays on the hook. Content OUTSIDE the markers (the
 /// user's own SOUL.md edits) is preserved. SOUL.md is reloaded by Hermes each message (no restart).
 fn hermes_sync_soul(remove: bool) -> Result<()> {
-    let soul = home()?.join(".hermes/SOUL.md");
+    let soul = hermes_dir()?.join("SOUL.md");
     let existing = std::fs::read_to_string(&soul).unwrap_or_default();
     // Drop any prior dmem-managed block, keep everything else verbatim.
     let outside = match (existing.find(SOUL_BEGIN), existing.find(SOUL_END)) {
@@ -389,9 +408,9 @@ fn hermes_sync_soul(remove: bool) -> Result<()> {
 /// edited YAML is re-parsed before it overwrites the config.
 fn hermes_install(dm: &str, remove: bool) -> Result<()> {
     use serde_yaml_ng::{Mapping, Value as Y};
-    let cfg = home()?.join(".hermes/config.yaml");
+    let cfg = hermes_dir()?.join("config.yaml");
     if !cfg.exists() {
-        println!("  skip Hermes (no ~/.hermes/config.yaml)");
+        println!("  skip Hermes (no config.yaml in ~/.hermes or the local-appdata hermes dir)");
         return Ok(());
     }
     let raw = std::fs::read_to_string(&cfg).with_context(|| format!("read {}", cfg.display()))?;
@@ -808,16 +827,55 @@ fn opencode_install(dm: &str, remove: bool) -> Result<()> {
     Ok(())
 }
 
-pub fn run(devin: bool, claude: bool, codex: bool, hermes: bool, opencode: bool, claude_desktop: bool) -> Result<()> {
-    run_mode(devin, claude, codex, hermes, opencode, claude_desktop, false)
+/// Grok CLI: wire dmem as an MCP server via `grok mcp add` - the canonical route, same pattern
+/// as claude/devin. MCP ONLY, deliberately: Grok v0 hooks are observe/block-only - its embedded
+/// hook docs state that for passive events (SessionStart etc.) "stdout is ignored", and no
+/// context-injection output field exists (verified against Grok CLI 0.2.99: the binary carries
+/// `decision`/`systemMessage` output keys but no `additionalContext` equivalent). A CC-style
+/// hook plugin would therefore spawn dmem every prompt and have its persona/recall output
+/// silently discarded. Until Grok grows context injection, persona rides the MCP server's
+/// `initialize.instructions` (hosts that surface it) and recall is tool-driven.
+fn grok_install(dm: &str, remove: bool) -> Result<()> {
+    let grok_dir = home()?.join(".grok");
+    if !grok_dir.exists() {
+        println!("  skip Grok (no ~/.grok - install it first: https://x.ai/cli)");
+        return Ok(());
+    }
+    // Clean up the hook-plugin experiment from pre-release builds of this target.
+    let stale_plug = grok_dir.join("dmem-plugin");
+    if stale_plug.exists() {
+        let _ = std::process::Command::new("grok").args(["plugin", "uninstall", "dmem"]).output();
+        let _ = std::fs::remove_dir_all(&stale_plug);
+    }
+    let mcp_ok = agent_mcp(
+        "grok",
+        &["mcp", "add", "dmem", "--", dm, "mcp"],
+        &["mcp", "remove", "dmem"],
+        remove,
+    );
+    if remove {
+        println!("  unwired Grok (MCP entry removed)");
+    } else if mcp_ok {
+        println!("  wired Grok -> ~/.grok/config.toml (MCP: recall/remember/log_* tools)");
+        println!("    note: Grok v0 hooks cannot inject context (passive-hook stdout is ignored),");
+        println!("    so there is no per-prompt auto-recall here - the model recalls via the MCP tools.");
+    } else {
+        println!("  Grok MCP step failed; run manually:  grok mcp add dmem -- {dm} mcp");
+    }
+    Ok(())
+}
+
+pub fn run(devin: bool, claude: bool, codex: bool, hermes: bool, opencode: bool, grok: bool, claude_desktop: bool) -> Result<()> {
+    run_mode(devin, claude, codex, hermes, opencode, grok, claude_desktop, false)
 }
 
 /// Wire or (with `remove`) unwire dmem into the selected agents. Devin + Claude Code use the
 /// generic Claude-compatible settings.json hook merge; Codex uses a bespoke `~/.codex/config.toml`
 /// MCP+plugin installer; Hermes uses a `~/.hermes/config.yaml` MCP+shell-hook installer; OpenCode
-/// gets a TypeScript plugin + `mcp.dmem` entry in ~/.config/opencode; Claude Desktop (hook-less)
-/// gets an MCP entry in claude_desktop_config.json.
-pub fn run_mode(devin: bool, claude: bool, codex: bool, hermes: bool, opencode: bool, claude_desktop: bool, remove: bool) -> Result<()> {
+/// gets a TypeScript plugin + `mcp.dmem` entry in ~/.config/opencode; Grok gets an MCP entry via
+/// `grok mcp add` (its v0 hooks cannot inject context, so no hook plugin); Claude Desktop
+/// (hook-less) gets an MCP entry in claude_desktop_config.json.
+pub fn run_mode(devin: bool, claude: bool, codex: bool, hermes: bool, opencode: bool, grok: bool, claude_desktop: bool, remove: bool) -> Result<()> {
     let dm = dm_bin()?;
     let h = home()?;
     let mut did_any = false;
@@ -873,13 +931,18 @@ pub fn run_mode(devin: bool, claude: bool, codex: bool, hermes: bool, opencode: 
         did_any = true;
     }
 
+    if grok {
+        grok_install(&dm, remove)?;
+        did_any = true;
+    }
+
     if claude_desktop {
         claude_desktop_install(&dm, remove)?;
         did_any = true;
     }
 
     if !did_any {
-        println!("Nothing changed. Pass --devin / --claude / --codex / --hermes / --opencode / --claude-desktop (or --all), and ensure the agent is installed.");
+        println!("Nothing changed. Pass --devin / --claude / --codex / --hermes / --opencode / --grok / --claude-desktop (or --all), and ensure the agent is installed.");
         return Ok(());
     }
     println!();
@@ -887,7 +950,7 @@ pub fn run_mode(devin: bool, claude: bool, codex: bool, hermes: bool, opencode: 
         println!("Done. dmem hooks removed (the agent's other hooks/plugins are untouched).");
     } else {
         println!("Done. dmem is wired in (SessionStart -> persona/recent, UserPromptSubmit -> recall + save nudge).");
-        println!("Undo any time with:  dmem bootstrap --remove --devin / --claude / --codex / --hermes / --opencode / --claude-desktop");
+        println!("Undo any time with:  dmem bootstrap --remove --devin / --claude / --codex / --hermes / --opencode / --grok / --claude-desktop");
     }
     Ok(())
 }

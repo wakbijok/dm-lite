@@ -113,7 +113,10 @@ pub fn run() -> Result<()> {
     let devin_cfg = home.join(".config/devin/config.json");
     let claude_cfg = home.join(".claude/settings.json");
     let codex_cfg = home.join(".codex/config.toml");
-    let hermes_cfg = home.join(".hermes/config.yaml");
+    // Hermes home varies by platform (~/.hermes vs %LOCALAPPDATA%\hermes) - one resolver.
+    let hermes_cfg = crate::bootstrap::hermes_dir()
+        .map(|d| d.join("config.yaml"))
+        .unwrap_or_else(|_| home.join(".hermes/config.yaml"));
     let devin_present = home.join(".config/devin").exists();
     let claude_present = home.join(".claude").exists();
     let codex_present = codex_cfg.exists();
@@ -126,6 +129,9 @@ pub fn run() -> Result<()> {
         .map(|f| opencode_dir.join(f))
         .find(|p| p.exists())
         .unwrap_or_else(|| opencode_dir.join("opencode.json"));
+    // Grok keeps its MCP entries in ~/.grok/config.toml; the text probe below flags prior wiring.
+    let grok_cfg = home.join(".grok/config.toml");
+    let grok_present = home.join(".grok").exists();
     // Devin/Claude use the JSON SessionStart-hook probe; Codex/Hermes have no such shape, so a
     // plain text probe flags a config that already references a daimon/dmem memory wiring.
     let json_label = |present: bool, cfg: &std::path::Path, name: &str| -> String {
@@ -168,21 +174,23 @@ pub fn run() -> Result<()> {
         plain_label(codex_present, &codex_cfg, "Codex"),
         plain_label(hermes_present, &hermes_cfg, "Hermes"),
         plain_label(opencode_present, &opencode_cfg, "OpenCode"),
+        plain_label(grok_present, &grok_cfg, "Grok CLI"),
         cd_label,
     ];
     let chosen = MultiSelect::with_theme(&theme)
         .with_prompt("Wire dmem into which agents? (nothing is pre-selected; space toggles, enter confirms)")
         .items(&items)
-        .defaults(&[false, false, false, false, false, false])
+        .defaults(&[false, false, false, false, false, false, false])
         .interact()?;
     let devin = chosen.contains(&0);
     let claude = chosen.contains(&1);
     let codex = chosen.contains(&2);
     let hermes = chosen.contains(&3);
     let opencode = chosen.contains(&4);
-    let claude_desktop = chosen.contains(&5);
-    if devin || claude || codex || hermes || opencode || claude_desktop {
-        crate::bootstrap::run(devin, claude, codex, hermes, opencode, claude_desktop)?;
+    let grok = chosen.contains(&5);
+    let claude_desktop = chosen.contains(&6);
+    if devin || claude || codex || hermes || opencode || grok || claude_desktop {
+        crate::bootstrap::run(devin, claude, codex, hermes, opencode, grok, claude_desktop)?;
     } else {
         println!("(skipped agent wiring - undo any wiring later with `dmem bootstrap --remove`)");
     }
