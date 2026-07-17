@@ -321,9 +321,37 @@ fn parse_expand_depth(v: Option<&str>) -> usize {
     }
 }
 
+/// Save-discipline nudge opt-in, read fresh from `DM_SAVE_NUDGE`. Default OFF: the save
+/// discipline already rides every session as a binding protocol (SOUL.md for Hermes, the MCP
+/// `initialize.instructions` for MCP clients, the SessionStart persona block for Claude Code),
+/// so the per-prompt `<daimon-memory>` nudge was a redundant third copy (Wak, 17-07-2026:
+/// "Matikan reminder ni. Dh ada reminder lain kan"). Set `DM_SAVE_NUDGE=1`/`on` to re-enable
+/// the cadence backstop for hosts that lack the protocol layer.
+pub fn save_nudge_enabled() -> bool {
+    parse_save_nudge(std::env::var("DM_SAVE_NUDGE").ok().as_deref())
+}
+
+fn parse_save_nudge(v: Option<&str>) -> bool {
+    matches!(
+        v.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("1") | Some("on") | Some("true") | Some("yes")
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn save_nudge_default_off_env_opt_in() {
+        assert!(!parse_save_nudge(None), "unset -> nudge off (protocol layer already covers it)");
+        for on in ["1", "on", "true", "yes", "ON", " 1 "] {
+            assert!(parse_save_nudge(Some(on)), "{on:?} should enable");
+        }
+        for off in ["0", "off", "false", "no", "", "garbage"] {
+            assert!(!parse_save_nudge(Some(off)), "{off:?} should stay off");
+        }
+    }
 
     #[test]
     fn parses_server_block() {

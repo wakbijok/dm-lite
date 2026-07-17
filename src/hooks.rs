@@ -113,6 +113,9 @@ pub fn session_end(raw: bool) -> Result<()> {
     if !raw {
         return Ok(());
     }
+    if !crate::config::save_nudge_enabled() {
+        return Ok(());
+    }
     let m = Memory::open()?;
     let latest = m.latest_save_ms().ok().flatten();
     if should_nudge(latest, crate::entry::now_ms()) {
@@ -188,10 +191,13 @@ pub fn user_prompt_submit(arg: Option<String>, hermes: bool, raw: bool) -> Resul
     // cadence backstop: if nothing has been saved recently, remind to capture durable work.
     // Use the newest SAVE time (latest_save_ms), not recent(1): recent() orders by importance, so
     // it returns a persona/protocol record (importance 95) whose old timestamp made the nudge fire
-    // every turn regardless of recent activity.
-    let latest = m.latest_save_ms().ok().flatten();
-    if should_nudge(latest, crate::entry::now_ms()) {
-        blocks.push(render::render_nudge());
+    // every turn regardless of recent activity. Opt-in via DM_SAVE_NUDGE (default off): the save
+    // discipline already rides every session's protocol layer, so this was a redundant copy.
+    if crate::config::save_nudge_enabled() {
+        let latest = m.latest_save_ms().ok().flatten();
+        if should_nudge(latest, crate::entry::now_ms()) {
+            blocks.push(render::render_nudge());
+        }
     }
     let text = blocks.join("\n");
     debug_log("user_prompt_submit", hermes, &raw_in, &prompt, first_turn, text.len());
