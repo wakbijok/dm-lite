@@ -412,7 +412,11 @@ async fn persona_h(State(st): State<AppState>, headers: HeaderMap) -> ApiResp {
 }
 
 async fn reminders_h(State(st): State<AppState>, headers: HeaderMap, Json(req): Json<RecentReq>) -> ApiResp {
-    with_tenant(&st, &headers, false, move |m, _agent| Ok(json!(m.reminders(req.limit.unwrap_or(5).min(MAX_LIMIT))?))).await
+    // /reminders is the SoT inventory endpoint: default to the FULL open list. A small default
+    // here silently truncated the backlog (a dated hospital appointment fell off the top-5 by
+    // importance, 23-07-2026). Budgeted surfaces (session-start greet, MCP bootstrap) pass their
+    // own explicit small limits.
+    with_tenant(&st, &headers, false, move |m, _agent| Ok(json!(m.reminders(req.limit.unwrap_or(MAX_LIMIT).min(MAX_LIMIT))?))).await
 }
 
 async fn latest_save_h(State(st): State<AppState>, headers: HeaderMap) -> ApiResp {
