@@ -494,6 +494,20 @@ async fn reindex_links_h(State(st): State<AppState>, headers: HeaderMap) -> ApiR
     with_tenant(&st, &headers, true, move |m, _agent| Ok(json!({ "linked": m.reindex_links()? }))).await
 }
 
+#[derive(Deserialize)]
+struct ReindexMentionsReq {
+    #[serde(default)]
+    dry_run: bool,
+}
+
+async fn reindex_mentions_h(State(st): State<AppState>, headers: HeaderMap, Json(req): Json<ReindexMentionsReq>) -> ApiResp {
+    with_tenant(&st, &headers, true, move |m, _agent| {
+        let (found, added) = m.reindex_mentions(req.dry_run)?;
+        Ok(json!({ "found": found, "added": added }))
+    })
+    .await
+}
+
 async fn decision_h(State(st): State<AppState>, headers: HeaderMap, Json(req): Json<DecisionReq>) -> ApiResp {
     with_tenant(&st, &headers, true, move |m, agent| {
         let ns = ns_or(&req.namespace, "resources/notes");
@@ -650,6 +664,7 @@ pub fn router(auth: Arc<dyn Authenticator>, iam: Option<crate::iam::Iam>) -> Rou
         .route("/neighbors", post(neighbors_h))
         .route("/recall_expanded", post(recall_expanded_h))
         .route("/reindex_links", post(reindex_links_h))
+        .route("/reindex_mentions", post(reindex_mentions_h))
         .route("/log_decision", post(decision_h))
         .route("/log_lesson", post(lesson_h))
         .route("/log_incident", post(incident_h))

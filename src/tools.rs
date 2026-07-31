@@ -110,6 +110,50 @@ pub(crate) fn parse_wikilinks(s: &str) -> Vec<String> {
     out
 }
 
+/// Title-derived aliases for an entity: the title itself, the title with any parenthetical
+/// stripped ("Izuhomeland (Windows)" -> "Izuhomeland"), and each `/`-separated variant.
+/// Deliberately cheap — richer aliases are a curation concern on the entity record itself.
+pub(crate) fn entity_aliases(title: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut push = |out: &mut Vec<String>, s: &str| {
+        let s = s.trim();
+        if s.len() >= 2 && !out.iter().any(|e| e == s) {
+            out.push(s.to_string());
+        }
+    };
+    push(&mut out, title);
+    let mut base = String::new();
+    let mut depth = 0usize;
+    for c in title.chars() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            _ if depth == 0 => base.push(c),
+            _ => {}
+        }
+    }
+    let base = base.split_whitespace().collect::<Vec<_>>().join(" ");
+    push(&mut out, &base);
+    for part in base.split('/') {
+        push(&mut out, part);
+    }
+    out
+}
+
+/// True when `text` contains `name` as a whole word, exact case. Word chars are alphanumeric
+/// plus `-` and `_`, so `dm-lite` matches in prose but never inside `dm-lite-poc`.
+pub(crate) fn mentions_word(text: &str, name: &str) -> bool {
+    let boundary = |c: char| !(c.is_alphanumeric() || c == '-' || c == '_');
+    for (i, _) in text.match_indices(name) {
+        let before_ok = text[..i].chars().next_back().is_none_or(boundary);
+        let after_ok = text[i + name.len()..].chars().next().is_none_or(boundary);
+        if before_ok && after_ok {
+            return true;
+        }
+    }
+    false
+}
+
 /// Stamp write attribution into a record's tags as `author:<agent>`, unless an author tag is
 /// already present (the first attribution wins; a re-save through another path must not
 /// silently re-assign a record). `None` (agent-less callers: embedded mode, legacy tokens)
@@ -725,6 +769,45 @@ impl LocalMemory {
         Ok(linked)
     }
 
+    /// Deterministic entity-mention pass: link `record -[mentions]-> entity` wherever a record's
+    /// title or body mentions a canonical entity title in plain text (word-boundary, exact case —
+    /// the conservative pass). The `mentions` rel is distinct from the curated `links` rel, so
+    /// expansion can weight curated edges above mined ones and this whole pass can be retracted
+    /// without touching hand-made edges. Skips pairs already connected by any rel in either
+    /// direction. Idempotent; `dry_run` counts without writing. Returns
+    /// (mention pairs found, edges added — or would be added under dry_run).
+    pub fn reindex_mentions(&self, dry_run: bool) -> Result<(usize, usize)> {
+        let records = self.store.recent(1_000_000)?;
+        let entities: Vec<(&Entry, Vec<String>)> =
+            records.iter().filter(|e| e.kind.is_entity()).map(|e| (e, entity_aliases(&e.title))).collect();
+        let mut have: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+        for e in self.store.all_edges(1_000_000)? {
+            have.insert((e.from_uri.clone(), e.to_uri.clone()));
+            have.insert((e.to_uri, e.from_uri));
+        }
+        let (mut found, mut added) = (0usize, 0usize);
+        for rec in &records {
+            let text = format!("{}\n{}", rec.title, rec.body);
+            for (ent, aliases) in &entities {
+                if ent.uri == rec.uri {
+                    continue;
+                }
+                if aliases.iter().any(|a| mentions_word(&text, a)) {
+                    found += 1;
+                    if !have.contains(&(rec.uri.clone(), ent.uri.clone())) {
+                        if !dry_run {
+                            self.store.link(&rec.uri, &ent.uri, "mentions")?;
+                        }
+                        have.insert((rec.uri.clone(), ent.uri.clone()));
+                        have.insert((ent.uri.clone(), rec.uri.clone()));
+                        added += 1;
+                    }
+                }
+            }
+        }
+        Ok((found, added))
+    }
+
     /// Construct a LocalMemory directly over a store (tests only; bypasses config). Uses the
     /// cheap HashEmbedder rather than `make_embedder` so tests never load a real model (no
     /// network, fast, deterministic); `vindex: None` keeps recall on the keyword path.
@@ -976,6 +1059,14 @@ impl Memory {
             Memory::Remote(r) => r.reindex_links(),
         }
     }
+
+    pub fn reindex_mentions(&self, dry_run: bool) -> Result<(usize, usize)> {
+        match self {
+            Memory::Local(l) => l.reindex_mentions(dry_run),
+            #[cfg(feature = "client")]
+            Memory::Remote(r) => r.reindex_mentions(dry_run),
+        }
+    }
     /// Re-embed every live record into the local vector index (embedded mode only; the work is
     /// local embedding + upsert, so it is not exposed over the remote client).
     #[cfg(feature = "zvec")]
@@ -1115,6 +1206,32 @@ mod tests {
         // a query that only hits alpha still pulls beta in, via the edge
         let hits = m.recall_expanded("Alpha refers context", 3, 1).unwrap();
         assert!(hits.iter().any(|e| e.body.contains("Beta the target")), "neighbor pulled in via the graph");
+    }
+
+    #[test]
+    fn reindex_mentions_links_plaintext_entity_mentions() {
+        let m = LocalMemory::for_test(tmp_store());
+        let narya = m.import_record(Kind::Site, "resources/entities", "narya",
+            &entity_body(Kind::Site, "narya", &[], "Homelab node")).unwrap();
+        let izuh = m.import_record(Kind::Site, "resources/entities", "Izuhomeland (Windows)",
+            &entity_body(Kind::Site, "Izuhomeland (Windows)", &[], "Workstation")).unwrap();
+        let hit = m.remember("Rebooted narya after the NFS mount hung", "resources/notes", None, None, None).unwrap();
+        m.remember("Vectors and naryad are not mentions of the node", "resources/notes", None, None, None).unwrap();
+        let cased = m.remember("NARYA in caps must not match the conservative pass", "resources/notes", None, None, None).unwrap();
+        let alias = m.remember("Provisioned Izuhomeland with Claude Code", "resources/notes", None, None, None).unwrap();
+        // dry run counts but writes nothing
+        let (found_dry, added_dry) = m.reindex_mentions(true).unwrap();
+        assert!(added_dry >= 2, "dry run sees the candidates");
+        assert!(m.edges_of(&hit).unwrap().is_empty(), "dry run must not write edges");
+        // real pass links exactly the word-boundary, exact-case mentions (alias via parenthetical strip)
+        let (found, added) = m.reindex_mentions(false).unwrap();
+        assert_eq!((found, added), (found_dry, added_dry), "dry run and real pass agree");
+        assert!(m.edges_of(&hit).unwrap().iter().any(|e| e.to_uri == narya && e.rel == "mentions"));
+        assert!(m.edges_of(&alias).unwrap().iter().any(|e| e.to_uri == izuh), "parenthetical-stripped alias resolves");
+        assert!(m.edges_of(&cased).unwrap().is_empty(), "exact case only: NARYA does not match narya");
+        // idempotent: a second pass adds nothing
+        let (_, again) = m.reindex_mentions(false).unwrap();
+        assert_eq!(again, 0, "second pass is a no-op");
     }
 
     #[test]

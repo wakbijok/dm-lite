@@ -236,6 +236,12 @@ impl RemoteClient {
         let v = self.post("/reindex_links", json!({}))?;
         Ok(v.get("linked").and_then(|n| n.as_u64()).unwrap_or(0) as usize)
     }
+    pub fn reindex_mentions(&self, dry_run: bool) -> Result<(usize, usize)> {
+        let v = self.post("/reindex_mentions", json!({ "dry_run": dry_run }))?;
+        let found = v.get("found").and_then(|n| n.as_u64()).unwrap_or(0) as usize;
+        let added = v.get("added").and_then(|n| n.as_u64()).unwrap_or(0) as usize;
+        Ok((found, added))
+    }
 }
 
 /// `dmem login`: write the `[server]` block into the config (preserving other keys), 0600.

@@ -211,6 +211,13 @@ enum Cmd {
     },
     /// Rebuild edges from the [[name]] references in every record body (batch).
     ReindexLinks,
+    /// Deterministic graph pass: link records to the entities they mention in plain text
+    /// (word-boundary, exact case). Adds `mentions` edges, distinct from curated `links`.
+    ReindexMentions {
+        /// Count what would be linked without writing any edges.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Re-embed every live record's body into the vector index, healing records whose embedding
     /// predates an embedder fix (e.g. long bodies that overflowed bge's 512-token limit and were
     /// stored as a zero vector). Idempotent.
@@ -555,6 +562,12 @@ fn run() -> Result<()> {
         Cmd::ReindexLinks => {
             let n = Memory::open()?.reindex_links()?;
             println!("reindexed: {} [[link]] reference{} linked", n, if n == 1 { "" } else { "s" });
+            Ok(())
+        }
+        Cmd::ReindexMentions { dry_run } => {
+            let (found, added) = Memory::open()?.reindex_mentions(dry_run)?;
+            let verb = if dry_run { "would add" } else { "added" };
+            println!("mention pairs: {found}; {verb} {added} new `mentions` edge{}", if added == 1 { "" } else { "s" });
             Ok(())
         }
         Cmd::ReindexEmbeddings => {
