@@ -95,4 +95,4 @@ For CI and scripted ops, point any command at a server without editing the confi
 
 Full documentation is in the [project wiki](https://github.com/wakbijok/dm-lite/wiki): install and first run, wiring each agent, run as a server, run as a client, embedding models and footprint, multitenant admin, persona and governance, migrating from v1, upgrading, and building from source.
 
-License: MIT.
+License: [MIT](LICENSE). See also [CONTRIBUTING](CONTRIBUTING.md), [CODE_OF_CONDUCT](CODE_OF_CONDUCT.md), and [SECURITY](SECURITY.md).

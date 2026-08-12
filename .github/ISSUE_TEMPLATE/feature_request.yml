@@ -1,0 +1,41 @@
+name: Feature request
+description: Propose a change or new capability
+title: "feat: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Search existing issues and the wiki first. Keep scope tight; one feature per issue.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What is painful or missing today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: What should dm-lite do instead?
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Workarounds, other tools, or "none".
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Recall / embedder
+        - Server / IAM / multitenant
+        - CLI / MCP / hooks
+        - Graph / UI
+        - Docs / packaging
+        - Other
+    validations:
+      required: true
