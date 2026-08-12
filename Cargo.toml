@@ -2,7 +2,7 @@
 name = "dm-lite"
 version = "0.2.1"
 edition = "2021"
-description = "daimon-memory v2: a small embedded typed memory engine with hybrid recall, behind a MemoryStore trait"
+description = "Memory for Hermes, Codex, Claude Code, OpenCode, Devin, and any MCP agent. daimon-memory v2: one-binary typed memory engine with hybrid recall"
 license = "MIT"
 
 [[bin]]
