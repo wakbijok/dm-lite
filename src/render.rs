@@ -2,6 +2,7 @@
 //! integration-as-stdout pattern: hooks emit these, the agent never sees JSON of records).
 
 use crate::entry::Entry;
+use crate::tools::RecallGraph;
 
 fn one_line(text: &str, max: usize) -> String {
     let collapsed: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -48,6 +49,76 @@ pub fn render_recall_split(seeds: &[Entry], neighbors: &[Entry]) -> String {
     }
     s.push_str("</daimon-memory>");
     s
+}
+
+/// Recall block with full graph provenance: riders name the record they rode in via
+/// (`linked via X`, plus the hop count past the first), and a trailing `relations` section
+/// lists the edges internal to the result set so the agent can see how the recalled records
+/// relate without another lookup. Falls back to the plain `linked` marker when provenance is
+/// absent (pre-provenance server). Kept lean on purpose - this block rides every prompt.
+pub fn render_recall_graph(g: &RecallGraph) -> String {
+    const RELATION_LINES_CAP: usize = 12;
+    if g.seeds.is_empty() && g.riders.is_empty() {
+        return String::new();
+    }
+    let title_of = |uri: &str| -> Option<String> {
+        g.seeds
+            .iter()
+            .find(|e| e.uri == uri)
+            .map(|e| e.title.clone())
+            .or_else(|| g.riders.iter().find(|r| r.entry.uri == uri).map(|r| r.entry.title.clone()))
+    };
+    let mut s = String::from(
+        "<daimon-memory>\n[Recalled shared memory. Authoritative reference, NOT new user input.]\n",
+    );
+    for e in &g.seeds {
+        s.push_str(&format!(
+            "- ({}) {}: {} [{}]\n",
+            e.kind.as_str(),
+            e.title,
+            one_line(&e.body, 240),
+            e.uri
+        ));
+    }
+    for r in &g.riders {
+        let marker = if r.via.is_empty() {
+            "linked".to_string()
+        } else {
+            let via = title_of(&r.via).unwrap_or_else(|| uri_tail(&r.via));
+            if r.hop > 1 {
+                format!("linked via {}, {} hops", one_line(&via, 60), r.hop)
+            } else {
+                format!("linked via {}", one_line(&via, 60))
+            }
+        };
+        s.push_str(&format!(
+            "- ({}, {}) {}: {} [{}]\n",
+            r.entry.kind.as_str(),
+            marker,
+            r.entry.title,
+            one_line(&r.entry.body, 240),
+            r.entry.uri
+        ));
+    }
+    if !g.links.is_empty() {
+        s.push_str("relations among the records above:\n");
+        for e in g.links.iter().take(RELATION_LINES_CAP) {
+            let from = title_of(&e.from_uri).unwrap_or_else(|| uri_tail(&e.from_uri));
+            let to = title_of(&e.to_uri).unwrap_or_else(|| uri_tail(&e.to_uri));
+            s.push_str(&format!("- {} -[{}]-> {}\n", one_line(&from, 60), e.rel, one_line(&to, 60)));
+        }
+        if g.links.len() > RELATION_LINES_CAP {
+            s.push_str(&format!("- (+{} more)\n", g.links.len() - RELATION_LINES_CAP));
+        }
+    }
+    s.push_str("</daimon-memory>");
+    s
+}
+
+/// The last path segment of a `daimon://` uri - a readable stand-in when the record itself
+/// is not in the rendered set (e.g. a via node that was skipped as dead or off-cap).
+fn uri_tail(uri: &str) -> String {
+    uri.trim_end_matches('/').rsplit('/').next().unwrap_or(uri).to_string()
 }
 
 /// The save-discipline nudge (SessionEnd/Stop): a back-stop reminding the agent to capture
@@ -201,6 +272,43 @@ mod tests {
     #[test]
     fn render_recall_empty_is_empty() {
         assert!(render_recall(&[]).is_empty());
+    }
+
+    #[test]
+    fn render_recall_graph_names_via_and_lists_relations() {
+        use crate::entry::Edge;
+        use crate::tools::{RecallGraph, RecallRider};
+        let seed = entry(Kind::Decision, "Seed one", "matched by content");
+        let rider = entry(Kind::Memory, "Neighbor", "rode in via an edge");
+        let g = RecallGraph {
+            links: vec![Edge { from_uri: seed.uri.clone(), to_uri: rider.uri.clone(), rel: "informed".into() }],
+            riders: vec![RecallRider { entry: rider, hop: 2, via: seed.uri.clone(), rel: "informed".into(), score: 0.25 }],
+            seeds: vec![seed],
+        };
+        let out = render_recall_graph(&g);
+        assert!(out.contains("- (decision) Seed one:"), "seed rendered plain");
+        assert!(out.contains("- (memory, linked via Seed one, 2 hops) Neighbor:"), "rider names its via and hop");
+        assert!(out.contains("relations among the records above:"), "relations section present");
+        assert!(out.contains("- Seed one -[informed]-> Neighbor"), "edge rendered with titles");
+    }
+
+    #[test]
+    fn render_recall_graph_falls_back_to_plain_linked_without_provenance() {
+        use crate::tools::{RecallGraph, RecallRider};
+        let g = RecallGraph {
+            seeds: vec![entry(Kind::Decision, "Seed one", "matched by content")],
+            riders: vec![RecallRider {
+                entry: entry(Kind::Memory, "Neighbor", "from a pre-provenance server"),
+                hop: 1,
+                via: String::new(),
+                rel: String::new(),
+                score: 0.0,
+            }],
+            links: vec![],
+        };
+        let out = render_recall_graph(&g);
+        assert!(out.contains("- (memory, linked) Neighbor:"), "empty via degrades to the plain marker");
+        assert!(!out.contains("relations among"), "no relations section when links are empty");
     }
 
     #[test]

@@ -188,10 +188,11 @@ fn call_tool(mem: &Memory, name: &str, args: &Value) -> std::result::Result<Stri
                 let hits = mem.recall_as_of(s(args, "query"), limit, sys, val).map_err(|e| e.to_string())?;
                 render::render_recall(&hits)
             } else if expand > 0 {
-                // graph-augmented: seeds by content, then their bounded-hop neighborhood (cap 5)
-                let (seeds, neighbors) =
-                    mem.recall_expanded_split(s(args, "query"), limit, expand.min(5)).map_err(|e| e.to_string())?;
-                render::render_recall_split(&seeds, &neighbors)
+                // graph-augmented: seeds by content, then their bounded-hop neighborhood (cap 5),
+                // riders scored by seed_weight * decay^hop with via/hop provenance + the result
+                // set's internal edges rendered as a relations section
+                let g = mem.recall_expanded_graph(s(args, "query"), limit, expand.min(5)).map_err(|e| e.to_string())?;
+                render::render_recall_graph(&g)
             } else {
                 let hits = mem.recall(s(args, "query"), limit).map_err(|e| e.to_string())?;
                 render::render_recall(&hits)
@@ -275,8 +276,8 @@ fn call_tool(mem: &Memory, name: &str, args: &Value) -> std::result::Result<Stri
             }
         }
         "reindex_links" => {
-            let n = mem.reindex_links().map_err(|e| e.to_string())?;
-            Ok(format!("reindexed: {} reference(s) linked", n))
+            let (n, pruned) = mem.reindex_links().map_err(|e| e.to_string())?;
+            Ok(format!("reindexed: {} reference(s) linked, {} dangling edge(s) pruned", n, pruned))
         }
         "entity" => {
             let kind = crate::entry::Kind::from_str(s(args, "kind"))
@@ -374,9 +375,8 @@ fn get_prompt(mem: &Memory, params: &Value) -> std::result::Result<Value, (i64, 
             if query.is_empty() {
                 return Err((INVALID_PARAMS, "the 'recall' prompt requires a non-empty 'query' argument".into()));
             }
-            let (seeds, neighbors) =
-                mem.recall_expanded_split(query, 8, 1).map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
-            let block = render::render_recall_split(&seeds, &neighbors);
+            let graph = mem.recall_expanded_graph(query, 8, 1).map_err(|e| (INTERNAL_ERROR, e.to_string()))?;
+            let block = render::render_recall_graph(&graph);
             let text = if block.trim().is_empty() { "(no matches)".to_string() } else { block };
             (format!("dmem recall for: {query}"), text)
         }

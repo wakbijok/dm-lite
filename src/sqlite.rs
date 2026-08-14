@@ -511,6 +511,14 @@ impl MemoryStore for SqliteStore {
             tx.execute("UPDATE entries SET system_to_ms=?1 WHERE id=?2", params![now, id])?;
             tx.execute("DELETE FROM entries_fts WHERE idref=?1", params![id])?;
         }
+        // Cascade the graph layer: a retracted record's edges go with it (edges are curated
+        // relations, not bitemporal facts - re-deriving them is safe, and dangling edges rot
+        // the graph: they keep bridging BFS expansion through a node that no longer exists).
+        // Only when the forget actually retracted something; `invalidate` deliberately does
+        // NOT cascade - an invalidated record is still a live node of the belief history.
+        if !ids.is_empty() {
+            tx.execute("DELETE FROM edges WHERE from_uri=?1 OR to_uri=?1", params![uri])?;
+        }
         tx.commit()?;
         Ok(ids.len())
     }
@@ -613,6 +621,18 @@ impl MemoryStore for SqliteStore {
             frontier = next;
         }
         Ok(out)
+    }
+
+    fn prune_dangling_edges(&self) -> Result<usize> {
+        // Liveness here is system-time only (a system-open row exists), NOT the bitemporal
+        // CURRENT filter: an invalidated record is still a real node of the belief history
+        // and must keep its edges - only forgotten/never-existed endpoints are dead.
+        Ok(self.conn.execute(
+            "DELETE FROM edges WHERE
+               NOT EXISTS (SELECT 1 FROM entries WHERE uri = edges.from_uri AND system_to_ms IS NULL)
+               OR NOT EXISTS (SELECT 1 FROM entries WHERE uri = edges.to_uri AND system_to_ms IS NULL)",
+            [],
+        )?)
     }
 
     fn all_edges(&self, limit: usize) -> Result<Vec<Edge>> {
@@ -1103,5 +1123,103 @@ mod tests {
         }
         assert_eq!(s.neighbors(&[hub.uri.clone()], 1, 3).unwrap().len(), 3, "limit caps the neighborhood");
         assert!(s.neighbors(&[hub.uri.clone()], 0, 10).unwrap().is_empty(), "depth 0 -> nothing");
+    }
+
+    #[test]
+    fn neighbors_scored_decays_per_hop_with_via_provenance() {
+        // chain: a -> b -> c; seed a with weight 1.0, decay 0.5
+        let s = mem_store();
+        let a = mk(Kind::Memory, "ns", "a", "a");
+        let b = mk(Kind::Memory, "ns", "b", "b");
+        let c = mk(Kind::Memory, "ns", "c", "c");
+        for e in [&a, &b, &c] {
+            s.put(e).unwrap();
+        }
+        s.link(&a.uri, &b.uri, "links").unwrap();
+        s.link(&b.uri, &c.uri, "informed").unwrap();
+        let hits = s.neighbors_scored(&[(a.uri.clone(), 1.0)], 2, 10, 0.5).unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!((hits[0].uri.as_str(), hits[0].hop, hits[0].score), (b.uri.as_str(), 1, 0.5), "hop-1 first");
+        assert_eq!(hits[0].via, a.uri, "b arrived via a");
+        assert_eq!((hits[1].uri.as_str(), hits[1].hop, hits[1].score), (c.uri.as_str(), 2, 0.25), "hop-2 decays again");
+        assert_eq!((hits[1].via.as_str(), hits[1].rel.as_str()), (b.uri.as_str(), "informed"), "c arrived via b");
+    }
+
+    #[test]
+    fn neighbors_scored_best_score_wins_across_seeds() {
+        // m is adjacent to both a strong seed (1.0) and a weak one (0.2): keep the strong path.
+        let s = mem_store();
+        let strong = mk(Kind::Memory, "ns", "strong", "s");
+        let weak = mk(Kind::Memory, "ns", "weak", "w");
+        let m = mk(Kind::Memory, "ns", "m", "m");
+        for e in [&strong, &weak, &m] {
+            s.put(e).unwrap();
+        }
+        s.link(&weak.uri, &m.uri, "links").unwrap(); // weak edge inserted first
+        s.link(&strong.uri, &m.uri, "links").unwrap();
+        let hits = s
+            .neighbors_scored(&[(weak.uri.clone(), 0.2), (strong.uri.clone(), 1.0)], 2, 10, 0.5)
+            .unwrap();
+        assert_eq!(hits.len(), 1, "seeds are never emitted");
+        assert_eq!(hits[0].score, 0.5, "best-scoring arrival wins");
+        assert_eq!(hits[0].via, strong.uri, "provenance follows the winning path");
+    }
+
+    #[test]
+    fn neighbors_scored_respects_caps() {
+        let s = mem_store();
+        let hub = mk(Kind::Memory, "ns", "hub", "h");
+        s.put(&hub).unwrap();
+        for i in 0..5 {
+            let sp = mk(Kind::Memory, "ns", &format!("spoke {i}"), "s");
+            s.put(&sp).unwrap();
+            s.link(&hub.uri, &sp.uri, "links").unwrap();
+        }
+        assert_eq!(s.neighbors_scored(&[(hub.uri.clone(), 1.0)], 1, 3, 0.5).unwrap().len(), 3, "limit caps nodes");
+        assert!(s.neighbors_scored(&[(hub.uri.clone(), 1.0)], 0, 10, 0.5).unwrap().is_empty(), "depth 0 -> nothing");
+        assert!(s.neighbors_scored(&[], 2, 10, 0.5).unwrap().is_empty(), "no seeds -> nothing");
+    }
+
+    #[test]
+    fn forget_cascades_edges_but_keeps_neighbors_edges() {
+        let s = mem_store();
+        let a = mk(Kind::Memory, "ns", "a", "a");
+        let b = mk(Kind::Memory, "ns", "b", "b");
+        let c = mk(Kind::Memory, "ns", "c", "c");
+        for e in [&a, &b, &c] {
+            s.put(e).unwrap();
+        }
+        s.link(&a.uri, &b.uri, "links").unwrap();
+        s.link(&b.uri, &c.uri, "links").unwrap();
+        s.link(&a.uri, &c.uri, "informed").unwrap();
+        assert_eq!(s.forget(&b.uri).unwrap(), 1);
+        assert!(s.edges_of(&b.uri).unwrap().is_empty(), "the forgotten node's edges cascade away");
+        let a_edges = s.edges_of(&a.uri).unwrap();
+        assert_eq!(a_edges.len(), 1, "a keeps only its edge to the still-live c");
+        assert_eq!(a_edges[0].to_uri, c.uri);
+        // forgetting a uri with no live versions is a no-op for the graph too
+        assert_eq!(s.forget(&b.uri).unwrap(), 0);
+    }
+
+    #[test]
+    fn prune_dangling_edges_spares_invalidated_records() {
+        let s = mem_store();
+        let a = mk(Kind::Memory, "ns", "a", "a");
+        let inv = mk(Kind::Memory, "ns", "inv", "was true once");
+        for e in [&a, &inv] {
+            s.put(e).unwrap();
+        }
+        s.link(&a.uri, &inv.uri, "links").unwrap();
+        // an edge inserted directly (bypassing forget's cascade) to a never-existed target
+        s.link(&a.uri, "daimon://ns/memory/never-existed", "links").unwrap();
+        // invalidate STRICTLY AFTER valid_from: valid-time closes, system-time stays open ->
+        // still a live graph node. (A cut AT valid_from leaves an empty remainder - no
+        // system-open row - which the pruner rightly treats as retraction; a same-millisecond
+        // now_ms() here made that fire flakily.)
+        s.invalidate(&inv.uri, inv.valid_from_ms + 10).unwrap();
+        assert_eq!(s.prune_dangling_edges().unwrap(), 1, "only the never-existed edge goes");
+        let a_edges = s.edges_of(&a.uri).unwrap();
+        assert_eq!(a_edges.len(), 1, "the invalidated record keeps its edge");
+        assert_eq!(a_edges[0].to_uri, inv.uri);
     }
 }

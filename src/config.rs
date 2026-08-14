@@ -321,6 +321,26 @@ fn parse_expand_depth(v: Option<&str>) -> usize {
     }
 }
 
+/// Per-hop score decay for graph-expanded recall riders, read fresh from `DM_RECALL_DECAY`
+/// (default 0.5). A rider's rank score is `seed_weight * decay^hop`, so a record one hop off
+/// the top seed outranks one two hops out or one hanging off a weak seed - rider slots fill by
+/// that score instead of BFS arrival order. Must be in (0, 1]; anything else falls back to the
+/// default. 1.0 disables hop penalty (all reachable riders rank purely by seed weight).
+pub fn recall_decay() -> f64 {
+    parse_recall_decay(std::env::var("DM_RECALL_DECAY").ok().as_deref())
+}
+
+fn parse_recall_decay(v: Option<&str>) -> f64 {
+    const DEFAULT: f64 = 0.5;
+    match v.map(str::trim) {
+        None | Some("") => DEFAULT,
+        Some(s) => match s.parse::<f64>() {
+            Ok(d) if d > 0.0 && d <= 1.0 => d,
+            _ => DEFAULT,
+        },
+    }
+}
+
 /// Save-discipline nudge opt-in, read fresh from `DM_SAVE_NUDGE`. Default OFF: the save
 /// discipline already rides every session as a binding protocol (SOUL.md for Hermes, the MCP
 /// `initialize.instructions` for MCP clients, the SessionStart persona block for Claude Code),
@@ -395,6 +415,17 @@ mod tests {
             assert_eq!(parse_expand_depth(Some(off)), 0, "{off:?} should disable expansion");
         }
         assert_eq!(parse_expand_depth(Some("garbage")), 1, "unparseable falls back to 1");
+    }
+
+    #[test]
+    fn recall_decay_parses() {
+        assert_eq!(parse_recall_decay(None), 0.5, "unset defaults to 0.5");
+        assert_eq!(parse_recall_decay(Some("")), 0.5);
+        assert_eq!(parse_recall_decay(Some("0.3")), 0.3);
+        assert_eq!(parse_recall_decay(Some("1")), 1.0, "1.0 disables the hop penalty");
+        for bad in ["0", "-0.2", "1.5", "garbage"] {
+            assert_eq!(parse_recall_decay(Some(bad)), 0.5, "{bad:?} falls back to the default");
+        }
     }
 
     #[test]

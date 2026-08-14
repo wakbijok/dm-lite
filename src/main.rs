@@ -497,24 +497,39 @@ fn run() -> Result<()> {
         Cmd::Recall { query, limit, as_of, valid_at, expand } => {
             let q = query.join(" ");
             let m = Memory::open()?;
-            let (seeds, neighbors) = if as_of.is_some() || valid_at.is_some() {
+            let graph = if as_of.is_some() || valid_at.is_some() {
                 let now = entry::now_ms();
                 let sys = as_of.unwrap_or(now);
                 let val = valid_at.or(as_of).unwrap_or(now);
-                (m.recall_as_of(&q, limit, sys, val)?, Vec::new())
+                tools::RecallGraph { seeds: m.recall_as_of(&q, limit, sys, val)?, riders: Vec::new(), links: Vec::new() }
             } else if expand > 0 {
-                m.recall_expanded_split(&q, limit, expand)?
+                m.recall_expanded_graph(&q, limit, expand)?
             } else {
-                (m.recall(&q, limit)?, Vec::new())
+                tools::RecallGraph { seeds: m.recall(&q, limit)?, riders: Vec::new(), links: Vec::new() }
             };
-            if seeds.is_empty() && neighbors.is_empty() {
+            if graph.seeds.is_empty() && graph.riders.is_empty() {
                 println!("(no matches for '{}')", q);
             } else {
-                for e in seeds {
+                for e in &graph.seeds {
                     println!("- ({}) {}  [{}]", e.kind.as_str(), e.title, e.uri);
                 }
-                for e in neighbors {
-                    println!("- ({}, linked) {}  [{}]", e.kind.as_str(), e.title, e.uri);
+                for r in &graph.riders {
+                    if r.via.is_empty() {
+                        println!("- ({}, linked) {}  [{}]", r.entry.kind.as_str(), r.entry.title, r.entry.uri);
+                    } else {
+                        println!(
+                            "- ({}, linked, hop {}, score {:.2}, via {}) {}  [{}]",
+                            r.entry.kind.as_str(),
+                            r.hop,
+                            r.score,
+                            r.via,
+                            r.entry.title,
+                            r.entry.uri
+                        );
+                    }
+                }
+                for e in &graph.links {
+                    println!("  edge: {} -[{}]-> {}", e.from_uri, e.rel, e.to_uri);
                 }
             }
             Ok(())
@@ -560,8 +575,14 @@ fn run() -> Result<()> {
             Ok(())
         }
         Cmd::ReindexLinks => {
-            let n = Memory::open()?.reindex_links()?;
-            println!("reindexed: {} [[link]] reference{} linked", n, if n == 1 { "" } else { "s" });
+            let (n, pruned) = Memory::open()?.reindex_links()?;
+            println!(
+                "reindexed: {} [[link]] reference{} linked, {} dangling edge{} pruned",
+                n,
+                if n == 1 { "" } else { "s" },
+                pruned,
+                if pruned == 1 { "" } else { "s" }
+            );
             Ok(())
         }
         Cmd::ReindexMentions { dry_run } => {
@@ -869,6 +890,9 @@ fn doctor(json: bool) -> Result<()> {
     #[cfg(not(feature = "client"))]
     let server_url: Option<String> = None;
     let mode = if server_url.is_some() { "remote client" } else { "embedded" };
+    // A remote client never loads the embedder: recall/save go over HTTPS and the server embeds.
+    // The embedder section below is capability info for serve/embedded/air-gapped use only.
+    let embedder_used = server_url.is_none();
 
     let tenant = config::tenant();
     let store = config::db_path(&tenant).ok().map(|p| p.display().to_string());
@@ -879,7 +903,7 @@ fn doctor(json: bool) -> Result<()> {
     let avx2 = "n/a (non-x86)";
 
     let cache_dir = d.cache_dir.as_ref().map(|p| p.display().to_string());
-    let needs_network = d.neural && !d.cache_present;
+    let needs_network = embedder_used && d.neural && !d.cache_present;
     let env: Vec<(&str, String)> = ["HF_HOME", "HUGGINGFACE_HUB_CACHE", "DM_CANDLE_MODEL", "DM_M2V_MODEL", "DM_CANDLE_F16", "DM_ENDPOINT", "DM_RECALL_FLOOR", "DM_RECALL_EXPAND"]
         .iter()
         .filter_map(|k| std::env::var(k).ok().map(|v| (*k, v)))
@@ -893,6 +917,7 @@ fn doctor(json: bool) -> Result<()> {
             "tenant": tenant,
             "store": store,
             "embedder": d.name,
+            "embedder_used": embedder_used,
             "model": d.model_id,
             "neural": d.neural,
             "model_cache": cache_dir,
@@ -914,14 +939,35 @@ fn doctor(json: bool) -> Result<()> {
     if let Some(s) = &store {
         println!("store       : {s}");
     }
-    println!("embedder    : {}{}", d.name, if d.neural { "" } else { " (placeholder, no real semantics)" });
+    let embedder_suffix = if !embedder_used {
+        " (unused in remote client mode; embedding runs on the server)"
+    } else if d.neural {
+        ""
+    } else {
+        " (placeholder, no real semantics)"
+    };
+    println!("embedder    : {}{embedder_suffix}", d.name);
     if let Some(m) = &d.model_id {
         println!("model       : {m}");
     }
     if d.neural {
         println!("model_cache : {}", cache_dir.as_deref().unwrap_or("unknown"));
-        println!("model_cached: {}", if d.cache_present { "yes" } else { "NO (first run downloads ~130 MB, needs network)" });
-        println!("offline_ok  : {}", if d.cache_present { "yes" } else { "no - pre-populate the cache (README: Offline / air-gapped)" });
+        let cached = if d.cache_present {
+            "yes"
+        } else if embedder_used {
+            "NO (first run downloads ~130 MB, needs network)"
+        } else {
+            "no (not needed in remote client mode)"
+        };
+        println!("model_cached: {cached}");
+        let offline = if !embedder_used {
+            "n/a (remote client; offline readiness depends on the server, not the model cache)"
+        } else if d.cache_present {
+            "yes"
+        } else {
+            "no - pre-populate the cache (README: Offline / air-gapped)"
+        };
+        println!("offline_ok  : {offline}");
     }
     println!("avx2        : {avx2}");
     if env.is_empty() {

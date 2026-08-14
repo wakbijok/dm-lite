@@ -7,6 +7,33 @@ use crate::sqlite::SqliteStore;
 use crate::store::MemoryStore;
 use anyhow::{anyhow, Result};
 
+/// A graph rider in an expanded recall: the hydrated record plus why it rode along -
+/// `hop` (1 = adjacent to a seed), `via` (the uri it was reached from on its best-scoring
+/// path; empty when the server predates provenance), `rel` (that edge's relation), and
+/// `score` (`seed_weight * decay^hop`).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RecallRider {
+    pub entry: Entry,
+    pub hop: u32,
+    #[serde(default)]
+    pub via: String,
+    #[serde(default)]
+    pub rel: String,
+    #[serde(default)]
+    pub score: f64,
+}
+
+/// An expanded recall with the graph made visible: content-matched `seeds`, scored `riders`
+/// with provenance, and `links` - the edges internal to the whole result set (the
+/// mini-subgraph), so a consumer can traverse relations without another round-trip.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RecallGraph {
+    pub seeds: Vec<Entry>,
+    pub riders: Vec<RecallRider>,
+    #[serde(default)]
+    pub links: Vec<Edge>,
+}
+
 /// The local (embedded) memory engine: SQLite store + optional zvec vector index.
 pub struct LocalMemory {
     store: SqliteStore,
@@ -224,16 +251,29 @@ fn floor_survivors(
     kw: &[(String, f64)],
     vec: &[(String, f32)],
     f: &config::RecallFloor,
+    small_corpus_max: usize,
 ) -> std::collections::HashSet<String> {
     use std::collections::HashSet;
     // Keyword-only mode: no cosine to gate on, so the bm25 relative gate is the floor.
     if vec.is_empty() {
         let top_kw = kw.iter().map(|(_, s)| *s).fold(f64::NEG_INFINITY, f64::max);
-        return kw
+        let survivors: HashSet<String> = kw
             .iter()
             .filter(|(_, s)| *s >= f.abs_keyword && (top_kw <= 0.0 || *s >= f.rel_ratio * top_kw))
             .map(|(u, _)| u.clone())
             .collect();
+        // Small-corpus guard (TencentDB-Agent-Memory study, 09-08-2026): BM25 absolute
+        // magnitudes are meaningless when FTS matched only a handful of docs (IDF -> 0 on a
+        // tiny/fresh corpus), so an absolute floor calibrated on a real corpus wrongly gates
+        // everything and a fresh install looks broken. When the floor rejects the WHOLE pool
+        // and the pool is small enough to inject anyway (<= small_corpus_max), trust MATCH
+        // membership - FTS only returns docs containing the query terms - and keep them all
+        // in rank order. Partial survival or a bigger pool means the magnitudes are
+        // discriminating, so the gate stands.
+        if survivors.is_empty() && !kw.is_empty() && kw.len() <= small_corpus_max {
+            return kw.iter().map(|(u, _)| u.clone()).collect();
+        }
+        return survivors;
     }
     // Hybrid: cosine is the floor.
     let top_c = vec.iter().map(|(_, s)| *s as f64).fold(f64::NEG_INFINITY, f64::max);
@@ -469,7 +509,7 @@ impl LocalMemory {
             // positional base stays aligned with bm25 rank.
             let scored = self.store.recall_scored(query, pool)?;
             let kw: Vec<(String, f64)> = scored.iter().map(|(e, s)| (e.uri.clone(), *s)).collect();
-            let keep = floor_survivors(&kw, &[], &floor);
+            let keep = floor_survivors(&kw, &[], &floor, limit);
             let kept: Vec<Entry> = scored.into_iter().filter(|(e, _)| keep.contains(&e.uri)).map(|(e, _)| e).collect();
             // Operator visibility: a default-on floor that empties a non-empty pool must not look
             // like "matched nothing". Say so, with the top magnitude that was rejected.
@@ -519,7 +559,7 @@ impl LocalMemory {
         if self.embedder.name() == "hash" {
             floor.abs_cosine = f64::NEG_INFINITY;
         }
-        let keep = if floor.enabled { Some(floor_survivors(&kw, &vec, &floor)) } else { None };
+        let keep = if floor.enabled { Some(floor_survivors(&kw, &vec, &floor, limit)) } else { None };
         let passes = |uri: &str| keep.as_ref().is_none_or(|k| k.contains(uri));
 
         let k = 60.0_f64;
@@ -708,40 +748,93 @@ impl LocalMemory {
 
     /// Graph-augmented recall, split: the content-matched seeds and their live N-hop
     /// neighborhood as separate lists, so callers can render the graph's contribution
-    /// distinguishably. Neighbor slots fill from an over-fetched candidate pool: edges are
-    /// non-cascading (a forgotten endpoint keeps its edges), so dead URIs are skipped WITHOUT
-    /// consuming the cap, and `kind=skill` records never ride recall (they surface only via
-    /// the skills projection - same invariant as the keyword and vector channels).
+    /// distinguishably. Thin wrapper over `recall_expanded_graph` for callers that only
+    /// want the entries.
     pub fn recall_expanded_split(&self, query: &str, limit: usize, depth: usize) -> Result<(Vec<Entry>, Vec<Entry>)> {
+        let g = self.recall_expanded_graph(query, limit, depth)?;
+        Ok((g.seeds, g.riders.into_iter().map(|r| r.entry).collect()))
+    }
+
+    /// Graph-augmented recall with the graph made visible: seeds are content matches; riders
+    /// are their bounded-hop neighborhood ranked by `seed_weight * decay^hop` (best-scoring
+    /// arrival path, see `MemoryStore::neighbors_scored`) instead of BFS arrival order, each
+    /// carrying its provenance (hop, via, rel, score); `links` is the mini-subgraph - every
+    /// edge whose BOTH endpoints made the result set - so a consumer can see how the results
+    /// relate without another round-trip.
+    ///
+    /// Seed weights decay with recall rank (1, 1/2, 1/3, ...): a rider adjacent to the top
+    /// hit outranks one hanging off the sixth. The recall channel is already rank-ordered and
+    /// `Entry` carries no score, so rank is the honest signal available. Rider slots fill from
+    /// an over-fetched candidate pool: edges are non-cascading (a forgotten endpoint keeps its
+    /// edges), so dead URIs are skipped WITHOUT consuming the cap, and `kind=skill` records
+    /// never ride recall (they surface only via the skills projection - same invariant as the
+    /// keyword and vector channels).
+    pub fn recall_expanded_graph(&self, query: &str, limit: usize, depth: usize) -> Result<RecallGraph> {
         let seeds = self.recall(query, limit)?;
         if depth == 0 || seeds.is_empty() {
-            return Ok((seeds, Vec::new()));
+            return Ok(RecallGraph { seeds, riders: Vec::new(), links: Vec::new() });
         }
-        let seed_uris: Vec<String> = seeds.iter().map(|e| e.uri.clone()).collect();
-        let mut seen: std::collections::HashSet<String> = seed_uris.iter().cloned().collect();
-        let mut neighbors: Vec<Entry> = Vec::new();
-        for uri in self.store.neighbors(&seed_uris, depth, limit.saturating_mul(4))? {
-            if neighbors.len() >= limit {
+        let weighted: Vec<(String, f64)> =
+            seeds.iter().enumerate().map(|(i, e)| (e.uri.clone(), 1.0 / (1.0 + i as f64))).collect();
+        let hits = self.store.neighbors_scored(
+            &weighted,
+            depth,
+            limit.saturating_mul(4),
+            config::recall_decay(),
+        )?;
+        let mut riders: Vec<RecallRider> = Vec::new();
+        for h in hits {
+            if riders.len() >= limit {
                 break;
             }
-            if !seen.insert(uri.clone()) {
-                continue;
-            }
-            if let Some(e) = self.store.get(&uri)? {
+            if let Some(e) = self.store.get(&h.uri)? {
                 if e.kind == Kind::Skill {
                     continue;
                 }
-                neighbors.push(e);
+                riders.push(RecallRider { entry: e, hop: h.hop, via: h.via, rel: h.rel, score: h.score });
             }
         }
-        Ok((seeds, neighbors))
+        let links = self.links_within(&seeds, &riders)?;
+        Ok(RecallGraph { seeds, riders, links })
+    }
+
+    /// Edges internal to the result set (both endpoints present), deduped, capped. The cap is
+    /// a context-budget guard, not a correctness bound: the mini-subgraph is a navigation aid.
+    fn links_within(&self, seeds: &[Entry], riders: &[RecallRider]) -> Result<Vec<Edge>> {
+        const LINKS_CAP: usize = 50;
+        let in_set: std::collections::HashSet<&str> = seeds
+            .iter()
+            .map(|e| e.uri.as_str())
+            .chain(riders.iter().map(|r| r.entry.uri.as_str()))
+            .collect();
+        let mut seen: std::collections::HashSet<(String, String, String)> = std::collections::HashSet::new();
+        let mut links: Vec<Edge> = Vec::new();
+        'outer: for uri in &in_set {
+            for e in self.store.edges_of(uri)? {
+                if !in_set.contains(e.from_uri.as_str()) || !in_set.contains(e.to_uri.as_str()) {
+                    continue;
+                }
+                if seen.insert((e.from_uri.clone(), e.to_uri.clone(), e.rel.clone())) {
+                    links.push(e);
+                    if links.len() >= LINKS_CAP {
+                        break 'outer;
+                    }
+                }
+            }
+        }
+        // Deterministic order regardless of HashSet iteration.
+        links.sort_by(|a, b| a.from_uri.cmp(&b.from_uri).then(a.to_uri.cmp(&b.to_uri)).then(a.rel.cmp(&b.rel)));
+        Ok(links)
     }
 
     /// Rebuild edges from the `[[name]]` references in every current record's body. Batch, not
     /// on-save, so writes stay fast at scale: build a slug->uri map once (the slug is the uri's
     /// last segment), then resolve each `[[name]]` against it in memory. Idempotent. Returns the
     /// count of `[[name]]` references that resolved to a record and were linked.
-    pub fn reindex_links(&self) -> Result<usize> {
+    pub fn reindex_links(&self) -> Result<(usize, usize)> {
+        // Hygiene first: clear edges whose endpoint is forgotten or never existed, so stale
+        // relations do not survive the rebuild (legitimate ones are re-derived right after).
+        let pruned = self.store.prune_dangling_edges()?;
         let records = self.store.recent(1_000_000)?;
         // recent() is ordered importance DESC then created DESC, so on a slug collision or_insert
         // keeps the highest-importance (then newest) record as the link target. Deterministic.
@@ -766,7 +859,7 @@ impl LocalMemory {
                 }
             }
         }
-        Ok(linked)
+        Ok((linked, pruned))
     }
 
     /// Deterministic entity-mention pass: link `record -[mentions]-> entity` wherever a record's
@@ -1052,7 +1145,14 @@ impl Memory {
             Memory::Remote(r) => r.recall_expanded_split(query, limit, depth),
         }
     }
-    pub fn reindex_links(&self) -> Result<usize> {
+    pub fn recall_expanded_graph(&self, query: &str, limit: usize, depth: usize) -> Result<RecallGraph> {
+        match self {
+            Memory::Local(l) => l.recall_expanded_graph(query, limit, depth),
+            #[cfg(feature = "client")]
+            Memory::Remote(r) => r.recall_expanded_graph(query, limit, depth),
+        }
+    }
+    pub fn reindex_links(&self) -> Result<(usize, usize)> {
         match self {
             Memory::Local(l) => l.reindex_links(),
             #[cfg(feature = "client")]
@@ -1201,7 +1301,7 @@ mod tests {
         let m = LocalMemory::for_test(tmp_store());
         m.remember("Beta the target", "resources/notes", None, None, None).unwrap();
         m.remember("Alpha refers to [[Beta the target]] for context", "resources/notes", None, None, None).unwrap();
-        let n = m.reindex_links().unwrap();
+        let (n, _pruned) = m.reindex_links().unwrap();
         assert!(n >= 1, "the [[Beta the target]] reference should resolve and link");
         // a query that only hits alpha still pulls beta in, via the edge
         let hits = m.recall_expanded("Alpha refers context", 3, 1).unwrap();
@@ -1252,6 +1352,46 @@ mod tests {
     }
 
     #[test]
+    fn expanded_graph_ranks_riders_by_decayed_score_not_arrival_order() {
+        // seed -> near (hop 1) -> far (hop 2): with one rider slot, hop-decay must pick `near`
+        // even though the flat BFS pool contains both.
+        let m = LocalMemory::for_test(tmp_store());
+        let seed = m.remember("Gamma anchor matches the query text", "resources/notes", None, None, None).unwrap();
+        let near = m.remember("Near rider one hop out", "resources/notes", None, None, None).unwrap();
+        let far = m.remember("Far rider two hops out", "resources/notes", None, None, None).unwrap();
+        m.link(&near, &far, "links").unwrap(); // inserted before the seed edge: arrival order must not matter
+        m.link(&seed, &near, "links").unwrap();
+        let g = m.recall_expanded_graph("Gamma anchor matches", 1, 2).unwrap();
+        assert_eq!(g.riders.len(), 1, "rider slots honour the limit");
+        let r = &g.riders[0];
+        assert_eq!(r.entry.uri, near, "hop-1 outranks hop-2");
+        assert_eq!((r.hop, r.via.as_str(), r.rel.as_str()), (1, seed.as_str(), "links"), "provenance points at the seed");
+        assert!(r.score > 0.0, "rider carries a decayed score");
+    }
+
+    #[test]
+    fn expanded_graph_returns_links_internal_to_the_result_set() {
+        let m = LocalMemory::for_test(tmp_store());
+        // No lexical overlap between the query and the rider/outside bodies: the rider must
+        // arrive via the edge only, regardless of the (process-global) recall-floor env state.
+        let seed = m.remember("Delta anchor matches the query text", "resources/notes", None, None, None).unwrap();
+        let rider = m.remember("Zeta companion joined by an edge only", "resources/notes", None, None, None).unwrap();
+        let outside = m.remember("Unrelated island far away", "resources/other", None, None, None).unwrap();
+        m.link(&seed, &rider, "informed").unwrap();
+        m.link(&rider, &outside, "links").unwrap(); // one endpoint outside -> must not appear
+        let g = m.recall_expanded_graph("Delta anchor matches", 2, 1).unwrap();
+        assert!(g.riders.iter().any(|r| r.entry.uri == rider), "rider present");
+        assert!(
+            g.links.iter().any(|e| e.from_uri == seed && e.to_uri == rider && e.rel == "informed"),
+            "seed->rider edge is in the mini-subgraph"
+        );
+        assert!(
+            g.links.iter().all(|e| e.from_uri != outside && e.to_uri != outside),
+            "edges leaving the result set are excluded"
+        );
+    }
+
+    #[test]
     fn entity_kg_create_and_relate() {
         let m = LocalMemory::for_test(tmp_store());
         let lenovo = m
@@ -1292,7 +1432,7 @@ mod tests {
     fn floor_off_topic_below_cosine_injects_zero() {
         // off-topic query: every vector hit is below the absolute cosine floor.
         let vec = vec![v("a", 0.12), v("b", 0.08), v("c", 0.20)];
-        let keep = floor_survivors(&[], &vec, &floor(0.30, 0.0, 0.45));
+        let keep = floor_survivors(&[], &vec, &floor(0.30, 0.0, 0.45), 0);
         assert!(keep.is_empty(), "all cosines < 0.30 must inject nothing, got {keep:?}");
     }
 
@@ -1301,7 +1441,7 @@ mod tests {
         // two strong hits then a steep drop-off: the relative ratio drops the tail, the absolute
         // floor is cleared by the strong ones. A 2-relevant query injects ~2, not the whole pool.
         let vec = vec![v("s1", 0.82), v("s2", 0.78), v("w1", 0.33), v("w2", 0.31)];
-        let keep = floor_survivors(&[], &vec, &floor(0.30, 0.0, 0.45));
+        let keep = floor_survivors(&[], &vec, &floor(0.30, 0.0, 0.45), 0);
         assert!(keep.contains("s1") && keep.contains("s2"), "strong hits kept");
         assert!(!keep.contains("w1") && !keep.contains("w2"), "weak tail dropped by ratio: {keep:?}");
     }
@@ -1311,7 +1451,7 @@ mod tests {
         // all-negative cosine (off-topic): the relative clause is skipped (top <= 0) so it can't
         // invert into admitting worse hits; the absolute gate empties the channel.
         let vec = vec![v("a", -0.10), v("b", -0.20), v("c", -0.05)];
-        let keep = floor_survivors(&[], &vec, &floor(0.30, 0.0, 0.45));
+        let keep = floor_survivors(&[], &vec, &floor(0.30, 0.0, 0.45), 0);
         assert!(keep.is_empty(), "negative cosines must not survive, got {keep:?}");
     }
 
@@ -1322,7 +1462,7 @@ mod tests {
         // keyword channel cannot bypass it. The genuinely relevant hit (high cosine) survives.
         let kw = vec![kwh("kw_overlap_junk", 9.0), kwh("relevant", 3.0)];
         let vec = vec![v("relevant", 0.82), v("kw_overlap_junk", 0.18)];
-        let keep = floor_survivors(&kw, &vec, &floor(0.30, 0.0, 0.45));
+        let keep = floor_survivors(&kw, &vec, &floor(0.30, 0.0, 0.45), 0);
         assert!(keep.contains("relevant"), "semantically-relevant hit survives");
         assert!(!keep.contains("kw_overlap_junk"), "shared-word junk with low cosine must be dropped: {keep:?}");
     }
@@ -1332,9 +1472,36 @@ mod tests {
         // no vector channel (keyword-only build / search failed): the bm25 relative gate is the
         // floor - the top match and anything within the ratio survive, the weak tail is dropped.
         let kw = vec![kwh("strong", 8.0), kwh("mid", 4.0), kwh("weak", 1.0)];
-        let keep = floor_survivors(&kw, &[], &floor(0.30, 0.0, 0.45)); // 0.45*8 = 3.6
+        let keep = floor_survivors(&kw, &[], &floor(0.30, 0.0, 0.45), 0); // 0.45*8 = 3.6
         assert!(keep.contains("strong") && keep.contains("mid"), "top + within-ratio kept");
         assert!(!keep.contains("weak"), "weak tail (1.0 < 3.6) dropped: {keep:?}");
+    }
+
+    #[test]
+    fn floor_small_corpus_guard_rescues_a_fully_gated_tiny_pool() {
+        // fresh/tiny corpus: IDF ~ 0, every -bm25 magnitude sits under the absolute floor.
+        // With the whole pool rejected AND small enough to inject anyway, MATCH membership is
+        // trusted and everything comes back.
+        let kw = vec![kwh("a", 0.4), kwh("b", 0.3)];
+        let f = floor(0.30, 2.0, 0.45); // abs_keyword 2.0 gates both
+        assert!(floor_survivors(&kw, &[], &f, 0).is_empty(), "guard off (0): gate stands");
+        let keep = floor_survivors(&kw, &[], &f, 6);
+        assert_eq!(keep.len(), 2, "guard on: the whole tiny pool is rescued: {keep:?}");
+    }
+
+    #[test]
+    fn floor_small_corpus_guard_does_not_fire_on_partial_survival_or_big_pools() {
+        // one hit clears the floor -> the magnitudes are discriminating, gate stands
+        let kw = vec![kwh("strong", 8.0), kwh("weak", 0.3)];
+        let f = floor(0.30, 2.0, 0.01);
+        let keep = floor_survivors(&kw, &[], &f, 6);
+        assert!(keep.contains("strong") && !keep.contains("weak"), "partial survival: no rescue: {keep:?}");
+        // pool bigger than the injectable window -> a big corpus, gate stands even if all-gated
+        let big: Vec<(String, f64)> = (0..8).map(|i| kwh(&format!("r{i}"), 0.2)).collect();
+        assert!(floor_survivors(&big, &[], &f, 6).is_empty(), "8 all-gated hits > max 6: no rescue");
+        // hybrid mode (vector channel present): cosine is the floor, the guard is keyword-only
+        let keep = floor_survivors(&kw, &[v("strong", 0.9)], &f, 6);
+        assert!(keep.contains("strong") && !keep.contains("weak"), "hybrid path untouched by the guard");
     }
 
     // Serializes the few tests that mutate DM_RECALL_FLOOR (the other recall-calling tests assert
@@ -1364,10 +1531,10 @@ mod tests {
         // the empty/short-query sentinel (f64::INFINITY = recent() boot rows) is never floored out,
         // whether or not a vector channel is present.
         let kw = vec![kwh("recent1", f64::INFINITY), kwh("recent2", f64::INFINITY)];
-        assert_eq!(floor_survivors(&kw, &[], &floor(0.30, 0.0, 0.45)).len(), 2, "keyword-only mode");
+        assert_eq!(floor_survivors(&kw, &[], &floor(0.30, 0.0, 0.45), 0).len(), 2, "keyword-only mode");
         // hybrid: a low-cosine vector pool would gate everything, but INFINITY recent rows still pass
         let vec = vec![v("x", 0.05)];
-        let keep = floor_survivors(&kw, &vec, &floor(0.30, 0.0, 0.45));
+        let keep = floor_survivors(&kw, &vec, &floor(0.30, 0.0, 0.45), 0);
         assert!(keep.contains("recent1") && keep.contains("recent2"), "recent rows survive in hybrid too");
     }
 }
@@ -1465,7 +1632,7 @@ mod floor_eval {
 
     /// recall-retained (over relevant present in pool), junk-survivor count, total survivors.
     fn eval_query(q: &QChannels, f: &config::RecallFloor) -> (f64, usize, usize) {
-        let keep = floor_survivors(&q.kw, &q.vec, f);
+        let keep = floor_survivors(&q.kw, &q.vec, f, 0);
         let rel_in_pool: usize = q.rel.iter().filter(|u| q.pool.contains(*u)).count();
         let rel_kept = keep.iter().filter(|u| q.rel.contains(*u)).count();
         let junk_kept = keep.len() - rel_kept;

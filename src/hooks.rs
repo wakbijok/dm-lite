@@ -173,18 +173,18 @@ pub fn user_prompt_submit(arg: Option<String>, hermes: bool, raw: bool) -> Resul
     // skew, transient network) fall back to the plain seeds and say so on stderr, instead of
     // silently injecting nothing - "memory had nothing to say" and "memory is broken" must
     // stay distinguishable.
-    let (seeds, neighbors) = if depth == 0 {
-        (plain("plain"), Vec::new())
+    let graph = if depth == 0 {
+        crate::tools::RecallGraph { seeds: plain("plain"), riders: Vec::new(), links: Vec::new() }
     } else {
-        match m.recall_expanded_split(&prompt, 6, depth) {
-            Ok(t) => t,
+        match m.recall_expanded_graph(&prompt, 6, depth) {
+            Ok(g) => g,
             Err(e) => {
                 eprintln!("dmem hook: graph-expanded recall failed ({e:#}); falling back to plain recall");
-                (plain("fallback plain"), Vec::new())
+                crate::tools::RecallGraph { seeds: plain("fallback plain"), riders: Vec::new(), links: Vec::new() }
             }
         }
     };
-    let recall = render::render_recall_split(&seeds, &neighbors);
+    let recall = render::render_recall_graph(&graph);
     if !recall.trim().is_empty() {
         blocks.push(recall);
     }

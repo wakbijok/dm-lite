@@ -483,15 +483,22 @@ async fn recall_expanded_h(State(st): State<AppState>, headers: HeaderMap, Json(
         // Split shape so clients can render the graph's contribution distinguishably; older
         // clients that expected a flat array must upgrade alongside the server (single-admin
         // deployment; the hook path degrades to plain /recall on a decode failure).
-        let (seeds, neighbors) =
-            m.recall_expanded_split(&req.query, req.limit.unwrap_or(6).min(MAX_LIMIT), req.depth.unwrap_or(1).min(5))?;
-        Ok(json!({ "seeds": seeds, "neighbors": neighbors }))
+        // `riders` (scored, with hop/via/rel provenance) and `links` (edges internal to the
+        // result set) are additive: pre-provenance clients keep reading seeds+neighbors.
+        let g =
+            m.recall_expanded_graph(&req.query, req.limit.unwrap_or(6).min(MAX_LIMIT), req.depth.unwrap_or(1).min(5))?;
+        let neighbors: Vec<&crate::entry::Entry> = g.riders.iter().map(|r| &r.entry).collect();
+        Ok(json!({ "seeds": g.seeds, "neighbors": neighbors, "riders": g.riders, "links": g.links }))
     })
     .await
 }
 
 async fn reindex_links_h(State(st): State<AppState>, headers: HeaderMap) -> ApiResp {
-    with_tenant(&st, &headers, true, move |m, _agent| Ok(json!({ "linked": m.reindex_links()? }))).await
+    with_tenant(&st, &headers, true, move |m, _agent| {
+        let (linked, pruned) = m.reindex_links()?;
+        Ok(json!({ "linked": linked, "pruned": pruned }))
+    })
+    .await
 }
 
 #[derive(Deserialize)]
@@ -815,7 +822,7 @@ mod tests {
 
     #[test]
     fn bearer_resolves_tenant() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("DM_TOKEN_ACME", "secret123");
         let a = BearerAuth::from_env().unwrap();
         let id = a.identity_for(Some("Bearer secret123")).expect("token resolves");
@@ -832,7 +839,7 @@ mod tests {
 
     #[test]
     fn env_token_agent_forms_parse() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("DM_TOKEN_WAKSPACE__IZU", "agtok1"); // tenant + agent
         std::env::set_var("DM_TOKEN_MY_TENANT__SHESTA", "agtok2"); // single underscores stay in the tenant
         std::env::set_var("DM_TOKEN_EDGE__", "agtok3"); // trailing __ = agent-less
@@ -866,7 +873,7 @@ mod tests {
 
     #[test]
     fn duplicate_secret_to_different_tenants_fails_fast() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("DM_TOKEN_ACME", "shared");
         std::env::set_var("DM_TOKEN_GLOBEX", "shared");
         let r = BearerAuth::from_env();
@@ -877,7 +884,7 @@ mod tests {
 
     #[test]
     fn duplicate_secret_to_different_agents_fails_fast() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("DM_TOKEN_ACME2__IZU", "shared2");
         std::env::set_var("DM_TOKEN_ACME2__DEVIN", "shared2");
         let r = BearerAuth::from_env();
@@ -888,7 +895,7 @@ mod tests {
 
     #[test]
     fn memory_cache_reuses_one_handle_per_tenant() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("dmcache-{}-{}", std::process::id(), crate::entry::now_ms()));
         std::env::set_var("DM_DATA_DIR", &dir);
         let st = AppState {
@@ -906,7 +913,7 @@ mod tests {
 
     #[tokio::test]
     async fn recall_route_authorizes_and_returns_hits() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("dmsrv-{}-{}", std::process::id(), crate::entry::now_ms()));
         std::env::set_var("DM_DATA_DIR", &dir);
         std::env::set_var("DM_TOKEN_T1SRV", "tok1");
@@ -958,7 +965,7 @@ mod tests {
     // unit tests over the in-process store do not cover.
     #[tokio::test]
     async fn remember_then_recall_round_trip_over_http() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("dmrt-{}-{}", std::process::id(), crate::entry::now_ms()));
         std::env::set_var("DM_DATA_DIR", &dir);
         std::env::set_var("DM_TOKEN_RT1", "rttok");
@@ -1005,6 +1012,97 @@ mod tests {
         std::env::remove_var("DM_DATA_DIR");
     }
 
+    // /recall_expanded returns the graph-provenance shape: seeds + neighbors (pre-provenance
+    // clients) + riders (hop/via/rel/score) + links (edges internal to the result set).
+    #[tokio::test]
+    async fn recall_expanded_returns_riders_and_links_over_http() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("dmrx-{}-{}", std::process::id(), crate::entry::now_ms()));
+        std::env::set_var("DM_DATA_DIR", &dir);
+        std::env::set_var("DM_TOKEN_RX1", "rxtok");
+        let app = router(Arc::new(BearerAuth::from_env().unwrap()), None);
+
+        let post = |uri: &'static str, body: &'static str| {
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer rxtok")
+                .body(Body::from(body))
+                .unwrap()
+        };
+        let resp = app
+            .clone()
+            .oneshot(post("/remember", r#"{"text":"epsilon anchor matches the query","namespace":"resources/notes"}"#))
+            .await
+            .unwrap();
+        let seed_uri: String = {
+            let body = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+            let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            v.get("uri").and_then(|u| u.as_str()).unwrap_or_default().to_string()
+        };
+        // The rider must be far from the query in BOTH channels: zero token overlap for the
+        // keyword path AND semantically unrelated for the hybrid/candle path - a "connected
+        // rider" phrasing scored close enough in cosine to surface as a SEED under --features
+        // dist, emptying the riders array (caught at the 0.3.0 release gate).
+        let resp = app
+            .clone()
+            .oneshot(post("/remember", r#"{"text":"midnight watering schedule for the rooftop garden","namespace":"resources/notes"}"#))
+            .await
+            .unwrap();
+        let rider_uri: String = {
+            let body = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+            let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            v.get("uri").and_then(|u| u.as_str()).unwrap_or_default().to_string()
+        };
+        let link_body = format!(r#"{{"from":"{seed_uri}","to":"{rider_uri}","rel":"informed"}}"#);
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/link")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer rxtok")
+                    .body(Body::from(link_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp = app
+            .oneshot(post("/recall_expanded", r#"{"query":"epsilon anchor matches","limit":3,"depth":1}"#))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(v.get("seeds").and_then(|s| s.as_array()).is_some_and(|a| !a.is_empty()), "seeds present: {v}");
+        let riders = v.get("riders").and_then(|r| r.as_array()).cloned().unwrap_or_default();
+        assert!(
+            riders.iter().any(|r| r.pointer("/entry/uri").and_then(|u| u.as_str()) == Some(rider_uri.as_str())),
+            "rider present with entry provenance: {v}"
+        );
+        assert!(
+            riders.iter().all(|r| r.get("hop").is_some() && r.get("via").is_some() && r.get("score").is_some()),
+            "riders carry hop/via/score: {v}"
+        );
+        assert!(
+            v.get("links").and_then(|l| l.as_array()).is_some_and(|a| a
+                .iter()
+                .any(|e| e.get("rel").and_then(|r| r.as_str()) == Some("informed"))),
+            "internal edge present in links: {v}"
+        );
+        assert!(
+            v.get("neighbors").and_then(|n| n.as_array()).is_some_and(|a| !a.is_empty()),
+            "pre-provenance neighbors field kept for old clients: {v}"
+        );
+
+        std::env::remove_var("DM_TOKEN_RX1");
+        std::env::remove_var("DM_DATA_DIR");
+    }
+
     // The identity-bleed regression this branch exists for: an agent token gets its OWN persona
     // plus shared governance over the wire, never another agent's; an agent-less token on the
     // SAME tenant still sees the legacy full set.
@@ -1013,7 +1111,7 @@ mod tests {
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn persona_route_serves_the_tokens_agent_only() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("dmpers-{}-{}", std::process::id(), crate::entry::now_ms()));
         std::env::set_var("DM_DATA_DIR", &dir);
         std::env::set_var("DM_TOKEN_PT1__IZU", "izutok");
@@ -1062,7 +1160,7 @@ mod tests {
     #[allow(clippy::await_holding_lock)] // ENV_LOCK must span the awaits, as above
     #[tokio::test]
     async fn remember_with_agent_token_stamps_author() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("dmattr-{}-{}", std::process::id(), crate::entry::now_ms()));
         std::env::set_var("DM_DATA_DIR", &dir);
         std::env::set_var("DM_TOKEN_AT1__SHESTA", "shestatok");

@@ -84,6 +84,98 @@ pub trait MemoryStore {
     /// `limit`. This is the recall-expansion primitive: pull a seed's neighborhood, not the world.
     fn neighbors(&self, seeds: &[String], depth: usize, limit: usize) -> Result<Vec<String>>;
 
+    /// Scored bounded-hop traversal: like `neighbors`, but each seed carries a weight and each
+    /// reached node is scored `seed_weight * decay^hop` along its best-scoring arrival path, so
+    /// the caller can fill rider slots by relevance instead of BFS arrival order. Level-order
+    /// walk with per-node best-score: a node's `hop` is fixed by its first (shallowest) arrival;
+    /// its score/via/rel upgrade if a later arrival scores higher; nodes are expanded once (no
+    /// re-expansion on upgrade - with a uniform per-hop decay the improvement downstream is
+    /// second-order, and the walk stays linear). Seeds are frozen: never scored, never emitted.
+    /// `limit` caps the number of distinct reached nodes. Results come back best score first
+    /// (ties: shallower hop, then uri, so the order is deterministic).
+    fn neighbors_scored(
+        &self,
+        seeds: &[(String, f64)],
+        depth: usize,
+        limit: usize,
+        decay: f64,
+    ) -> Result<Vec<NeighborHit>> {
+        use std::collections::{HashMap, HashSet};
+        if seeds.is_empty() || depth == 0 || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let seed_set: HashSet<&str> = seeds.iter().map(|(u, _)| u.as_str()).collect();
+        let mut best: HashMap<String, NeighborHit> = HashMap::new();
+        let mut frontier: Vec<(String, f64)> = seeds.to_vec();
+        for hop in 1..=(depth as u32) {
+            let mut next: Vec<(String, f64)> = Vec::new();
+            for (u, w) in &frontier {
+                for edge in self.edges_of(u)? {
+                    let other = if edge.from_uri == *u { &edge.to_uri } else { &edge.from_uri };
+                    if other == u || seed_set.contains(other.as_str()) {
+                        continue;
+                    }
+                    let score = w * decay;
+                    match best.get_mut(other) {
+                        Some(hit) => {
+                            if score > hit.score {
+                                hit.score = score;
+                                hit.via = u.clone();
+                                hit.rel = edge.rel.clone();
+                            }
+                        }
+                        None => {
+                            if best.len() >= limit {
+                                continue;
+                            }
+                            best.insert(
+                                other.clone(),
+                                NeighborHit { uri: other.clone(), hop, via: u.clone(), rel: edge.rel.clone(), score },
+                            );
+                            next.push((other.clone(), score));
+                        }
+                    }
+                }
+            }
+            if next.is_empty() {
+                break;
+            }
+            frontier = next;
+        }
+        let mut out: Vec<NeighborHit> = best.into_values().collect();
+        out.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.hop.cmp(&b.hop))
+                .then(a.uri.cmp(&b.uri))
+        });
+        Ok(out)
+    }
+
     /// All edges (capped), for the graph viewer.
     fn all_edges(&self, limit: usize) -> Result<Vec<Edge>>;
+
+    /// Graph hygiene: delete every edge with at least one dead endpoint. Returns how many
+    /// edges were pruned. An endpoint is DEAD when its uri has no system-open version at all
+    /// (forgotten, or never existed); an INVALIDATED record (valid-time closed, system-time
+    /// open) is still a live node of the belief history and keeps its edges. `forget`
+    /// cascades its own edges going forward; this is the batch pass that clears rot
+    /// accumulated before that, plus manual links to targets that never existed. Recall
+    /// stays tolerant of dangling edges regardless (dead riders are skipped without
+    /// consuming the cap) - pruning stops them from also bridging BFS expansion.
+    fn prune_dangling_edges(&self) -> Result<usize>;
+}
+
+/// A graph-expansion hit from `neighbors_scored`: a non-seed record reached by walking edges out
+/// from the recall seeds, with enough provenance to rank and explain it - `hop` (1 = adjacent to
+/// a seed), `via` (the uri it was reached from on its best-scoring path), `rel` (that edge's
+/// relation), and `score` (`seed_weight * decay^hop`, best across arrival paths).
+#[derive(Debug, Clone, PartialEq)]
+pub struct NeighborHit {
+    pub uri: String,
+    pub hop: u32,
+    pub via: String,
+    pub rel: String,
+    pub score: f64,
 }

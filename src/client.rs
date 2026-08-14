@@ -5,6 +5,7 @@
 
 use crate::config::ServerLink;
 use crate::entry::{Edge, Entry, Kind};
+use crate::tools::{RecallGraph, RecallRider};
 use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
 
@@ -217,24 +218,45 @@ impl RemoteClient {
         Ok(seeds)
     }
     pub fn recall_expanded_split(&self, query: &str, limit: usize, depth: usize) -> Result<(Vec<Entry>, Vec<Entry>)> {
-        let v = self.post("/recall_expanded", json!({ "query": query, "limit": limit, "depth": depth }))?;
-        // New servers return {"seeds": [...], "neighbors": [...]}; an older server returns a
-        // flat array - treat that as all-seeds so version skew degrades to unmarked output,
-        // not an error.
-        if v.is_array() {
-            return serde_json::from_value(v)
-                .map(|seeds| (seeds, Vec::new()))
-                .map_err(|e| anyhow!("decode /recall_expanded (flat): {e}"));
-        }
-        let seeds = serde_json::from_value(v.get("seeds").cloned().unwrap_or_else(|| json!([])))
-            .map_err(|e| anyhow!("decode /recall_expanded seeds: {e}"))?;
-        let neighbors = serde_json::from_value(v.get("neighbors").cloned().unwrap_or_else(|| json!([])))
-            .map_err(|e| anyhow!("decode /recall_expanded neighbors: {e}"))?;
-        Ok((seeds, neighbors))
+        let g = self.recall_expanded_graph(query, limit, depth)?;
+        Ok((g.seeds, g.riders.into_iter().map(|r| r.entry).collect()))
     }
-    pub fn reindex_links(&self) -> Result<usize> {
+    pub fn recall_expanded_graph(&self, query: &str, limit: usize, depth: usize) -> Result<RecallGraph> {
+        let v = self.post("/recall_expanded", json!({ "query": query, "limit": limit, "depth": depth }))?;
+        // Version-skew ladder, richest first: a current server returns {"seeds", "neighbors",
+        // "riders", "links"}; a pre-provenance server omits riders/links (neighbors become
+        // provenance-less riders: hop 1, empty via, score 0 - render falls back to the plain
+        // `linked` marker); the oldest returns a flat array - treat that as all-seeds so skew
+        // degrades to unmarked output, not an error.
+        if v.is_array() {
+            let seeds = serde_json::from_value(v).map_err(|e| anyhow!("decode /recall_expanded (flat): {e}"))?;
+            return Ok(RecallGraph { seeds, riders: Vec::new(), links: Vec::new() });
+        }
+        let seeds: Vec<Entry> = serde_json::from_value(v.get("seeds").cloned().unwrap_or_else(|| json!([])))
+            .map_err(|e| anyhow!("decode /recall_expanded seeds: {e}"))?;
+        let riders: Vec<RecallRider> = match v.get("riders") {
+            Some(r) => serde_json::from_value(r.clone()).map_err(|e| anyhow!("decode /recall_expanded riders: {e}"))?,
+            None => {
+                let neighbors: Vec<Entry> =
+                    serde_json::from_value(v.get("neighbors").cloned().unwrap_or_else(|| json!([])))
+                        .map_err(|e| anyhow!("decode /recall_expanded neighbors: {e}"))?;
+                neighbors
+                    .into_iter()
+                    .map(|entry| RecallRider { entry, hop: 1, via: String::new(), rel: String::new(), score: 0.0 })
+                    .collect()
+            }
+        };
+        let links = serde_json::from_value(v.get("links").cloned().unwrap_or_else(|| json!([])))
+            .map_err(|e| anyhow!("decode /recall_expanded links: {e}"))?;
+        Ok(RecallGraph { seeds, riders, links })
+    }
+    pub fn reindex_links(&self) -> Result<(usize, usize)> {
         let v = self.post("/reindex_links", json!({}))?;
-        Ok(v.get("linked").and_then(|n| n.as_u64()).unwrap_or(0) as usize)
+        // `pruned` is additive (new servers report it; old servers just don't).
+        Ok((
+            v.get("linked").and_then(|n| n.as_u64()).unwrap_or(0) as usize,
+            v.get("pruned").and_then(|n| n.as_u64()).unwrap_or(0) as usize,
+        ))
     }
     pub fn reindex_mentions(&self, dry_run: bool) -> Result<(usize, usize)> {
         let v = self.post("/reindex_mentions", json!({ "dry_run": dry_run }))?;
