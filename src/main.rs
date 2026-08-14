@@ -324,6 +324,15 @@ enum Cmd {
         /// TLS private key (PEM)
         #[arg(long = "tls-key")]
         tls_key: Option<String>,
+        /// DANGEROUS: allow serving plain HTTP on a non-loopback address (token + memory
+        /// content travel cleartext). Without this flag, a public bind requires TLS.
+        #[arg(long = "allow-insecure-http")]
+        allow_insecure_http: bool,
+        /// DANGEROUS: keep serving with env tokens when the IAM database cannot be opened
+        /// (revocation/suspension is then NOT enforced). Without this flag, IAM failure
+        /// refuses to start.
+        #[arg(long = "allow-env-only")]
+        allow_env_only: bool,
         /// generate a self-signed cert for HTTPS (saved under the data dir)
         #[arg(long = "tls-generate")]
         tls_generate: bool,
@@ -338,12 +347,17 @@ enum Cmd {
         /// include pre-releases (rc/beta), not just stable
         #[arg(long)]
         pre: bool,
+        /// skip the confirmation prompt (signature verification still always runs)
+        #[arg(long, short = 'y')]
+        yes: bool,
     },
     /// Connect this dmem to a remote server (writes the [server] config). Needs --features client.
     #[cfg(feature = "client")]
     Login {
         url: String,
-        token: String,
+        /// One-time member token. PREFER omitting it: dmem then reads $DM_LOGIN_TOKEN or
+        /// prompts on stdin - a positional token lands in shell history and `ps` output.
+        token: Option<String>,
         #[arg(long)]
         insecure: bool,
         #[arg(long = "ca-cert")]
@@ -393,6 +407,18 @@ enum AdminCmd {
         /// Per-agent identity for the token (persona selection + write attribution); omit for agent-less.
         #[arg(long)]
         agent: Option<String>,
+        /// Scope this token may READ (repeatable; global '' always rides along). Any scope
+        /// flag makes the token scope-bound; omit all three for a full-tenant token.
+        #[arg(long = "scope-read")]
+        scope_read: Vec<String>,
+        /// The single scope stamped on this token's WRITES. Omit on a scope-bound token for
+        /// a read-only token (global writes from scoped tokens are always forbidden).
+        #[arg(long = "scope-write")]
+        scope_write: Option<String>,
+        /// Adapter token: trusted to assert the reader's scope set per request
+        /// (X-DM-Scopes / X-DM-Write-Scope headers).
+        #[arg(long)]
+        adapter: bool,
     },
     /// List tenants and live token counts.
     List,
@@ -732,10 +758,13 @@ fn run() -> Result<()> {
         #[cfg(feature = "ui")]
         Cmd::Ui { addr, open } => ui::run(&addr, open),
         #[cfg(feature = "server")]
-        Cmd::Serve { addr, tls_cert, tls_key, tls_generate } => server::run_blocking(
-            &addr,
-            server::TlsOpts { cert: tls_cert, key: tls_key, generate: tls_generate },
-        ),
+        Cmd::Serve { addr, tls_cert, tls_key, tls_generate, allow_insecure_http, allow_env_only } => {
+            server::run_blocking(
+                &addr,
+                server::TlsOpts { cert: tls_cert, key: tls_key, generate: tls_generate },
+                server::HardeningOpts { allow_insecure_http, allow_env_only },
+            )
+        }
         #[cfg(feature = "server")]
         Cmd::Service(s) => match s {
             ServiceCmd::Install { addr } => service::install(&addr),
@@ -746,9 +775,33 @@ fn run() -> Result<()> {
             ServiceCmd::Status => service::status(),
         },
         #[cfg(feature = "self-update")]
-        Cmd::Upgrade { pre } => upgrade::run(pre),
+        Cmd::Upgrade { pre, yes } => upgrade::run(pre, yes),
         #[cfg(feature = "client")]
-        Cmd::Login { url, token, insecure, ca_cert } => client::login(&url, &token, insecure, ca_cert),
+        Cmd::Login { url, token, insecure, ca_cert } => {
+            // Token sourcing ladder (audit High #3): flag-less env var, then an stdin prompt.
+            // The positional form still works but is discouraged - it leaks via shell history
+            // and process listings.
+            let token = match token {
+                Some(t) => {
+                    eprintln!("dmem login: NOTE - passing the token as an argument leaks it into shell history/ps; prefer $DM_LOGIN_TOKEN or the interactive prompt.");
+                    t
+                }
+                None => match std::env::var("DM_LOGIN_TOKEN").ok().filter(|t| !t.trim().is_empty()) {
+                    Some(t) => t.trim().to_string(),
+                    None => {
+                        eprint!("token: ");
+                        let mut buf = String::new();
+                        std::io::stdin().read_line(&mut buf)?;
+                        let t = buf.trim().to_string();
+                        if t.is_empty() {
+                            anyhow::bail!("no token provided (set $DM_LOGIN_TOKEN or paste it at the prompt)");
+                        }
+                        t
+                    }
+                },
+            };
+            client::login(&url, &token, insecure, ca_cert)
+        }
         #[cfg(feature = "client")]
         Cmd::Logout => client::logout(),
         #[cfg(feature = "client")]
@@ -758,11 +811,18 @@ fn run() -> Result<()> {
             })?;
             let rc = client::RemoteClient::new(link)?;
             match a {
-                AdminCmd::Add { tenant, label, display, agent } => {
-                    let (t, tok) = rc.admin_add(&tenant, &label, &display, agent.as_deref())?;
-                    match &agent {
-                        Some(a) => println!("created tenant '{t}' (token agent: {a}). one-time token (save it now, shown once):"),
-                        None => println!("created tenant '{t}'. one-time token (save it now, shown once):"),
+                AdminCmd::Add { tenant, label, display, agent, scope_read, scope_write, adapter } => {
+                    let (t, tok) =
+                        rc.admin_add(&tenant, &label, &display, agent.as_deref(), &scope_read, scope_write.as_deref(), adapter)?;
+                    let scoped = !scope_read.is_empty() || scope_write.is_some() || adapter;
+                    match (&agent, scoped) {
+                        (Some(a), false) => println!("created tenant '{t}' (token agent: {a}). one-time token (save it now, shown once):"),
+                        (None, false) => println!("created tenant '{t}'. one-time token (save it now, shown once):"),
+                        (_, true) => println!(
+                            "minted scope-bound token for tenant '{t}' (read: [{}], write: {}, adapter: {adapter}). one-time token (save it now, shown once):",
+                            scope_read.join(", "),
+                            scope_write.as_deref().map(|s| if s.is_empty() { "'' (global)" } else { s }.to_string()).unwrap_or_else(|| "none (read-only)".into()),
+                        ),
                     }
                     println!("    {tok}");
                     println!("the user runs:  dmem login {} {tok}", link.url);

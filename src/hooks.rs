@@ -124,6 +124,37 @@ pub fn session_end(raw: bool) -> Result<()> {
     Ok(())
 }
 
+/// Pull the submitted prompt out of a hook-event JSON body. Hermes shell hooks
+/// put it at `extra.user_message` (docs); some surfaces (and hand tests) send
+/// top-level `user_message` / `prompt`. An empty parse must not be treated as
+/// "memory had nothing to say" - that is how desktop awareness went silent.
+fn prompt_from_hook_input(v: &serde_json::Value, hermes: bool) -> Option<String> {
+    let paths: &[&str] = if hermes {
+        &[
+            "/extra/user_message",
+            "/user_message",
+            "/extra/prompt",
+            "/prompt",
+            "/user_prompt",
+        ]
+    } else {
+        &["/prompt", "/user_prompt", "/extra/user_message", "/user_message"]
+    };
+    for p in paths {
+        if let Some(s) = v.pointer(p).and_then(|x| x.as_str()).map(str::trim).filter(|s| !s.is_empty()) {
+            return Some(s.to_string());
+        }
+    }
+    None
+}
+
+fn first_turn_from_hook_input(v: &serde_json::Value) -> bool {
+    v.pointer("/extra/is_first_turn")
+        .or_else(|| v.get("is_first_turn"))
+        .and_then(|x| x.as_bool())
+        .unwrap_or(false)
+}
+
 /// UserPromptSubmit (Claude/Codex) / pre_llm_call (Hermes): recall relevant memory for the
 /// submitted prompt and append a save-discipline nudge when this session's work looks
 /// uncaptured. Claude/Codex put the prompt at top-level `prompt`; Hermes passes it as
@@ -133,23 +164,11 @@ pub fn user_prompt_submit(arg: Option<String>, hermes: bool, raw: bool) -> Resul
     let (raw_in, input) = read_stdin();
     let prompt = arg
         .filter(|s| !s.trim().is_empty())
-        .or_else(|| {
-            let v = input.as_ref()?;
-            if hermes {
-                v.pointer("/extra/user_message").and_then(|x| x.as_str()).map(|s| s.to_string())
-            } else {
-                v.get("prompt").or_else(|| v.get("user_prompt")).and_then(|x| x.as_str()).map(|s| s.to_string())
-            }
-        })
+        .or_else(|| input.as_ref().and_then(|v| prompt_from_hook_input(v, hermes)))
         .unwrap_or_default();
     // Hermes flags the first turn so the persona/recent block can ride pre_llm_call (its
-    // on_session_start hook cannot inject context).
-    let first_turn = hermes
-        && input
-            .as_ref()
-            .and_then(|v| v.pointer("/extra/is_first_turn"))
-            .and_then(|x| x.as_bool())
-            .unwrap_or(false);
+    // on_session_start hook cannot inject context). Diagnostic only - recall runs every turn.
+    let first_turn = hermes && input.as_ref().map(first_turn_from_hook_input).unwrap_or(false);
     if prompt.trim().len() < 3 {
         debug_log("user_prompt_submit", hermes, &raw_in, &prompt, first_turn, 0);
         return Ok(());
@@ -247,5 +266,28 @@ mod tests {
         assert!(should_nudge(Some(now - NUDGE_GAP_MS - 1), now), "30m + 1ms -> nudge");
         assert!(!should_nudge(Some(now), now), "just saved -> no nudge");
         assert!(!should_nudge(Some(now + 5), now), "future save (clock skew) -> no nudge (saturating_sub)");
+    }
+
+    #[test]
+    fn hermes_prompt_accepts_extra_and_top_level() {
+        let extra = serde_json::json!({"extra": {"user_message": "  wg ip  ", "is_first_turn": true}});
+        assert_eq!(prompt_from_hook_input(&extra, true).as_deref(), Some("wg ip"));
+        assert!(first_turn_from_hook_input(&extra));
+
+        let top = serde_json::json!({"user_message": "desktop turn", "is_first_turn": false});
+        assert_eq!(
+            prompt_from_hook_input(&top, true).as_deref(),
+            Some("desktop turn")
+        );
+        assert!(!first_turn_from_hook_input(&top));
+
+        let empty = serde_json::json!({"extra": {"user_message": "  "}});
+        assert!(prompt_from_hook_input(&empty, true).is_none());
+    }
+
+    #[test]
+    fn claude_prompt_still_prefers_top_level_prompt() {
+        let v = serde_json::json!({"prompt": "cc prompt", "user_message": "ignored"});
+        assert_eq!(prompt_from_hook_input(&v, false).as_deref(), Some("cc prompt"));
     }
 }

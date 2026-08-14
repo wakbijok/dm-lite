@@ -330,6 +330,15 @@ pub fn recall_decay() -> f64 {
     parse_recall_decay(std::env::var("DM_RECALL_DECAY").ok().as_deref())
 }
 
+/// Scope for a scope-bound LOCAL session (`DM_SCOPE`, scope primitive): stamps writes with
+/// that scope and narrows reads to it + global. Unset/empty = full-tenant global session -
+/// the default, and byte-identical to pre-scope behavior. Server mode resolves scope from
+/// the TOKEN, never from this env (the env is the local trust boundary, the token is the
+/// remote one).
+pub fn scope() -> Option<String> {
+    std::env::var("DM_SCOPE").ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
 fn parse_recall_decay(v: Option<&str>) -> f64 {
     const DEFAULT: f64 = 0.5;
     match v.map(str::trim) {

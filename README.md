@@ -67,7 +67,7 @@ Details, offline cache, and env knobs: wiki [Embedding models](https://github.co
 
 ## Per-agent identity (shared memory, separate personas)
 
-Several agents can share one tenant's memory while each receives only its own persona. Mint a token per agent (`dmem admin add <tenant> --agent izu`, or the env form `DM_TOKEN_<TENANT>__<AGENT>=secret` - double underscore separates tenant from agent). A token with an agent label is served the shared governance records (persona/protocol records outside the `agents/` namespace tree) plus that agent's own `agents/<agent>/...` persona - never another agent's - and its writes are stamped with an `author:<agent>` tag. Agent-less tokens keep the full legacy behaviour, so existing setups are unaffected until you opt in.
+Several agents can share one tenant's memory while each receives only its own persona. Mint a token per agent (`dmem admin add <tenant> --agent izu`, or the env form `DM_TOKEN_<TENANT>__<AGENT>=secret` - double underscore separates tenant from agent). An agent-labelled token cannot read another agent's `agents/<other>/...` tree through ANY surface (recall, recent, history, graph expansion - not just the persona route), cannot write into it, and cannot forget/invalidate records there; its writes are stamped with an `author:<agent>` tag. Everything OUTSIDE the `agents/` tree is one shared pool by design - the shared brain is the point, so do not put per-agent secrets in shared namespaces, and do not share a tenant with agents or users you don't trust (see Security model). Agent-less tokens keep the full legacy behaviour.
 
 ## Offline / air-gapped
 
@@ -90,6 +90,19 @@ HF_HOME=/srv/hf-cache dmem serve --addr 127.0.0.1:8088
 `dmem` honours `HF_HOME` and `HUGGINGFACE_HUB_CACHE` (it uses the standard HuggingFace cache), and `dmem serve` logs the cache dir and model on startup. `dmem doctor` prints the exact directory it expects and whether the model is present, so you know up front if a first run needs network.
 
 For CI and scripted ops, point any command at a server without editing the config: `dmem --endpoint https://memory.example.com recall "x"` (overrides `DM_ENDPOINT`; the token comes from `DM_TOKEN` or the config).
+
+## Security model
+
+The trust boundaries, plainly:
+
+- **Tenant = the hard boundary.** One tenant, one SQLite database, one vector index. Nothing crosses tenants.
+- **Scope = the partition inside a tenant** (design doc: daimon-docs, dm-lite/scope-primitive.md): per-record audience labels, server-stamped writes, grant-filtered reads. Scoped tokens cannot write global; adapter tokens assert a reader's scopes per request.
+- **Agent label = persona protection + attribution**, not a general ACL. The `agents/` tree is isolated per agent; everything else in the tenant is a shared pool. Share a tenant only with mutually-trusted agents/users: anything a member writes can reach every member's context (shared brains share prompt-injection surface too).
+- **Transport:** `dmem serve` refuses plain HTTP on a non-loopback bind unless you pass `--allow-insecure-http`. Use `--tls-generate` or bring your own cert.
+- **Startup is fail-closed:** an unopenable IAM database refuses to start (revocation would not be enforced) unless you pass `--allow-env-only`; `DM_TOKEN_*` env secrets under 16 characters are rejected outright.
+- **Tokens:** prefer `dmem login <url>` with `$DM_LOGIN_TOKEN` or the prompt - a positional token lands in shell history and `ps`.
+- **Files:** tenant DBs and `iam.db` are created/re-chmodded 0600 on Unix. On Windows there is no ACL tightening yet - rely on the account boundary.
+- **The local graph viewer (`dmem ui`) has no auth** by design: keep it on the default loopback bind and reach it over an SSH tunnel. It rejects DNS-name Host headers (rebinding guard); IP-literal and localhost Hosts are allowed.
 
 ## Docs
 

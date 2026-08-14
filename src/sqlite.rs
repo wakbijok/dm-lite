@@ -12,7 +12,7 @@ use std::path::Path;
 
 /// Full column list (read order matches `row_to_entry`, which reads by name).
 const COLS: &str = "uri,kind,namespace,title,body,tags,importance,dedup_key,\
-created_ms,valid_from_ms,valid_to_ms,system_from_ms,system_to_ms";
+created_ms,valid_from_ms,valid_to_ms,system_from_ms,system_to_ms,scope";
 
 /// The "current slice" predicate: the currently-recorded version (system_to NULL) that is
 /// still true-in-world at the bound `now` param. `?` placeholders are filled per query.
@@ -21,11 +21,29 @@ const CURRENT: &str =
 
 pub struct SqliteStore {
     conn: Connection,
+    /// Read visibility (scope primitive): None = full tenant (every scope - today's behavior
+    /// and the default); Some(set) = only records whose scope is `''` (global) or in the set.
+    /// v1 filters post-query with over-fetch, the same pattern as the kind=skill exclusion.
+    read_scopes: Option<std::collections::HashSet<String>>,
+    /// Agent-tree visibility (security audit 11-08-2026, High #1): Some(a) hides every
+    /// record under another agent's `agents/<b>/...` namespace from ALL reads - recall,
+    /// recent, history, get, graph traversal - not just the persona route. The shared pool
+    /// (everything outside `agents/`) stays fully visible: the shared brain is the point;
+    /// only the persona mechanism itself is protected. None = legacy/agent-less = no filter.
+    agent_view: Option<String>,
 }
 
 impl SqliteStore {
     pub fn open(path: &Path) -> Result<Self> {
         let conn = Connection::open(path).with_context(|| format!("open {}", path.display()))?;
+        // Tenant DBs hold all memory content; keep them owner-only (audit Medium #5).
+        // SQLite copies the main db file's mode onto -wal/-shm, so this covers those too.
+        // Best-effort: a read-only FS or exotic mount must not brick the open.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        }
         // The CREATE TABLE is the v1 (bitemporal) shape for fresh dbs; on an existing v0 db
         // it is a no-op and migrate() adds the new columns. Only columns present in BOTH v0
         // and v1 may be indexed here; the new-column indexes are created in migrate().
@@ -48,7 +66,8 @@ impl SqliteStore {
                 valid_from_ms  INTEGER NOT NULL DEFAULT 0,
                 valid_to_ms    INTEGER,
                 system_from_ms INTEGER NOT NULL DEFAULT 0,
-                system_to_ms   INTEGER
+                system_to_ms   INTEGER,
+                scope          TEXT NOT NULL DEFAULT ''
             );
             CREATE INDEX IF NOT EXISTS idx_entries_dedup ON entries(dedup_key);
             CREATE INDEX IF NOT EXISTS idx_entries_kind  ON entries(kind);
@@ -70,9 +89,28 @@ impl SqliteStore {
             "#,
         )
         .context("init schema")?;
-        let store = Self { conn };
+        let store = Self { conn, read_scopes: None, agent_view: None };
         store.migrate().context("migrate schema to bitemporal (v1)")?;
+        store.ensure_scope_column().context("add scope column (scope primitive)")?;
         Ok(store)
+    }
+
+    /// Scope primitive (daimon-docs: dm-lite/scope-primitive.md): one audience label per record version;
+    /// '' = tenant-global, so every pre-scope row reads as global - truthful history.
+    /// UNCONDITIONAL and idempotent, deliberately OUTSIDE the user_version-gated migrate():
+    /// a v1 (bitemporal) database returns early from migrate(), which is exactly where the
+    /// production db lives - the 0.3.2 release-gate migration test on a copy of it caught the
+    /// scope ALTER never running when it sat inside that block.
+    fn ensure_scope_column(&self) -> Result<()> {
+        let missing: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('entries') WHERE name='scope'",
+            [],
+            |r| r.get(0),
+        )?;
+        if missing == 0 {
+            self.conn.execute_batch("ALTER TABLE entries ADD COLUMN scope TEXT NOT NULL DEFAULT ''")?;
+        }
+        Ok(())
     }
 
     /// Migrate a v0 (soft-close) db to v1 (bitemporal), guarded by `PRAGMA user_version`.
@@ -157,10 +195,67 @@ impl SqliteStore {
             valid_to_ms: row.get("valid_to_ms")?,
             system_from_ms: row.get("system_from_ms")?,
             system_to_ms: row.get("system_to_ms")?,
+            scope: row.get("scope")?,
         })
     }
 
+    /// Restrict reads to `scopes` (plus global `''`, which every reader sees). None = full
+    /// tenant. Set once at open (local `DM_SCOPE`) or per request under the tenant lock
+    /// (server, from the token) - the scope primitive's read half.
+    pub fn set_read_scopes(&mut self, scopes: Option<Vec<String>>) {
+        self.read_scopes = scopes.map(|v| v.into_iter().collect());
+    }
+
+    /// Restrict reads to one agent's view of the `agents/` tree (None = no restriction).
+    pub fn set_agent_view(&mut self, agent: Option<String>) {
+        self.agent_view = agent;
+    }
+
+    /// Is a record with this scope visible to the current reader?
+    fn scope_ok(&self, scope: &str) -> bool {
+        match &self.read_scopes {
+            None => true,
+            Some(set) => scope.is_empty() || set.contains(scope),
+        }
+    }
+
+    /// Is a record in this namespace visible to the current agent identity? Everything
+    /// outside `agents/` is; inside it, only the caller's own subtree. The prefix and the
+    /// agent segment compare CASE-INSENSITIVELY (2nd-opinion follow-up: `Agents/shesta`
+    /// must not slip past a guard that only knows `agents/`); agent labels themselves are
+    /// canonical lowercase, so the caller side is already normalized.
+    fn ns_ok(&self, namespace: &str) -> bool {
+        let Some(a) = &self.agent_view else { return true };
+        match crate::entry::split_agents_tree(namespace) {
+            None => true,
+            Some(owner) => owner.eq_ignore_ascii_case(a),
+        }
+    }
+
+    /// The combined per-row read gate: scope (audience) AND agent tree.
+    fn row_ok(&self, e: &Entry) -> bool {
+        self.scope_ok(&e.scope) && self.ns_ok(&e.namespace)
+    }
+
+    /// Over-fetch when EITHER filter is active (both are post-query).
+    fn filtered_reads(&self) -> bool {
+        self.read_scopes.is_some() || self.agent_view.is_some()
+    }
+
+    /// Over-fetch factor for scope-filtered reads: the SQL LIMIT counts rows BEFORE the
+    /// post-query scope filter, so a scoped reader fetches deeper to keep `limit` visible
+    /// results. Unscoped readers pay nothing.
+    fn fetch_depth(&self, limit: usize) -> usize {
+        if self.filtered_reads() {
+            limit.saturating_mul(4)
+        } else {
+            limit
+        }
+    }
+
     /// Fetch the current (live) entry for a uri (used by RRF fusion to hydrate vector hits).
+    /// Scope-gated: an out-of-scope record reads as absent - this is what keeps invisible
+    /// records out of rider hydration for free.
     #[cfg_attr(not(feature = "zvec"), allow(dead_code))]
     pub fn get(&self, uri: &str) -> Result<Option<Entry>> {
         let now = crate::entry::now_ms();
@@ -169,7 +264,8 @@ impl SqliteStore {
         ))?;
         let mut rows = stmt.query(params![uri, now, now])?;
         if let Some(r) = rows.next()? {
-            Ok(Some(Self::row_to_entry(r)?))
+            let e = Self::row_to_entry(r)?;
+            Ok(if self.row_ok(&e) { Some(e) } else { None })
         } else {
             Ok(None)
         }
@@ -259,12 +355,15 @@ fn intervals_overlap(af: i64, at: Option<i64>, bf: i64, bt: Option<i64>) -> bool
 impl SqliteStore {
     /// All system-current versions (id + entry) for a dedup_key. Bitemporal: an entity can have
     /// several at once, partitioning its valid-time line into non-overlapping segments.
-    fn current_rows(conn: &Connection, dedup_key: &str) -> Result<Vec<(i64, Entry)>> {
+    /// Current live rows for a dedup key WITHIN ONE SCOPE. Dedup/supersede is per-scope by
+    /// design (scope-primitive doc, section 4): the same title in two scopes is two records
+    /// on two sides of a fence - they must never supersede each other across it.
+    fn current_rows(conn: &Connection, dedup_key: &str, scope: &str) -> Result<Vec<(i64, Entry)>> {
         let mut stmt = conn.prepare(&format!(
-            "SELECT id, {COLS} FROM entries WHERE dedup_key=?1 AND system_to_ms IS NULL"
+            "SELECT id, {COLS} FROM entries WHERE dedup_key=?1 AND scope=?2 AND system_to_ms IS NULL"
         ))?;
         let rows = stmt
-            .query_map(params![dedup_key], |row| Ok((row.get::<_, i64>("id")?, Self::row_to_entry(row)?)))?
+            .query_map(params![dedup_key, scope], |row| Ok((row.get::<_, i64>("id")?, Self::row_to_entry(row)?)))?
             .filter_map(|r| r.ok())
             .collect();
         Ok(rows)
@@ -296,11 +395,11 @@ impl SqliteStore {
         let tags = serde_json::to_string(&e.tags).unwrap_or_else(|_| "[]".into());
         conn.execute(
             "INSERT INTO entries(uri,kind,namespace,title,body,tags,importance,dedup_key,\
-             created_ms,valid_from_ms,valid_to_ms,system_from_ms,system_to_ms) \
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,NULL)",
+             created_ms,valid_from_ms,valid_to_ms,system_from_ms,system_to_ms,scope) \
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,NULL,?13)",
             params![
                 e.uri, e.kind.as_str(), e.namespace, e.title, e.body, tags,
-                e.importance, e.dedup_key, e.created_ms, e.valid_from_ms, e.valid_to_ms, now
+                e.importance, e.dedup_key, e.created_ms, e.valid_from_ms, e.valid_to_ms, now, e.scope
             ],
         )?;
         let new_id = conn.last_insert_rowid();
@@ -331,7 +430,7 @@ impl MemoryStore for SqliteStore {
         }
         let now = crate::entry::now_ms();
         let tx = self.conn.unchecked_transaction()?;
-        let current = Self::current_rows(&tx, &e.dedup_key)?;
+        let current = Self::current_rows(&tx, &e.dedup_key, &e.scope)?;
         // Idempotent: a current segment with the SAME body that already covers the new interval
         // means we already believe this -> nothing to record.
         let already = current.iter().any(|(_, r)| {
@@ -389,12 +488,14 @@ impl MemoryStore for SqliteStore {
             COLS.split(',').map(|c| format!("e.{c}")).collect::<Vec<_>>().join(",")
         ))?;
         let out = stmt
-            .query_map(params![fq, now, limit as i64], |r| {
+            .query_map(params![fq, now, self.fetch_depth(limit) as i64], |r| {
                 let e = Self::row_to_entry(r)?;
                 let rank: f64 = r.get("kw_rank")?;
                 Ok((e, -rank))
             })?
             .filter_map(|r| r.ok())
+            .filter(|(e, _)| self.row_ok(e))
+            .take(limit)
             .collect();
         Ok(out)
     }
@@ -408,8 +509,10 @@ impl MemoryStore for SqliteStore {
              ORDER BY importance DESC, created_ms DESC LIMIT ?"
         ))?;
         let rows = stmt
-            .query_map(params![now, now, limit as i64], Self::row_to_entry)?
+            .query_map(params![now, now, self.fetch_depth(limit) as i64], Self::row_to_entry)?
             .filter_map(|r| r.ok())
+            .filter(|e| self.row_ok(e))
+            .take(limit)
             .collect();
         Ok(rows)
     }
@@ -421,8 +524,10 @@ impl MemoryStore for SqliteStore {
              ORDER BY importance DESC, created_ms DESC LIMIT ?"
         ))?;
         let rows = stmt
-            .query_map(params![kind, now, now, limit as i64], Self::row_to_entry)?
+            .query_map(params![kind, now, now, self.fetch_depth(limit) as i64], Self::row_to_entry)?
             .filter_map(|r| r.ok())
+            .filter(|e| self.row_ok(e))
+            .take(limit)
             .collect();
         Ok(rows)
     }
@@ -447,8 +552,10 @@ impl MemoryStore for SqliteStore {
         let own = format!("agents/{agent}");
         let own_tree = format!("agents/{agent}/*");
         let rows = stmt
-            .query_map(params![kind, now, now, own, own_tree, limit as i64], Self::row_to_entry)?
+            .query_map(params![kind, now, now, own, own_tree, self.fetch_depth(limit) as i64], Self::row_to_entry)?
             .filter_map(|r| r.ok())
+            .filter(|e| self.row_ok(e))
+            .take(limit)
             .collect();
         Ok(rows)
     }
@@ -466,6 +573,7 @@ impl MemoryStore for SqliteStore {
         let all: Vec<Entry> = stmt
             .query_map(params![as_of_ms, valid_ms], Self::row_to_entry)?
             .filter_map(|r| r.ok())
+            .filter(|e| self.row_ok(e))
             .take(MAX_AS_OF_SCAN)
             .collect();
         let terms: Vec<String> = query
@@ -488,12 +596,16 @@ impl MemoryStore for SqliteStore {
     }
 
     fn history(&self, uri: &str, limit: usize) -> Result<Vec<Entry>> {
+        // History is content (scope decision Q2): each version is gated by its own scope, the
+        // same rule as recall - anyone holding the scope may read the lineage, nobody else.
         let mut stmt = self.conn.prepare(&format!(
             "SELECT {COLS} FROM entries WHERE uri=?1 ORDER BY system_from_ms DESC, id DESC LIMIT ?2"
         ))?;
         let rows = stmt
-            .query_map(params![uri, limit as i64], Self::row_to_entry)?
+            .query_map(params![uri, self.fetch_depth(limit) as i64], Self::row_to_entry)?
             .filter_map(|r| r.ok())
+            .filter(|e| self.row_ok(e))
+            .take(limit)
             .collect();
         Ok(rows)
     }
@@ -577,11 +689,28 @@ impl MemoryStore for SqliteStore {
         let mut stmt = self.conn.prepare(
             "SELECT from_uri, to_uri, rel FROM edges WHERE from_uri=?1 OR to_uri=?1 ORDER BY created_ms",
         )?;
-        let rows = stmt
+        let rows: Vec<Edge> = stmt
             .query_map(params![uri], |r| Ok(Edge { from_uri: r.get(0)?, to_uri: r.get(1)?, rel: r.get(2)? }))?
             .filter_map(|r| r.ok())
             .collect();
-        Ok(rows)
+        if !self.filtered_reads() {
+            return Ok(rows);
+        }
+        // Same reasoning as all_edges (2nd-opinion follow-up: this surface was missed): an
+        // invisible record's uri slug is a title in disguise, and agents/<other> uris are
+        // predictable - a restricted reader probing /edges must not enumerate them. The
+        // queried uri itself being invisible reads as "no edges", matching get()'s absence.
+        if !self.scope_visible(uri)? {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::new();
+        for e in rows {
+            let other = if e.from_uri == uri { &e.to_uri } else { &e.from_uri };
+            if self.scope_visible(other)? {
+                out.push(e);
+            }
+        }
+        Ok(out)
     }
 
     fn neighbors(&self, seeds: &[String], depth: usize, limit: usize) -> Result<Vec<String>> {
@@ -604,9 +733,15 @@ impl MemoryStore for SqliteStore {
             }
             let mut next: Vec<String> = Vec::new();
             'frontier: for u in &frontier {
-                let hits = stmt.query_map(params![u], |r| r.get::<_, String>(0))?;
-                for h in hits.filter_map(|x| x.ok()) {
+                let hits: Vec<String> =
+                    stmt.query_map(params![u], |r| r.get::<_, String>(0))?.filter_map(|x| x.ok()).collect();
+                for h in hits {
                     if visited.insert(h.clone()) {
+                        // scope gate at traversal, same rule as neighbors_scored: an invisible
+                        // node neither appears nor bridges
+                        if !self.scope_visible(&h)? {
+                            continue;
+                        }
                         next.push(h.clone());
                         out.push(h);
                         if out.len() >= limit {
@@ -621,6 +756,29 @@ impl MemoryStore for SqliteStore {
             frontier = next;
         }
         Ok(out)
+    }
+
+    fn scope_visible(&self, uri: &str) -> Result<bool> {
+        if !self.filtered_reads() {
+            return Ok(true);
+        }
+        // The newest system-open version decides, on BOTH gates (scope + agent tree). A uri
+        // with no live version stays "visible": dead nodes are the pruner's business, not
+        // this gate's - hiding them here would silently change pre-scope bridging behavior.
+        let row: Option<(String, String)> = self
+            .conn
+            .query_row(
+                "SELECT scope, namespace FROM entries WHERE uri=?1 AND system_to_ms IS NULL \
+                 ORDER BY system_from_ms DESC LIMIT 1",
+                params![uri],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .map(Some)
+            .or_else(|e| if e == rusqlite::Error::QueryReturnedNoRows { Ok(None) } else { Err(e) })?;
+        Ok(match row {
+            Some((s, ns)) => self.scope_ok(&s) && self.ns_ok(&ns),
+            None => true,
+        })
     }
 
     fn prune_dangling_edges(&self) -> Result<usize> {
@@ -639,11 +797,32 @@ impl MemoryStore for SqliteStore {
         let mut stmt = self.conn.prepare(
             "SELECT from_uri, to_uri, rel FROM edges ORDER BY created_ms DESC LIMIT ?1",
         )?;
-        let rows = stmt
+        let rows: Vec<Edge> = stmt
             .query_map(params![limit as i64], |r| Ok(Edge { from_uri: r.get(0)?, to_uri: r.get(1)?, rel: r.get(2)? }))?
             .filter_map(|r| r.ok())
             .collect();
-        Ok(rows)
+        if !self.filtered_reads() {
+            return Ok(rows);
+        }
+        // Scoped reader: a uri's slug is a title in disguise, so an edge naming an invisible
+        // record leaks it. Keep only edges whose BOTH endpoints are visible. Per-endpoint
+        // lookups, memoized - scoped graph dumps are rare (adapters/viewers), correctness wins.
+        let mut memo: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
+        let mut out = Vec::new();
+        for e in rows {
+            let mut vis = |u: &str| -> Result<bool> {
+                if let Some(v) = memo.get(u) {
+                    return Ok(*v);
+                }
+                let v = self.scope_visible(u)?;
+                memo.insert(u.to_string(), v);
+                Ok(v)
+            };
+            if vis(&e.from_uri)? && vis(&e.to_uri)? {
+                out.push(e);
+            }
+        }
+        Ok(out)
     }
 }
 
@@ -1199,6 +1378,73 @@ mod tests {
         assert_eq!(a_edges[0].to_uri, c.uri);
         // forgetting a uri with no live versions is a no-op for the graph too
         assert_eq!(s.forget(&b.uri).unwrap(), 0);
+    }
+
+    #[test]
+    fn v1_db_without_scope_gains_the_column_on_open() {
+        // Regression for the 0.3.2 release-gate catch: a bitemporal (user_version=1) db - i.e.
+        // PRODUCTION - returns early from migrate(), so the scope ALTER must live OUTSIDE that
+        // gate or existing deployments break on first read after upgrade.
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("dmv1s-{}-{}-{}", std::process::id(), now_ms(), n));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.db");
+        {
+            let c = Connection::open(&path).unwrap();
+            c.execute_batch(
+                "CREATE TABLE entries (id INTEGER PRIMARY KEY, uri TEXT NOT NULL, kind TEXT NOT NULL,
+                    namespace TEXT NOT NULL, title TEXT NOT NULL, body TEXT NOT NULL,
+                    tags TEXT NOT NULL DEFAULT '[]', importance INTEGER NOT NULL DEFAULT 50,
+                    dedup_key TEXT NOT NULL, created_ms INTEGER NOT NULL,
+                    valid_from_ms INTEGER NOT NULL DEFAULT 0, valid_to_ms INTEGER,
+                    system_from_ms INTEGER NOT NULL DEFAULT 0, system_to_ms INTEGER);
+                 CREATE VIRTUAL TABLE entries_fts USING fts5(idref UNINDEXED, text);
+                 INSERT INTO entries(uri,kind,namespace,title,body,dedup_key,created_ms,valid_from_ms,system_from_ms)
+                    VALUES('daimon://ns/memory/pre-scope','memory','ns','pre scope','body','daimon://ns/memory/pre-scope',1,1,1);
+                 PRAGMA user_version = 1;",
+            )
+            .unwrap();
+        }
+        let s = SqliteStore::open(&path).unwrap();
+        let e = s.get("daimon://ns/memory/pre-scope").unwrap().expect("pre-scope row readable");
+        assert_eq!(e.scope, "", "pre-scope rows read as tenant-global");
+        assert!(!s.recent(5).unwrap().is_empty(), "reads work post-ALTER");
+    }
+
+    #[test]
+    fn scope_partitions_dedup_and_gates_reads() {
+        let mut s = mem_store();
+        // Same title in two scopes shares a uri/dedup_key (scope is NOT part of the uri by
+        // design) but must NOT supersede across the fence: dedup is per (scope, dedup_key).
+        // KNOWN WRINKLE (flagged for phase-2 review): a full-tenant reader's get(uri) on such
+        // a collision returns the newest of the two - identity is ambiguous across scopes.
+        let g = mk(Kind::Memory, "ns", "same title", "global body");
+        let mut p = mk(Kind::Memory, "ns", "same title", "private body");
+        p.scope = "user:a".into();
+        s.put(&g).unwrap();
+        s.put(&p).unwrap();
+        let live: Vec<Entry> =
+            s.history(&g.uri, 10).unwrap().into_iter().filter(|e| e.system_to_ms.is_none()).collect();
+        assert_eq!(live.len(), 2, "both scopes' records stay live - no cross-scope supersede: {live:?}");
+
+        // reads narrow to global + granted scopes
+        let q = mk(Kind::Memory, "ns", "quiet other record", "in another scope");
+        let mut q = q;
+        q.scope = "user:b".into();
+        s.put(&q).unwrap();
+        s.set_read_scopes(Some(vec!["user:a".to_string()]));
+        let recent = s.recent(10).unwrap();
+        assert!(recent.iter().any(|e| e.scope.is_empty()), "global rides along for every reader");
+        assert!(recent.iter().any(|e| e.scope == "user:a"), "granted scope visible");
+        assert!(recent.iter().all(|e| e.scope != "user:b"), "ungranted scope invisible: {recent:?}");
+        assert!(s.get(&q.uri).unwrap().is_none(), "get() reads an out-of-scope record as absent");
+        assert!(
+            s.history(&q.uri, 10).unwrap().is_empty(),
+            "history follows the scope filter (decision Q2: history is content)"
+        );
+        // and the keyword channel too
+        let hits = s.recall("quiet other record", 10).unwrap();
+        assert!(hits.is_empty(), "recall must not leak ungranted scopes: {hits:?}");
     }
 
     #[test]

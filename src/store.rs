@@ -115,6 +115,11 @@ pub trait MemoryStore {
                     if other == u || seed_set.contains(other.as_str()) {
                         continue;
                     }
+                    // Scope gate at traversal, not hydration: an out-of-scope node is not on
+                    // the graph for this reader - it neither rides nor bridges.
+                    if !self.scope_visible(other)? {
+                        continue;
+                    }
                     let score = w * decay;
                     match best.get_mut(other) {
                         Some(hit) => {
@@ -155,6 +160,15 @@ pub trait MemoryStore {
 
     /// All edges (capped), for the graph viewer.
     fn all_edges(&self, limit: usize) -> Result<Vec<Edge>>;
+
+    /// May the current reader see this uri at all? (Scope primitive.) This is the
+    /// TRAVERSAL-level gate: graph expansion must not walk THROUGH an invisible node -
+    /// rider `via` provenance would leak its title otherwise. Default: everything visible
+    /// (stores without scope support behave exactly as before).
+    fn scope_visible(&self, uri: &str) -> Result<bool> {
+        let _ = uri;
+        Ok(true)
+    }
 
     /// Graph hygiene: delete every edge with at least one dead endpoint. Returns how many
     /// edges were pruned. An endpoint is DEAD when its uri has no system-open version at all

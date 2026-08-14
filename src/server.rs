@@ -84,6 +84,15 @@ impl BearerAuth {
                 if tenant_raw.is_empty() || v.is_empty() {
                     continue;
                 }
+                // Weak env secrets fail FAST (audit Medium #9): env tokens skip IAM's 160-bit
+                // minting, so enforce a floor here rather than silently serving a guessable
+                // bearer. Same fail-fast posture as the duplicate-secret check below.
+                if v.len() < 16 {
+                    anyhow::bail!(
+                        "DM_TOKEN_{rest} is too short ({} chars): bearer secrets must be at least 16 characters",
+                        v.len()
+                    );
+                }
                 let ident = (
                     crate::config::canonical_tenant(tenant_raw),
                     agent_raw.and_then(crate::config::canonical_agent),
@@ -120,10 +129,15 @@ fn parse_bearer(h: &str) -> Option<&str> {
 impl Authenticator for BearerAuth {
     fn identity_for(&self, auth_header: Option<&str>) -> Option<crate::iam::Identity> {
         let token = parse_bearer(auth_header?)?;
+        // Env tokens are always scope-unbound (full tenant): scoped identities exist only in
+        // iam.db, where they can be audited and revoked.
         self.map.get(&sha256_hex(token)).map(|(tenant, agent)| crate::iam::Identity {
             tenant: Some(tenant.clone()),
             is_admin: false,
             agent: agent.clone(),
+            scope_read: None,
+            scope_write: None,
+            adapter: false,
         })
     }
 }
@@ -355,21 +369,70 @@ fn ns_or<'a>(ns: &'a Option<String>, default: &'a str) -> &'a str {
 /// tenant's Mutex via spawn_blocking, so SQLite/zvec work never blocks an async worker and
 /// same-tenant requests serialize (SQLite writes serialize anyway) while different tenants run
 /// in parallel. (Admin tokens have no tenant -> 401 here.)
+/// Per-request scope binding derived from the token (+ adapter headers): (write, read).
+/// Scope-unbound tokens (every pre-scope token) bind to full tenant - byte-identical to the
+/// pre-scope server. Non-adapter tokens asserting scope headers are silently ignored (Q1).
+fn scope_binding(id: &crate::iam::Identity, headers: &HeaderMap) -> (Option<String>, Option<Vec<String>>) {
+    if id.scope_unbound() {
+        return (Some(String::new()), None);
+    }
+    if id.adapter {
+        // Q1: the adapter asserts the READER's scope set per request; an absent header means
+        // global-only (fail closed). Token-level scope_read, when present, caps the set.
+        let mut read: Vec<String> = headers
+            .get("x-dm-scopes")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect())
+            .unwrap_or_default();
+        if let Some(cap) = &id.scope_read {
+            read.retain(|s| cap.contains(s));
+        }
+        // Adapter writes are explicit per request too: header absent = this request is
+        // read-only; an empty value = deliberate GLOBAL write (Q3's explicit promotion path).
+        let write = headers.get("x-dm-write-scope").and_then(|v| v.to_str().ok()).map(|s| s.trim().to_string());
+        if let Some(w) = write.as_deref().filter(|w| !w.is_empty()) {
+            if !read.iter().any(|s| s == w) {
+                read.push(w.to_string());
+            }
+        }
+        return (write, Some(read));
+    }
+    // Plain scope-bound token: static grants. Missing scope_read = global-only (fail closed);
+    // the write scope is always readable so engine-side mutation guards can see their target.
+    let mut read = id.scope_read.clone().unwrap_or_default();
+    if let Some(w) = id.scope_write.as_deref().filter(|w| !w.is_empty()) {
+        if !read.iter().any(|s| s == w) {
+            read.push(w.to_string());
+        }
+    }
+    (id.scope_write.clone(), Some(read))
+}
+
 async fn with_tenant<F>(st: &AppState, headers: &HeaderMap, client_err: bool, f: F) -> ApiResp
 where
     F: FnOnce(&LocalMemory, Option<String>) -> Result<serde_json::Value> + Send + 'static,
 {
-    let (tenant, agent) = match resolve_identity(st, headers) {
-        Some(crate::iam::Identity { tenant: Some(t), agent, .. }) => (t, agent),
+    let id = match resolve_identity(st, headers) {
+        Some(id) if id.tenant.is_some() => id,
         _ => return err(StatusCode::UNAUTHORIZED, "invalid or missing bearer token"),
     };
+    let tenant = id.tenant.clone().expect("checked above");
+    let agent = id.agent.clone();
+    let (write_scope, read_scopes) = scope_binding(&id, headers);
     let handle = match st.memory_for(&tenant) {
         Ok(h) => h,
         Err(e) => return internal(e),
     };
     let res = tokio::task::spawn_blocking(move || {
-        let guard = handle.lock().unwrap_or_else(|p| p.into_inner());
-        f(&guard, agent)
+        let mut guard = handle.lock().unwrap_or_else(|p| p.into_inner());
+        // Bind this request's scope context, run, then RESET: the handle is cached per
+        // tenant and the next request must never inherit a previous caller's context.
+        guard.set_scope_context(write_scope.as_deref(), read_scopes);
+        guard.set_agent_view(agent.clone());
+        let r = f(&guard, agent);
+        guard.set_scope_context(Some(""), None);
+        guard.set_agent_view(None);
+        r
     })
     .await;
     match res {
@@ -493,8 +556,22 @@ async fn recall_expanded_h(State(st): State<AppState>, headers: HeaderMap, Json(
     .await
 }
 
+/// As `with_tenant`, but only for FULL-TENANT identities: batch graph maintenance under a
+/// scoped identity would rebuild/prune from a partial view of the store and damage the graph.
+async fn with_tenant_unscoped<F>(st: &AppState, headers: &HeaderMap, client_err: bool, f: F) -> ApiResp
+where
+    F: FnOnce(&LocalMemory, Option<String>) -> Result<serde_json::Value> + Send + 'static,
+{
+    if let Some(id) = resolve_identity(st, headers) {
+        if id.tenant.is_some() && !id.scope_unbound() {
+            return err(StatusCode::FORBIDDEN, "full-tenant token required for this operation");
+        }
+    }
+    with_tenant(st, headers, client_err, f).await
+}
+
 async fn reindex_links_h(State(st): State<AppState>, headers: HeaderMap) -> ApiResp {
-    with_tenant(&st, &headers, true, move |m, _agent| {
+    with_tenant_unscoped(&st, &headers, true, move |m, _agent| {
         let (linked, pruned) = m.reindex_links()?;
         Ok(json!({ "linked": linked, "pruned": pruned }))
     })
@@ -508,7 +585,7 @@ struct ReindexMentionsReq {
 }
 
 async fn reindex_mentions_h(State(st): State<AppState>, headers: HeaderMap, Json(req): Json<ReindexMentionsReq>) -> ApiResp {
-    with_tenant(&st, &headers, true, move |m, _agent| {
+    with_tenant_unscoped(&st, &headers, true, move |m, _agent| {
         let (found, added) = m.reindex_mentions(req.dry_run)?;
         Ok(json!({ "found": found, "added": added }))
     })
@@ -602,6 +679,16 @@ struct AdminAddReq {
     /// Optional per-agent identity label for the minted token (None = agent-less).
     #[serde(default)]
     agent: Option<String>,
+    /// Scope primitive (all optional; omitting every one mints a full-tenant token exactly
+    /// as before). `scope_read`: scopes this token may read (global always included).
+    /// `scope_write`: the single scope stamped on its writes (omit = read-only when any
+    /// scope field is set). `adapter`: may assert the reader's scopes per request (Q1).
+    #[serde(default)]
+    scope_read: Option<Vec<String>>,
+    #[serde(default)]
+    scope_write: Option<String>,
+    #[serde(default)]
+    adapter: bool,
 }
 
 #[derive(Deserialize)]
@@ -612,7 +699,21 @@ struct AdminTargetReq {
 async fn admin_add_h(State(st): State<AppState>, headers: HeaderMap, Json(req): Json<AdminAddReq>) -> ApiResp {
     with_admin(&st, &headers, || {
         let iam = crate::iam::Iam::open()?;
-        let (tenant, token) = iam.create_tenant(&req.tenant, &req.display, &req.label, req.agent.as_deref())?;
+        let scoped = req.scope_read.is_some() || req.scope_write.is_some() || req.adapter;
+        let (tenant, token) = if scoped {
+            let t = crate::config::canonical_tenant(&req.tenant);
+            let tok = iam.mint_scoped_token(
+                &req.tenant,
+                &req.label,
+                req.agent.as_deref(),
+                req.scope_read.as_deref().unwrap_or(&[]),
+                req.scope_write.as_deref(),
+                req.adapter,
+            )?;
+            (t, tok)
+        } else {
+            iam.create_tenant(&req.tenant, &req.display, &req.label, req.agent.as_deref())?
+        };
         Ok(json!({ "tenant": tenant, "token": token, "agent": req.agent.as_deref().and_then(crate::config::canonical_agent) }))
     })
 }
@@ -720,7 +821,35 @@ fn generate_self_signed(addr: &str) -> Result<(String, String)> {
 
 /// Bind `addr` and serve. With TLS (cert/key or generate) it serves HTTPS; otherwise plain
 /// HTTP with a loud warning. Tokens come from the environment.
-pub fn run_blocking(addr: &str, tls: TlsOpts) -> Result<()> {
+/// Operator overrides for the fail-closed startup defaults (security audit 11-08-2026).
+#[derive(Default)]
+pub struct HardeningOpts {
+    pub allow_insecure_http: bool,
+    pub allow_env_only: bool,
+}
+
+/// Loopback = 127.0.0.0/8, ::1, or the literal `localhost` host part.
+fn is_loopback_addr(addr: &str) -> bool {
+    let host = addr.rsplit_once(':').map(|(h, _)| h).unwrap_or(addr).trim_matches(['[', ']']);
+    host == "localhost" || host == "::1" || host.starts_with("127.")
+}
+
+pub fn run_blocking(addr: &str, tls: TlsOpts, hardening: HardeningOpts) -> Result<()> {
+    // Fail closed on a cleartext public bind (audit High #2): a non-loopback address without
+    // TLS puts bearer tokens and memory content on the wire. Loopback keeps the old default.
+    // A half-configured pair is a misconfiguration, not "no TLS": fail loudly instead of
+    // silently serving plain HTTP (2nd-opinion follow-up: `--tls-cert` alone previously
+    // counted as "has TLS" for the bind guard while the serve path fell through to HTTP).
+    if tls.cert.is_some() != tls.key.is_some() {
+        anyhow::bail!("--tls-cert and --tls-key must be given together (or use --tls-generate)");
+    }
+    let has_tls = (tls.cert.is_some() && tls.key.is_some()) || tls.generate;
+    if !is_loopback_addr(addr) && !has_tls && !hardening.allow_insecure_http {
+        anyhow::bail!(
+            "refusing to serve plain HTTP on non-loopback {addr}: add --tls-cert/--tls-key or \
+             --tls-generate, or override explicitly with --allow-insecure-http"
+        );
+    }
     // rustls 0.23 needs a process-wide crypto provider installed before any TLS work.
     let _ = rustls::crypto::ring::default_provider().install_default();
     let auth = BearerAuth::from_env()?;
@@ -743,10 +872,16 @@ pub fn run_blocking(addr: &str, tls: TlsOpts) -> Result<()> {
             }
             Some(iam)
         }
-        Err(e) => {
-            eprintln!("dmem serve: IAM unavailable ({e:#}); serving with env tokens only - token revocation/suspension is NOT enforced until IAM is reachable.");
+        Err(e) if hardening.allow_env_only => {
+            eprintln!("dmem serve: IAM unavailable ({e:#}); serving with env tokens only (--allow-env-only) - token revocation/suspension is NOT enforced until IAM is reachable.");
             None
         }
+        // Fail closed (audit Medium #8): without the explicit override, an unopenable IAM db
+        // means revoked tokens could come back to life via the env fallback - refuse instead.
+        Err(e) => anyhow::bail!(
+            "IAM database unavailable ({e:#}); refusing to start (revocation would not be \
+             enforced). Fix the IAM db, or start with --allow-env-only to accept that risk."
+        ),
     };
     if auth.is_empty() {
         eprintln!(
@@ -810,6 +945,16 @@ pub fn run_blocking(addr: &str, tls: TlsOpts) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn loopback_addr_detection() {
+        for ok in ["127.0.0.1:8077", "127.9.9.9:80", "localhost:8077", "[::1]:8077"] {
+            assert!(is_loopback_addr(ok), "{ok} is loopback");
+        }
+        for bad in ["0.0.0.0:8077", "10.100.30.64:8077", "192.168.217.1:8077", "memory.example.com:443"] {
+            assert!(!is_loopback_addr(bad), "{bad} is not loopback");
+        }
+    }
+
     use super::*;
     use axum::body::Body;
     use axum::http::Request;
@@ -823,16 +968,16 @@ mod tests {
     #[test]
     fn bearer_resolves_tenant() {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("DM_TOKEN_ACME", "secret123");
+        std::env::set_var("DM_TOKEN_ACME", "secret123-0123456789");
         let a = BearerAuth::from_env().unwrap();
-        let id = a.identity_for(Some("Bearer secret123")).expect("token resolves");
+        let id = a.identity_for(Some("Bearer secret123-0123456789")).expect("token resolves");
         assert_eq!(id.tenant.as_deref(), Some("acme"));
         assert!(id.agent.is_none(), "plain DM_TOKEN_<TENANT> stays agent-less");
         assert!(!id.is_admin);
         // case-insensitive scheme
-        assert_eq!(a.identity_for(Some("bearer secret123")).unwrap().tenant.as_deref(), Some("acme"));
+        assert_eq!(a.identity_for(Some("bearer secret123-0123456789")).unwrap().tenant.as_deref(), Some("acme"));
         assert!(a.identity_for(Some("Bearer nope")).is_none());
-        assert!(a.identity_for(Some("Basic secret123")).is_none());
+        assert!(a.identity_for(Some("Basic secret123-0123456789")).is_none());
         assert!(a.identity_for(None).is_none());
         std::env::remove_var("DM_TOKEN_ACME");
     }
@@ -840,29 +985,29 @@ mod tests {
     #[test]
     fn env_token_agent_forms_parse() {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("DM_TOKEN_WAKSPACE__IZU", "agtok1"); // tenant + agent
-        std::env::set_var("DM_TOKEN_MY_TENANT__SHESTA", "agtok2"); // single underscores stay in the tenant
-        std::env::set_var("DM_TOKEN_EDGE__", "agtok3"); // trailing __ = agent-less
-        std::env::set_var("DM_TOKEN___GHOST", "agtok4"); // empty tenant = ignored
-        std::env::set_var("DM_TOKEN_T2__A__B", "agtok5"); // FIRST __ splits; the rest is the agent
+        std::env::set_var("DM_TOKEN_WAKSPACE__IZU", "agtok1-0123456789abc"); // tenant + agent
+        std::env::set_var("DM_TOKEN_MY_TENANT__SHESTA", "agtok2-0123456789abc"); // single underscores stay in the tenant
+        std::env::set_var("DM_TOKEN_EDGE__", "agtok3-0123456789abc"); // trailing __ = agent-less
+        std::env::set_var("DM_TOKEN___GHOST", "agtok4-0123456789abc"); // empty tenant = ignored
+        std::env::set_var("DM_TOKEN_T2__A__B", "agtok5-0123456789abc"); // FIRST __ splits; the rest is the agent
         let a = BearerAuth::from_env().unwrap();
 
-        let id = a.identity_for(Some("Bearer agtok1")).expect("agent token resolves");
+        let id = a.identity_for(Some("Bearer agtok1-0123456789abc")).expect("agent token resolves");
         assert_eq!(id.tenant.as_deref(), Some("wakspace"));
         assert_eq!(id.agent.as_deref(), Some("izu"), "env agent label is canonicalized (lowercase)");
         assert!(!id.is_admin);
 
-        let id = a.identity_for(Some("Bearer agtok2")).unwrap();
+        let id = a.identity_for(Some("Bearer agtok2-0123456789abc")).unwrap();
         assert_eq!(id.tenant.as_deref(), Some("my_tenant"), "single underscores belong to the tenant");
         assert_eq!(id.agent.as_deref(), Some("shesta"));
 
-        let id = a.identity_for(Some("Bearer agtok3")).unwrap();
+        let id = a.identity_for(Some("Bearer agtok3-0123456789abc")).unwrap();
         assert_eq!(id.tenant.as_deref(), Some("edge"));
         assert!(id.agent.is_none(), "trailing __ means agent-less");
 
-        assert!(a.identity_for(Some("Bearer agtok4")).is_none(), "empty tenant is skipped");
+        assert!(a.identity_for(Some("Bearer agtok4-0123456789abc")).is_none(), "empty tenant is skipped");
 
-        let id = a.identity_for(Some("Bearer agtok5")).unwrap();
+        let id = a.identity_for(Some("Bearer agtok5-0123456789abc")).unwrap();
         assert_eq!(id.tenant.as_deref(), Some("t2"));
         assert_eq!(id.agent.as_deref(), Some("a__b"), "only the first __ splits");
 
@@ -874,8 +1019,8 @@ mod tests {
     #[test]
     fn duplicate_secret_to_different_tenants_fails_fast() {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("DM_TOKEN_ACME", "shared");
-        std::env::set_var("DM_TOKEN_GLOBEX", "shared");
+        std::env::set_var("DM_TOKEN_ACME", "shared-0123456789abc");
+        std::env::set_var("DM_TOKEN_GLOBEX", "shared-0123456789abc");
         let r = BearerAuth::from_env();
         assert!(r.is_err(), "same secret -> two tenants must be rejected");
         std::env::remove_var("DM_TOKEN_ACME");
@@ -885,8 +1030,8 @@ mod tests {
     #[test]
     fn duplicate_secret_to_different_agents_fails_fast() {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("DM_TOKEN_ACME2__IZU", "shared2");
-        std::env::set_var("DM_TOKEN_ACME2__DEVIN", "shared2");
+        std::env::set_var("DM_TOKEN_ACME2__IZU", "shared2-0123456789ab");
+        std::env::set_var("DM_TOKEN_ACME2__DEVIN", "shared2-0123456789ab");
         let r = BearerAuth::from_env();
         assert!(r.is_err(), "same secret -> same tenant but two agents must be rejected (attribution)");
         std::env::remove_var("DM_TOKEN_ACME2__IZU");
@@ -916,7 +1061,7 @@ mod tests {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("dmsrv-{}-{}", std::process::id(), crate::entry::now_ms()));
         std::env::set_var("DM_DATA_DIR", &dir);
-        std::env::set_var("DM_TOKEN_T1SRV", "tok1");
+        std::env::set_var("DM_TOKEN_T1SRV", "tok1-0123456789abcde");
         // seed a record into tenant t1srv
         let m = Memory::open_tenant("t1srv").unwrap();
         m.remember("the vector substrate is zvec", "resources/notes", None, None, None).unwrap();
@@ -945,7 +1090,7 @@ mod tests {
                     .method("POST")
                     .uri("/recall")
                     .header("content-type", "application/json")
-                    .header("authorization", "Bearer tok1")
+                    .header("authorization", "Bearer tok1-0123456789abcde")
                     .body(Body::from(r#"{"query":"vector substrate","limit":5}"#))
                     .unwrap(),
             )
@@ -968,7 +1113,7 @@ mod tests {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("dmrt-{}-{}", std::process::id(), crate::entry::now_ms()));
         std::env::set_var("DM_DATA_DIR", &dir);
-        std::env::set_var("DM_TOKEN_RT1", "rttok");
+        std::env::set_var("DM_TOKEN_RT1", "rttok-0123456789abcd");
         let app = router(Arc::new(BearerAuth::from_env().unwrap()), None);
 
         // POST /remember (write through the wire)
@@ -979,7 +1124,7 @@ mod tests {
                     .method("POST")
                     .uri("/remember")
                     .header("content-type", "application/json")
-                    .header("authorization", "Bearer rttok")
+                    .header("authorization", "Bearer rttok-0123456789abcd")
                     .body(Body::from(r#"{"text":"the mail relay runs postfix on local raid","namespace":"resources/notes"}"#))
                     .unwrap(),
             )
@@ -997,7 +1142,7 @@ mod tests {
                     .method("POST")
                     .uri("/recall")
                     .header("content-type", "application/json")
-                    .header("authorization", "Bearer rttok")
+                    .header("authorization", "Bearer rttok-0123456789abcd")
                     .body(Body::from(r#"{"query":"postfix mail relay","limit":5}"#))
                     .unwrap(),
             )
@@ -1012,6 +1157,128 @@ mod tests {
         std::env::remove_var("DM_DATA_DIR");
     }
 
+    // The scope primitive over the wire: scoped tokens stamp writes and read a filtered
+    // slice; read-only tokens cannot write; adapter tokens assert scopes per request;
+    // batch graph maintenance is full-tenant only. One test, one shared router - the
+    // scenarios build on each other's data.
+    #[tokio::test]
+    async fn scoped_tokens_over_http_stamp_filter_and_guard() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("dmscope-{}-{}", std::process::id(), crate::entry::now_ms()));
+        std::env::set_var("DM_DATA_DIR", &dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let iam = crate::iam::Iam::open_at(&dir.join("iam.db")).unwrap();
+        let (_t, full) = iam.create_tenant("scopetest", "", "", None).unwrap();
+        let user_a = iam
+            .mint_scoped_token("scopetest", "a", None, &["user:a".to_string()], Some("user:a"), false)
+            .unwrap();
+        let readonly = iam.mint_scoped_token("scopetest", "ro", None, &["user:a".to_string()], None, false).unwrap();
+        let bridge = iam.mint_scoped_token("scopetest", "bridge", None, &[], None, true).unwrap();
+        let app = router(Arc::new(BearerAuth::from_env().unwrap()), Some(iam));
+
+        let call = |app: Router, uri: &'static str, tok: String, body: String, hdrs: Vec<(&'static str, String)>| async move {
+            let mut b = Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {tok}"));
+            for (k, v) in hdrs {
+                b = b.header(k, v);
+            }
+            let resp = app.oneshot(b.body(Body::from(body)).unwrap()).await.unwrap();
+            let status = resp.status();
+            let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+            (status, serde_json::from_slice::<serde_json::Value>(&bytes).unwrap_or(serde_json::Value::Null))
+        };
+
+        // full-tenant token writes a global record
+        let (st, _) = call(
+            app.clone(),
+            "/remember",
+            full.clone(),
+            r#"{"text":"global fact for everyone","namespace":"resources/notes"}"#.into(),
+            vec![],
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        // scoped token writes - stamped user:a regardless of payload (no scope field exists on the wire)
+        let (st, v) = call(
+            app.clone(),
+            "/remember",
+            user_a.clone(),
+            r#"{"text":"private note of user a","namespace":"resources/notes"}"#.into(),
+            vec![],
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        let a_uri = v.get("uri").and_then(|u| u.as_str()).unwrap().to_string();
+        // full token sees the stored scope stamp
+        let (_, v) = call(app.clone(), "/recall", full.clone(), r#"{"query":"private note user","limit":5}"#.into(), vec![]).await;
+        let hit = v.as_array().and_then(|a| a.iter().find(|e| e["uri"].as_str() == Some(a_uri.as_str()))).cloned();
+        assert_eq!(hit.expect("full token sees it")["scope"], "user:a", "write stamped from the token");
+
+        // scoped token sees global + own; a different-scope record stays invisible
+        let (_, v) = call(app.clone(), "/recall", user_a.clone(), r#"{"query":"global fact everyone","limit":5}"#.into(), vec![]).await;
+        assert!(v.as_array().is_some_and(|a| !a.is_empty()), "global rides along: {v}");
+
+        // read-only scoped token: write is rejected
+        let (st, _) = call(
+            app.clone(),
+            "/remember",
+            readonly.clone(),
+            r#"{"text":"should never land","namespace":"resources/notes"}"#.into(),
+            vec![],
+        )
+        .await;
+        assert_ne!(st, StatusCode::OK, "read-only token cannot write (Q3)");
+
+        // scoped token cannot forget a global record... (mutation guard)
+        let (_, v) = call(app.clone(), "/recall", full.clone(), r#"{"query":"global fact everyone","limit":1}"#.into(), vec![]).await;
+        let g_uri = v[0]["uri"].as_str().unwrap().to_string();
+        let (st, _) = call(app.clone(), "/forget", user_a.clone(), format!(r#"{{"uri":"{g_uri}"}}"#), vec![]).await;
+        assert_ne!(st, StatusCode::OK, "scoped token cannot retract a global record");
+        // ...and cannot run batch graph maintenance
+        let (st, _) = call(app.clone(), "/reindex_links", user_a.clone(), "{}".into(), vec![]).await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "reindex is full-tenant only");
+
+        // adapter: no headers = global-only read, and write rejected
+        let (_, v) = call(app.clone(), "/recall", bridge.clone(), r#"{"query":"private note user","limit":5}"#.into(), vec![]).await;
+        assert!(
+            v.as_array().is_some_and(|a| a.iter().all(|e| e["uri"].as_str() != Some(a_uri.as_str()))),
+            "adapter without asserted scopes must not see user:a: {v}"
+        );
+        let (st, _) = call(app.clone(), "/remember", bridge.clone(), r#"{"text":"x","namespace":"resources/notes"}"#.into(), vec![]).await;
+        assert_ne!(st, StatusCode::OK, "adapter write without X-DM-Write-Scope is rejected");
+        // adapter asserting the scope reads it; asserting a write scope stamps it
+        let (_, v) = call(
+            app.clone(),
+            "/recall",
+            bridge.clone(),
+            r#"{"query":"private note user","limit":5}"#.into(),
+            vec![("x-dm-scopes", "user:a".into())],
+        )
+        .await;
+        assert!(
+            v.as_array().is_some_and(|a| a.iter().any(|e| e["uri"].as_str() == Some(a_uri.as_str()))),
+            "adapter with asserted scope sees it: {v}"
+        );
+        let (st, v) = call(
+            app.clone(),
+            "/remember",
+            bridge.clone(),
+            r#"{"text":"room record via the bridge","namespace":"resources/notes"}"#.into(),
+            vec![("x-dm-write-scope", "room:z".into())],
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        let room_uri = v["uri"].as_str().unwrap().to_string();
+        let (_, v) = call(app.clone(), "/recall", full.clone(), r#"{"query":"room record bridge","limit":5}"#.into(), vec![]).await;
+        let hit = v.as_array().and_then(|a| a.iter().find(|e| e["uri"].as_str() == Some(room_uri.as_str()))).cloned();
+        assert_eq!(hit.expect("stored")["scope"], "room:z", "adapter write stamped from its asserted scope");
+
+        std::env::remove_var("DM_DATA_DIR");
+    }
+
     // /recall_expanded returns the graph-provenance shape: seeds + neighbors (pre-provenance
     // clients) + riders (hop/via/rel/score) + links (edges internal to the result set).
     #[tokio::test]
@@ -1019,7 +1286,7 @@ mod tests {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("dmrx-{}-{}", std::process::id(), crate::entry::now_ms()));
         std::env::set_var("DM_DATA_DIR", &dir);
-        std::env::set_var("DM_TOKEN_RX1", "rxtok");
+        std::env::set_var("DM_TOKEN_RX1", "rxtok-0123456789abcd");
         let app = router(Arc::new(BearerAuth::from_env().unwrap()), None);
 
         let post = |uri: &'static str, body: &'static str| {
@@ -1027,7 +1294,7 @@ mod tests {
                 .method("POST")
                 .uri(uri)
                 .header("content-type", "application/json")
-                .header("authorization", "Bearer rxtok")
+                .header("authorization", "Bearer rxtok-0123456789abcd")
                 .body(Body::from(body))
                 .unwrap()
         };
@@ -1063,7 +1330,7 @@ mod tests {
                     .method("POST")
                     .uri("/link")
                     .header("content-type", "application/json")
-                    .header("authorization", "Bearer rxtok")
+                    .header("authorization", "Bearer rxtok-0123456789abcd")
                     .body(Body::from(link_body))
                     .unwrap(),
             )
@@ -1114,8 +1381,8 @@ mod tests {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("dmpers-{}-{}", std::process::id(), crate::entry::now_ms()));
         std::env::set_var("DM_DATA_DIR", &dir);
-        std::env::set_var("DM_TOKEN_PT1__IZU", "izutok");
-        std::env::set_var("DM_TOKEN_PT1", "plaintok");
+        std::env::set_var("DM_TOKEN_PT1__IZU", "izutok-0123456789abc");
+        std::env::set_var("DM_TOKEN_PT1", "plaintok-0123456789a");
         let m = Memory::open_tenant("pt1").unwrap();
         m.import_record(crate::entry::Kind::Persona, "agents/izu/persona", "Izu Persona", "I am Izu").unwrap();
         m.import_record(crate::entry::Kind::Persona, "agents/shesta/persona", "Shesta Persona", "I am Shesta").unwrap();
@@ -1143,11 +1410,11 @@ mod tests {
             }
         };
 
-        let s = call("izutok").await;
+        let s = call("izutok-0123456789abc").await;
         assert!(s.contains("Izu Persona") && s.contains("House Rules"), "own persona + shared governance: {s}");
         assert!(!s.contains("Shesta Persona"), "another agent's persona must not leak: {s}");
 
-        let s = call("plaintok").await;
+        let s = call("plaintok-0123456789a").await;
         assert!(s.contains("Izu Persona") && s.contains("Shesta Persona"), "agent-less token keeps legacy behaviour: {s}");
 
         std::env::remove_var("DM_TOKEN_PT1__IZU");
@@ -1163,7 +1430,7 @@ mod tests {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("dmattr-{}-{}", std::process::id(), crate::entry::now_ms()));
         std::env::set_var("DM_DATA_DIR", &dir);
-        std::env::set_var("DM_TOKEN_AT1__SHESTA", "shestatok");
+        std::env::set_var("DM_TOKEN_AT1__SHESTA", "shestatok-0123456789");
         let app = router(Arc::new(BearerAuth::from_env().unwrap()), None);
 
         let resp = app
@@ -1173,7 +1440,7 @@ mod tests {
                     .method("POST")
                     .uri("/remember")
                     .header("content-type", "application/json")
-                    .header("authorization", "Bearer shestatok")
+                    .header("authorization", "Bearer shestatok-0123456789")
                     .body(Body::from(r#"{"text":"the report template lives in projects docs","namespace":"resources/notes"}"#))
                     .unwrap(),
             )
@@ -1187,7 +1454,7 @@ mod tests {
                     .method("POST")
                     .uri("/recall")
                     .header("content-type", "application/json")
-                    .header("authorization", "Bearer shestatok")
+                    .header("authorization", "Bearer shestatok-0123456789")
                     .body(Body::from(r#"{"query":"report template docs","limit":5}"#))
                     .unwrap(),
             )

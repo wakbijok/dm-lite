@@ -1,6 +1,6 @@
 [package]
 name = "dm-lite"
-version = "0.3.0"
+version = "0.3.2"
 edition = "2021"
 description = "Memory for Hermes, Codex, Claude Code, OpenCode, Devin, and any MCP agent. daimon-memory v2: one-binary typed memory engine with hybrid recall"
 license = "MIT"
@@ -33,7 +33,7 @@ ui = ["dep:axum", "dep:tokio"]
 # wizard: interactive `dmem setup` first-run flow (dialoguer).
 wizard = ["dep:dialoguer"]
 # self-update: `dmem upgrade` in-place from GitHub Releases.
-self-update = ["dep:self_update", "dep:semver"]
+self-update = ["dep:semver", "dep:reqwest", "dep:minisign-verify", "dep:self-replace", "dep:tar", "dep:flate2"]
 # client: remote-client mode - talk to a remote `dmem serve` over HTTPS (reqwest + rustls).
 client = ["dep:reqwest"]
 # dist: the friend-facing distribution build (what the release workflow ships).
@@ -64,7 +64,10 @@ rustls = { version = "0.23", features = ["ring"], optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"], optional = true }
 tower = { version = "0.5", features = ["util"], optional = true }
 dialoguer = { version = "0.11", optional = true }
-self_update = { version = "0.41", default-features = false, features = ["rustls", "archive-tar", "archive-zip", "compression-flate2"], optional = true }
+minisign-verify = { version = "0.2", optional = true }
+self-replace = { version = "1", optional = true }
+tar = { version = "0.4", optional = true }
+flate2 = { version = "1", optional = true }
 semver = { version = "1", optional = true }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json"], optional = true }
 getrandom = { version = "0.2", optional = true }

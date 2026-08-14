@@ -124,6 +124,14 @@ pub struct Entry {
     pub valid_to_ms: Option<i64>,
     pub system_from_ms: i64,
     pub system_to_ms: Option<i64>,
+    /// Audience partition label (the scope primitive; design doc in daimon-docs: dm-lite/scope-primitive.md).
+    /// Opaque to the engine - adapters choose the vocabulary. `""` = tenant-global (readable by
+    /// every reader of the tenant; the default, and the only value our own deployment uses).
+    /// Exactly ONE scope per record: sharing across audiences is an explicit copy, not a list.
+    /// Part of the record version (bitemporal-consistent); NOT part of the uri. `serde(default)`
+    /// so pre-scope wire payloads and stored JSON decode as global.
+    #[serde(default)]
+    pub scope: String,
 }
 
 impl Entry {
@@ -154,6 +162,7 @@ impl Entry {
             valid_to_ms: None,
             system_from_ms: now,
             system_to_ms: None,
+            scope: String::new(),
         }
     }
 }
@@ -166,6 +175,19 @@ pub struct Edge {
     pub from_uri: String,
     pub to_uri: String,
     pub rel: String,
+}
+
+/// If `namespace` lies under the agents tree, the owner segment: `agents/izu/persona` ->
+/// Some("izu"). The `agents/` prefix matches CASE-INSENSITIVELY so a lookalike spelling
+/// (`Agents/shesta`) is treated as the same protected tree, not as shared pool. None for
+/// everything outside the tree.
+pub fn split_agents_tree(namespace: &str) -> Option<&str> {
+    let prefix = namespace.get(..7)?;
+    if !prefix.eq_ignore_ascii_case("agents/") {
+        return None;
+    }
+    let rest = &namespace[7..];
+    Some(rest.split('/').next().unwrap_or(rest))
 }
 
 pub fn now_ms() -> i64 {

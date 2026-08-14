@@ -245,7 +245,7 @@ mod tests {
 
     #[test]
     fn long_daimon_uri_roundtrips() {
-        // the real failure: a daimon:// URI is >64 chars and has : and / — so it can't be the
+        // the real failure: a daimon:// URI is >64 chars and has : and / - so it can't be the
         // PK (zvec caps PK at 64 bytes). Hashed PK + uri field must round-trip the full URI.
         let dir = std::env::temp_dir().join(format!("zveclonguri-{}", crate::entry::now_ms()));
         let _ = std::fs::remove_dir_all(&dir);

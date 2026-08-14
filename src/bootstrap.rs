@@ -13,11 +13,24 @@ fn dm_bin() -> Result<String> {
     Ok(std::env::current_exe()?.to_string_lossy().to_string())
 }
 
+/// Shell-quote the binary path for hook COMMAND STRINGS that hosts run via a shell (audit
+/// Medium #7): a path with spaces/`;`/`$()` would otherwise split or inject. Paths from the
+/// safe charset pass through unquoted so existing configs stay byte-identical; anything else
+/// gets POSIX single-quoting (with the '\'' escape). JSON-array/TOML sites that pass argv
+/// directly must keep using the RAW path - do not quote those.
+fn sh_quote(path: &str) -> String {
+    let safe = path.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-' | '~' | '+'));
+    if safe && !path.is_empty() {
+        return path.to_string();
+    }
+    format!("'{}'", path.replace('\'', r"'\''"))
+}
+
 /// One CC-compatible hook entry array for an event, calling `dm <subcmd>`.
 fn hook_entry(dm: &str, subcmd: &str, timeout: u64) -> Value {
     json!([{
         "matcher": "",
-        "hooks": [{ "type": "command", "command": format!("{} {}", dm, subcmd), "timeout": timeout }]
+        "hooks": [{ "type": "command", "command": format!("{} {}", sh_quote(dm), subcmd), "timeout": timeout }]
     }])
 }
 
@@ -164,9 +177,9 @@ fn codex_write_plugin(mp_dir: &Path, dm: &str) -> Result<()> {
     let hooks = json!({
         "hooks": {
             "SessionStart": [ { "matcher": "*", "hooks": [
-                { "type": "command", "command": format!("{dm} hook session_start"), "timeout": 10 } ] } ],
+                { "type": "command", "command": format!("{} hook session_start", sh_quote(dm)), "timeout": 10 } ] } ],
             "UserPromptSubmit": [ { "matcher": "*", "hooks": [
-                { "type": "command", "command": format!("{dm} hook user_prompt_submit"), "timeout": 8 } ] } ]
+                { "type": "command", "command": format!("{} hook user_prompt_submit", sh_quote(dm)), "timeout": 8 } ] } ]
         }
     });
     std::fs::write(plug.join("hooks/hooks.json"), serde_json::to_string_pretty(&hooks)? + "\n")?;
@@ -402,6 +415,54 @@ fn hermes_sync_soul(remove: bool) -> Result<()> {
     Ok(())
 }
 
+/// Enable `dmem` (and drop leftover v1 `daimon`) on `plugins.enabled`. Desktop
+/// user plugins are gated on that list; without this the plugin we install is
+/// discovered then skipped.
+fn hermes_toggle_plugin_enabled(root: &mut serde_yaml_ng::Mapping, remove: bool) {
+    use serde_yaml_ng::{Mapping, Value as Y};
+    let plugins = root
+        .entry(Y::from("plugins"))
+        .or_insert_with(|| Y::Mapping(Mapping::new()));
+    let Some(p) = plugins.as_mapping_mut() else {
+        return;
+    };
+    let enabled = p
+        .entry(Y::from("enabled"))
+        .or_insert_with(|| Y::Sequence(vec![]));
+    let Some(seq) = enabled.as_sequence_mut() else {
+        return;
+    };
+    seq.retain(|v| {
+        let s = v.as_str().unwrap_or("");
+        if s == "dmem" {
+            return false;
+        }
+        // Wiring dmem replaces the v1 daimon memory plugin; do not resurrect it on remove.
+        !(s == "daimon" && !remove)
+    });
+    if !remove {
+        seq.push(Y::from("dmem"));
+    }
+}
+
+/// Install (or remove) `~/.hermes/plugins/dmem` — the desktop-safe pre_llm_call path.
+fn hermes_write_plugin(dm: &str, remove: bool) -> Result<()> {
+    let dir = hermes_dir()?.join("plugins/dmem");
+    if remove {
+        let _ = std::fs::remove_file(dir.join("__init__.py"));
+        let _ = std::fs::remove_file(dir.join("plugin.yaml"));
+        return Ok(());
+    }
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(dir.join("plugin.yaml"), include_str!("../contrib/hermes-plugin/plugin.yaml"))
+        .with_context(|| format!("write {}", dir.join("plugin.yaml").display()))?;
+    let bin_lit = serde_json::to_string(dm).context("encode dmem path")?;
+    let src = include_str!("../contrib/hermes-plugin/__init__.py").replace("\"__DMEM_BIN__\"", &bin_lit);
+    std::fs::write(dir.join("__init__.py"), src)
+        .with_context(|| format!("write {}", dir.join("__init__.py").display()))?;
+    Ok(())
+}
+
 /// Hermes: wire dmem as an MCP server (tools) + a `pre_llm_call` shell hook (recall every turn),
 /// project persona/protocols into SOUL.md (always-on identity), allowlist just that one hook
 /// command, and migrate off the v1 daimon memory provider. Backed up to config.yaml.dmbak; the
@@ -419,7 +480,7 @@ fn hermes_install(dm: &str, remove: bool) -> Result<()> {
     let root = doc
         .as_mapping_mut()
         .ok_or_else(|| anyhow!("~/.hermes/config.yaml is not a YAML mapping"))?;
-    let hook_cmd = format!("{dm} hook user_prompt_submit --hermes");
+    let hook_cmd = format!("{} hook user_prompt_submit --hermes", sh_quote(dm));
 
     // MCP tools: mcp_servers.dmem = { command, args:[mcp] }; drop the v1 daimon server.
     let mcp = root
@@ -482,11 +543,17 @@ fn hermes_install(dm: &str, remove: bool) -> Result<()> {
         }
     }
 
+    // Desktop chat (tui_gateway / hermes serve) never calls register_from_config, so the
+    // shell hook above is dead there. A user plugin *does* load (AIAgent discover_plugins)
+    // and is gated by plugins.enabled. Enable `dmem`, drop leftover v1 `daimon`.
+    hermes_toggle_plugin_enabled(root, remove);
+
     let out = yaml_quote_pyyaml_unsafe(&serde_yaml_ng::to_string(&doc).with_context(|| "serialize ~/.hermes/config.yaml")?);
     serde_yaml_ng::from_str::<Y>(&out).with_context(|| "refusing to write: edited config.yaml no longer parses")?;
     std::fs::write(&cfg, out).with_context(|| format!("write {}", cfg.display()))?;
 
     hermes_allowlist(&hook_cmd, remove)?;
+    hermes_write_plugin(dm, remove)?;
     let soul_status = match hermes_sync_soul(remove) {
         Ok(()) if remove => "removed the dmem-managed block from ~/.hermes/SOUL.md".to_string(),
         Ok(()) => "persona + protocols -> ~/.hermes/SOUL.md (always-on identity; reloaded each message)".to_string(),
@@ -500,6 +567,7 @@ fn hermes_install(dm: &str, remove: bool) -> Result<()> {
         println!("  wired Hermes -> {} (MCP tools + pre_llm_call recall; persona via SOUL.md)", cfg.display());
         println!("    {soul_status}");
         println!("    allowlisted only the dmem hook in ~/.hermes/shell-hooks-allowlist.json (no global auto-accept).");
+        println!("    installed ~/.hermes/plugins/dmem (desktop pre_llm_call; tui_gateway skips shell hooks).");
         println!("    migrated memory.provider off the v1 daimon plugin (set to unset) where it was 'daimon'.");
         println!("    note: SOUL.md is a projection of your dmem persona/protocols; re-run `dmem bootstrap --hermes` after you change them.");
         println!("    restart Hermes once after wiring so it registers the recall hook (it hot-reloads MCP, but registers shell hooks only at startup).");
@@ -957,6 +1025,14 @@ pub fn run_mode(devin: bool, claude: bool, codex: bool, hermes: bool, opencode: 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn sh_quote_passes_safe_paths_and_quotes_hostile_ones() {
+        assert_eq!(sh_quote("/home/arif/.local/bin/dmem"), "/home/arif/.local/bin/dmem", "safe path unchanged (existing configs stay byte-identical)");
+        assert_eq!(sh_quote("/Users/Wak Bijok/bin/dmem"), "'/Users/Wak Bijok/bin/dmem'", "space -> quoted");
+        assert_eq!(sh_quote("/tmp/x;rm -rf ~/dmem"), "'/tmp/x;rm -rf ~/dmem'", "metacharacters -> quoted");
+        assert_eq!(sh_quote("/tmp/it's/dmem"), r"'/tmp/it'\''s/dmem'", "embedded single quote escaped");
+    }
+
     use super::*;
 
     #[test]
@@ -1123,5 +1199,62 @@ mod tests {
         let v: Value = serde_json::from_str(&std::fs::read_to_string(&cfg).unwrap()).unwrap();
         assert!(v["hooks"].get("SessionEnd").is_none(), "stale dmem SessionEnd must be cleaned");
         assert!(v["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"].as_str().unwrap().contains("hook user_prompt_submit"));
+    }
+
+    #[test]
+    fn hermes_toggle_plugin_enabled_replaces_v1_daimon() {
+        use serde_yaml_ng::{Mapping, Value as Y};
+        let mut root = Mapping::new();
+        let mut plugins = Mapping::new();
+        plugins.insert(
+            Y::from("enabled"),
+            Y::Sequence(vec![Y::from("daimon"), Y::from("security-guidance")]),
+        );
+        root.insert(Y::from("plugins"), Y::Mapping(plugins));
+
+        hermes_toggle_plugin_enabled(&mut root, false);
+        let enabled: Vec<&str> = root
+            .get("plugins")
+            .unwrap()
+            .as_mapping()
+            .unwrap()
+            .get("enabled")
+            .unwrap()
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert_eq!(enabled, vec!["security-guidance", "dmem"]);
+
+        hermes_toggle_plugin_enabled(&mut root, false);
+        let enabled2: Vec<&str> = root
+            .get("plugins")
+            .unwrap()
+            .as_mapping()
+            .unwrap()
+            .get("enabled")
+            .unwrap()
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert_eq!(enabled2, vec!["security-guidance", "dmem"], "idempotent");
+
+        hermes_toggle_plugin_enabled(&mut root, true);
+        let enabled3: Vec<&str> = root
+            .get("plugins")
+            .unwrap()
+            .as_mapping()
+            .unwrap()
+            .get("enabled")
+            .unwrap()
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert_eq!(enabled3, vec!["security-guidance"]);
     }
 }

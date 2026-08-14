@@ -81,8 +81,26 @@ impl RemoteClient {
 
     // --- admin (root-token) operations ---
 
-    pub fn admin_add(&self, tenant: &str, label: &str, display: &str, agent: Option<&str>) -> Result<(String, String)> {
-        let v = self.post("/admin/tenant", json!({ "tenant": tenant, "label": label, "display": display, "agent": agent }))?;
+    #[allow(clippy::too_many_arguments)]
+    pub fn admin_add(
+        &self,
+        tenant: &str,
+        label: &str,
+        display: &str,
+        agent: Option<&str>,
+        scope_read: &[String],
+        scope_write: Option<&str>,
+        adapter: bool,
+    ) -> Result<(String, String)> {
+        // Scope fields are additive on the wire: omitted entirely for a full-tenant token so
+        // an older server never sees unknown-but-consequential fields.
+        let mut body = json!({ "tenant": tenant, "label": label, "display": display, "agent": agent });
+        if !scope_read.is_empty() || scope_write.is_some() || adapter {
+            body["scope_read"] = json!(scope_read);
+            body["scope_write"] = json!(scope_write);
+            body["adapter"] = json!(adapter);
+        }
+        let v = self.post("/admin/tenant", body)?;
         Ok((
             v.get("tenant").and_then(|x| x.as_str()).unwrap_or_default().to_string(),
             v.get("token").and_then(|x| x.as_str()).unwrap_or_default().to_string(),

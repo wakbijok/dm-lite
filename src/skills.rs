@@ -149,7 +149,7 @@ pub fn list_rows(records: &[Entry]) -> Vec<(String, String)> {
 
 // --- CLI entry points ---
 
-/// `dmem skills import <dir>` — writes through the server (mode-aware), so it is safe while the
+/// `dmem skills import <dir>` - writes through the server (mode-aware), so it is safe while the
 /// loopback `dmem serve` is running.
 pub fn import(dir: &str) -> Result<()> {
     let mem = Memory::open()?;
@@ -158,7 +158,7 @@ pub fn import(dir: &str) -> Result<()> {
     Ok(())
 }
 
-/// `dmem skills sync` — reads the local tenant store (a safe concurrent read) and projects every
+/// `dmem skills sync` - reads the local tenant store (a safe concurrent read) and projects every
 /// skill record to `~/.claude/skills/<name>/SKILL.md`.
 pub fn sync() -> Result<()> {
     let mem = LocalMemory::open_tenant(&config::tenant())?;

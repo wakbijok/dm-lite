@@ -14,6 +14,22 @@ pub struct Identity {
     pub tenant: Option<String>,
     pub is_admin: bool,
     pub agent: Option<String>,
+    /// Scope primitive (daimon-docs: dm-lite/scope-primitive.md). `scope_read`: None = full tenant
+    /// (every scope; all pre-scope tokens); Some(set) = those scopes + global. `scope_write`:
+    /// the single scope stamped on this token's writes; None on a scope-bound token means
+    /// the token cannot write at all (decision Q3: global writes from scoped tokens are
+    /// forbidden - promotion is explicit). `adapter`: trusted verdict-propagation component
+    /// (decision Q1) - may assert the reader's scope set per request via headers.
+    pub scope_read: Option<Vec<String>>,
+    pub scope_write: Option<String>,
+    pub adapter: bool,
+}
+
+impl Identity {
+    /// A full-tenant identity (no scope restriction) - what every pre-scope token resolves to.
+    pub fn scope_unbound(&self) -> bool {
+        self.scope_read.is_none() && self.scope_write.is_none() && !self.adapter
+    }
 }
 
 pub struct Iam {
@@ -54,6 +70,12 @@ impl Iam {
             std::fs::create_dir_all(p).ok();
         }
         let conn = Connection::open(path)?;
+        // iam.db holds token hashes and the tenant registry; owner-only (audit Medium #5).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        }
         conn.execute_batch(
             "PRAGMA journal_mode=WAL;
              PRAGMA busy_timeout=5000;
@@ -82,6 +104,20 @@ impl Iam {
         )?;
         if has_agent == 0 {
             conn.execute_batch("ALTER TABLE tokens ADD COLUMN agent TEXT")?;
+        }
+        // Scope-primitive columns, same idempotent pattern. All nullable/zero-default: every
+        // pre-scope token reads back scope-unbound (full tenant - exactly its old behavior).
+        let has_scope: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('tokens') WHERE name='scope_read'",
+            [],
+            |r| r.get(0),
+        )?;
+        if has_scope == 0 {
+            conn.execute_batch(
+                "ALTER TABLE tokens ADD COLUMN scope_read TEXT;
+                 ALTER TABLE tokens ADD COLUMN scope_write TEXT;
+                 ALTER TABLE tokens ADD COLUMN adapter INTEGER NOT NULL DEFAULT 0;",
+            )?;
         }
         Ok(Self { conn })
     }
@@ -128,14 +164,26 @@ impl Iam {
     /// not worth that contention. (The column stays for schema compatibility.)
     pub fn resolve(&self, token: &str) -> Option<Identity> {
         let h = sha256_hex(token);
-        let (tenant, is_admin, agent): (Option<String>, i64, Option<String>) = self
+        let (tenant, is_admin, agent, scope_read_json, scope_write, adapter): (
+            Option<String>,
+            i64,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            i64,
+        ) = self
             .conn
             .query_row(
-                "SELECT tenant, is_admin, agent FROM tokens WHERE token_hash=?1 AND revoked=0",
+                "SELECT tenant, is_admin, agent, scope_read, scope_write, adapter \
+                 FROM tokens WHERE token_hash=?1 AND revoked=0",
                 params![h],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
             )
             .ok()?;
+        // Malformed stored JSON degrades to an EMPTY grant set (global only), never to full
+        // tenant - a corrupt row must fail closed.
+        let scope_read: Option<Vec<String>> =
+            scope_read_json.map(|j| serde_json::from_str(&j).unwrap_or_default());
         if let Some(t) = &tenant {
             let active: i64 = self
                 .conn
@@ -149,7 +197,54 @@ impl Iam {
                 return None;
             }
         }
-        Some(Identity { tenant, is_admin: is_admin != 0, agent })
+        Some(Identity { tenant, is_admin: is_admin != 0, agent, scope_read, scope_write, adapter: adapter != 0 })
+    }
+
+    /// Mint a scope-bound (or adapter) member token for an existing-or-new tenant.
+    /// `scope_read` = the scopes this token may read (global always rides along);
+    /// `scope_write` = the single scope stamped on its writes (None = cannot write, Q3);
+    /// `adapter` = trusted to assert the reader's scopes per request (Q1). The plaintext
+    /// token is returned exactly once.
+    pub fn mint_scoped_token(
+        &self,
+        tenant: &str,
+        label: &str,
+        agent: Option<&str>,
+        scope_read: &[String],
+        scope_write: Option<&str>,
+        adapter: bool,
+    ) -> Result<String> {
+        let t = crate::config::canonical_tenant(tenant);
+        let agent = agent.and_then(crate::config::canonical_agent);
+        self.conn.execute(
+            "INSERT OR IGNORE INTO tenants(tenant,display,status,created_ms) VALUES(?1,'','active',?2)",
+            params![t, crate::entry::now_ms()],
+        )?;
+        let token = gen_token()?;
+        // For an ADAPTER, an empty scope_read means "no cap" (assertions are per-request, Q1)
+        // and is stored NULL; a non-adapter's empty list is a real grant set (global-only)
+        // and is stored as [] - the two must not be conflated, or the cap filter would
+        // silently reduce every adapter assertion to nothing.
+        let scope_read_json: Option<String> = if adapter && scope_read.is_empty() {
+            None
+        } else {
+            Some(serde_json::to_string(scope_read)?)
+        };
+        self.conn.execute(
+            "INSERT INTO tokens(token_hash,tenant,is_admin,label,created_ms,agent,scope_read,scope_write,adapter) \
+             VALUES(?1,?2,0,?3,?4,?5,?6,?7,?8)",
+            params![
+                sha256_hex(&token),
+                t,
+                label,
+                crate::entry::now_ms(),
+                agent,
+                scope_read_json,
+                scope_write,
+                adapter as i64
+            ],
+        )?;
+        Ok(token)
     }
 
     /// Create the tenant if absent and issue a new member token (returned in plaintext once).
@@ -317,5 +412,31 @@ mod tests {
         let (_t2, tok2) = iam.create_tenant("initech", "", "", None).unwrap();
         iam.remove_tenant("initech").unwrap();
         assert!(iam.resolve(&tok2).is_none(), "suspended tenant blocks its tokens");
+    }
+
+    #[test]
+    fn scoped_and_adapter_tokens_roundtrip() {
+        let iam = tmp();
+        // pre-scope token: scope-unbound (full tenant), exactly its old behavior
+        let (_t, plain) = iam.create_tenant("acme", "", "", None).unwrap();
+        let id = iam.resolve(&plain).unwrap();
+        assert!(id.scope_unbound(), "plain member token is full-tenant");
+
+        let scoped = iam
+            .mint_scoped_token("acme", "fadzil", None, &["user:fadzil".to_string()], Some("user:fadzil"), false)
+            .unwrap();
+        let id = iam.resolve(&scoped).unwrap();
+        assert!(!id.scope_unbound());
+        assert_eq!(id.scope_read.as_deref(), Some(&["user:fadzil".to_string()][..]));
+        assert_eq!(id.scope_write.as_deref(), Some("user:fadzil"));
+        assert!(!id.adapter);
+
+        let readonly = iam.mint_scoped_token("acme", "ro", None, &["room:x".to_string()], None, false).unwrap();
+        let id = iam.resolve(&readonly).unwrap();
+        assert!(id.scope_write.is_none(), "no write scope = read-only token (Q3)");
+
+        let adapter = iam.mint_scoped_token("acme", "bridge", None, &[], None, true).unwrap();
+        let id = iam.resolve(&adapter).unwrap();
+        assert!(id.adapter, "adapter flag survives the roundtrip");
     }
 }

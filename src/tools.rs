@@ -37,6 +37,16 @@ pub struct RecallGraph {
 /// The local (embedded) memory engine: SQLite store + optional zvec vector index.
 pub struct LocalMemory {
     store: SqliteStore,
+    /// Scope stamped on every write (scope primitive). `Some("")` = tenant-global writer (the
+    /// default; every unscoped deployment). `Some(s)` = scoped writer. `None` = this identity
+    /// cannot write at all (a scope-bound token minted without a write scope - decision Q3).
+    /// Local mode: from `DM_SCOPE`; server mode: set per request from the token (never from
+    /// the client payload - anti confused-deputy).
+    write_scope: Option<String>,
+    /// Agent identity for THIS request's view (security audit 11-08, High #1). Some(a): reads
+    /// hide other agents' `agents/<b>/...` trees, writes into another agent's tree are
+    /// rejected, and mutations require a visible target. None = agent-less (full legacy).
+    agent_view: Option<String>,
     #[cfg(feature = "zvec")]
     vindex: Option<crate::zvec_index::ZvecIndex>,
     #[cfg(feature = "zvec")]
@@ -139,7 +149,7 @@ pub(crate) fn parse_wikilinks(s: &str) -> Vec<String> {
 
 /// Title-derived aliases for an entity: the title itself, the title with any parenthetical
 /// stripped ("Izuhomeland (Windows)" -> "Izuhomeland"), and each `/`-separated variant.
-/// Deliberately cheap — richer aliases are a curation concern on the entity record itself.
+/// Deliberately cheap - richer aliases are a curation concern on the entity record itself.
 pub(crate) fn entity_aliases(title: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut push = |out: &mut Vec<String>, s: &str| {
@@ -304,7 +314,14 @@ impl LocalMemory {
     /// never mutates the process-global $DM_TENANT (which would race under concurrency).
     pub fn open_tenant(tenant: &str) -> Result<Self> {
         let path = config::db_path(tenant)?;
-        let store = SqliteStore::open(&path)?;
+        let mut store = SqliteStore::open(&path)?;
+        // Scope-bound local session (DM_SCOPE): writes stamp that scope and reads narrow to
+        // it + global. Unset = full-tenant global session - byte-identical to pre-scope
+        // behavior, and the only mode our own deployments use.
+        let write_scope = Some(config::scope().unwrap_or_default());
+        if let Some(s) = write_scope.as_deref().filter(|s| !s.is_empty()) {
+            store.set_read_scopes(Some(vec![s.to_string()]));
+        }
         #[cfg(feature = "zvec")]
         {
             let vdir = config::vector_dir(tenant)?;
@@ -315,10 +332,78 @@ impl LocalMemory {
                     None
                 }
             };
-            return Ok(Self { store, vindex, embedder: make_embedder() });
+            return Ok(Self { store, write_scope, agent_view: None, vindex, embedder: make_embedder() });
         }
         #[cfg(not(feature = "zvec"))]
-        Ok(Self { store })
+        Ok(Self { store, write_scope, agent_view: None })
+    }
+
+    /// Rebind this engine handle to a reader/writer scope context (scope primitive). Server
+    /// mode calls this per request under the tenant lock, from the TOKEN's grants; tests use
+    /// it directly. `write_scope`: Some("") = global writer, Some(s) = scoped writer, None =
+    /// writes rejected (decision Q3). `read_scopes` None = full tenant.
+    pub fn set_scope_context(&mut self, write_scope: Option<&str>, read_scopes: Option<Vec<String>>) {
+        self.write_scope = write_scope.map(str::to_string);
+        self.store.set_read_scopes(read_scopes);
+    }
+
+    /// Bind this handle to an agent identity's view (persona-tree protection). Server mode
+    /// sets it per request from the TOKEN's agent label; None = agent-less.
+    pub fn set_agent_view(&mut self, agent: Option<String>) {
+        self.agent_view = agent.clone();
+        self.store.set_agent_view(agent);
+    }
+
+    /// Writes into the `agents/` tree may only target the caller's own subtree. Everything
+    /// outside `agents/` is the shared pool (by design). Agent-less identities: no restriction.
+    fn guard_agent_namespace(&self, namespace: &str) -> Result<()> {
+        let Some(owner) = crate::entry::split_agents_tree(namespace) else {
+            return Ok(());
+        };
+        match &self.agent_view {
+            Some(a) if owner.eq_ignore_ascii_case(a) => Ok(()),
+            Some(_) => anyhow::bail!("namespace '{namespace}' belongs to another agent identity"),
+            // No agent label: only a FULLY unrestricted identity may touch the agents/ tree.
+            // A scoped principal is a user, not an agent - without this, a scoped token could
+            // plant records in an agent's tree that the (typically full-tenant) agent token
+            // then reads as its own persona (caught by the 0.3.2 live release smoke).
+            None if !self.write_restricted() => Ok(()),
+            None => anyhow::bail!("scoped identities cannot write into the agents/ tree"),
+        }
+    }
+
+    /// Is this identity anything less than a full-tenant writer? (Scoped or write-denied.)
+    fn write_restricted(&self) -> bool {
+        self.write_scope.as_deref() != Some("")
+    }
+
+    /// The write scope for a save, or an error for a write-denied identity (decision Q3: a
+    /// scope-bound token without a write scope cannot write; promotion to global is explicit).
+    fn effective_write_scope(&self) -> Result<&str> {
+        self.write_scope
+            .as_deref()
+            .ok_or_else(|| anyhow!("this identity has no write scope (writes are read-only for this token)"))
+    }
+
+    /// Guard for retracting mutations (forget/invalidate). A scope-restricted writer may only
+    /// mutate records IN ITS OWN write scope; an agent-labeled identity may not touch another
+    /// agent's `agents/<b>/...` records (the target must be VISIBLE - get() applies both the
+    /// scope and agent-tree gates, so a foreign persona reads as absent here).
+    fn guard_mutation_target(&self, uri: &str) -> Result<()> {
+        if !self.write_restricted() && self.agent_view.is_none() {
+            return Ok(());
+        }
+        let e = self
+            .store
+            .get(uri)?
+            .ok_or_else(|| anyhow!("record not found (or not visible to this identity)"))?;
+        if self.write_restricted() {
+            let ws = self.effective_write_scope()?;
+            if e.scope != ws {
+                anyhow::bail!("record is outside this identity's write scope");
+            }
+        }
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -332,6 +417,9 @@ impl LocalMemory {
     /// stamps write attribution (see `stamp_author`); None writes exactly as before.
     #[allow(clippy::too_many_arguments)]
     fn save_valid(&self, kind: Kind, namespace: &str, title: &str, body: String, importance: i64, mut tags: Vec<String>, valid_from: Option<i64>, valid_to: Option<i64>, author: Option<&str>) -> Result<String> {
+        // Persona-tree protection (audit High #1): an agent identity may not write into
+        // another agent's agents/<b>/... namespace - attribution is a tag, this is the authz.
+        self.guard_agent_namespace(namespace)?;
         stamp_author(&mut tags, author);
         let uri = make_uri(namespace, kind, title);
         let mut e = Entry::new_now(
@@ -348,6 +436,10 @@ impl LocalMemory {
             e.valid_from_ms = vf;
         }
         e.valid_to_ms = valid_to;
+        // Stamp the audience: the engine-side write half of the scope primitive. Callers do
+        // not choose this per record - it is identity context (DM_SCOPE locally, the token's
+        // write scope on the server), which is what makes it unforgeable from a prompt.
+        e.scope = self.effective_write_scope()?.to_string();
         self.save_entry(&e)?;
         Ok(uri)
     }
@@ -449,6 +541,7 @@ impl LocalMemory {
 
     /// Application-time invalidation: this entity's fact is no longer true from `valid_to_ms` on.
     pub fn invalidate(&self, uri: &str, valid_to_ms: i64) -> Result<usize> {
+        self.guard_mutation_target(uri)?;
         self.store.invalidate(uri, valid_to_ms)
     }
 
@@ -664,6 +757,7 @@ impl LocalMemory {
     /// Retract a uri: drop it from recall (close current version, keep lineage) and remove
     /// its vector. Returns how many current versions were closed.
     pub fn forget(&self, uri: &str) -> Result<usize> {
+        self.guard_mutation_target(uri)?;
         let n = self.store.forget(uri)?;
         #[cfg(feature = "zvec")]
         if let Some(vindex) = &self.vindex {
@@ -723,10 +817,28 @@ impl LocalMemory {
     // --- graph layer ---
 
     pub fn link(&self, from_uri: &str, to_uri: &str, rel: &str) -> Result<()> {
+        self.guard_edge_endpoints(from_uri, to_uri)?;
         self.store.link(from_uri, to_uri, rel)
     }
     pub fn unlink(&self, from_uri: &str, to_uri: &str, rel: &str) -> Result<usize> {
+        self.guard_edge_endpoints(from_uri, to_uri)?;
         self.store.unlink(from_uri, to_uri, rel)
+    }
+
+    /// Edge mutations for a restricted identity require BOTH endpoints to be live and visible
+    /// (edges carry no content, so read visibility is the right bar - a scoped principal may
+    /// link its own record to a global entity, but never touch edges of records it cannot see).
+    fn guard_edge_endpoints(&self, from_uri: &str, to_uri: &str) -> Result<()> {
+        if !self.write_restricted() && self.agent_view.is_none() {
+            return Ok(());
+        }
+        self.effective_write_scope()?; // write-denied identities cannot mutate edges either
+        for u in [from_uri, to_uri] {
+            if self.store.get(u)?.is_none() {
+                anyhow::bail!("edge endpoint not found (or not visible to this identity): {u}");
+            }
+        }
+        Ok(())
     }
     pub fn edges_of(&self, uri: &str) -> Result<Vec<Edge>> {
         self.store.edges_of(uri)
@@ -863,12 +975,12 @@ impl LocalMemory {
     }
 
     /// Deterministic entity-mention pass: link `record -[mentions]-> entity` wherever a record's
-    /// title or body mentions a canonical entity title in plain text (word-boundary, exact case —
+    /// title or body mentions a canonical entity title in plain text (word-boundary, exact case -
     /// the conservative pass). The `mentions` rel is distinct from the curated `links` rel, so
     /// expansion can weight curated edges above mined ones and this whole pass can be retracted
     /// without touching hand-made edges. Skips pairs already connected by any rel in either
     /// direction. Idempotent; `dry_run` counts without writing. Returns
-    /// (mention pairs found, edges added — or would be added under dry_run).
+    /// (mention pairs found, edges added - or would be added under dry_run).
     pub fn reindex_mentions(&self, dry_run: bool) -> Result<(usize, usize)> {
         let records = self.store.recent(1_000_000)?;
         let entities: Vec<(&Entry, Vec<String>)> =
@@ -908,11 +1020,17 @@ impl LocalMemory {
     pub(crate) fn for_test(store: SqliteStore) -> Self {
         #[cfg(feature = "zvec")]
         {
-            Self { store, vindex: None, embedder: std::sync::Arc::new(crate::embedder::HashEmbedder::new()) }
+            Self {
+                store,
+                write_scope: Some(String::new()),
+                agent_view: None,
+                vindex: None,
+                embedder: std::sync::Arc::new(crate::embedder::HashEmbedder::new()),
+            }
         }
         #[cfg(not(feature = "zvec"))]
         {
-            Self { store }
+            Self { store, write_scope: Some(String::new()), agent_view: None }
         }
     }
 }
@@ -1367,6 +1485,115 @@ mod tests {
         assert_eq!(r.entry.uri, near, "hop-1 outranks hop-2");
         assert_eq!((r.hop, r.via.as_str(), r.rel.as_str()), (1, seed.as_str(), "links"), "provenance points at the seed");
         assert!(r.score > 0.0, "rider carries a decayed score");
+    }
+
+    #[test]
+    fn scope_context_stamps_writes_and_narrows_reads() {
+        let mut m = LocalMemory::for_test(tmp_store());
+        let global = m.remember("Team runbook everyone may read", "resources/notes", None, None, None).unwrap();
+        m.set_scope_context(Some("user:a"), Some(vec!["user:a".to_string()]));
+        let mine = m.remember("Private draft plan for later", "resources/notes", None, None, None).unwrap();
+        let mine_e = m.store.get(&mine).unwrap().expect("own record visible");
+        assert_eq!(mine_e.scope, "user:a", "write stamped with the identity's scope, not caller input");
+        let recent = m.recent(10).unwrap();
+        assert!(recent.iter().any(|e| e.uri == global), "global rides along");
+        assert!(recent.iter().any(|e| e.uri == mine), "own scope visible");
+        // switch reader to a different principal: the other scope reads as absent everywhere
+        m.set_scope_context(Some("user:b"), Some(vec!["user:b".to_string()]));
+        assert!(m.store.get(&mine).unwrap().is_none());
+        assert!(m.recall("private draft plan", 5).unwrap().iter().all(|e| e.uri != mine));
+        // a scoped principal is a user, not an agent: the agents/ tree is off-limits even
+        // without an agent label in play (0.3.2 live-smoke catch: persona poison path)
+        assert!(
+            m.import_record(Kind::Persona, "agents/izu", "poison", "planted persona").is_err(),
+            "scoped identities cannot write into the agents/ tree"
+        );
+    }
+
+    #[test]
+    fn agent_view_guards_the_agents_tree_on_every_surface() {
+        // Audit High #1: an agent identity must not read, write, or retract another agent's
+        // agents/<other>/... records through ANY surface - not just the persona route.
+        let mut m = LocalMemory::for_test(tmp_store());
+        let shesta_persona = m
+            .import_record(Kind::Persona, "agents/shesta", "Shesta persona", "I am Shesta the document specialist")
+            .unwrap();
+        let shared = m.remember("Shared brain fact for everyone", "resources/notes", None, None, None).unwrap();
+
+        m.set_agent_view(Some("izu".into()));
+        // reads: foreign persona invisible everywhere
+        assert!(m.recall("I am Shesta specialist", 5).unwrap().iter().all(|e| e.uri != shesta_persona));
+        assert!(m.recent(50).unwrap().iter().all(|e| e.uri != shesta_persona));
+        assert!(m.history(&shesta_persona, 10).unwrap().is_empty(), "history gated too");
+        assert!(m.store.get(&shesta_persona).unwrap().is_none(), "get() reads it as absent");
+        // shared pool stays fully visible (the shared brain is the point)
+        assert!(m.recent(50).unwrap().iter().any(|e| e.uri == shared));
+        // writes into the foreign tree are rejected; own tree + shared are fine
+        assert!(m.import_record(Kind::Persona, "agents/shesta", "Fake", "overwrite attempt").is_err());
+        assert!(m.import_record(Kind::Persona, "agents/izu", "Izu persona", "own tree ok").is_ok());
+        assert!(m.remember("shared write ok", "resources/notes", None, None, None).is_ok());
+        // retractions of the foreign record are rejected (reads as not-found)
+        assert!(m.forget(&shesta_persona).is_err());
+        assert!(m.invalidate(&shesta_persona, crate::entry::now_ms() + 10).is_err());
+        // agent-less view: everything back to legacy behavior
+        m.set_agent_view(None);
+        assert!(m.store.get(&shesta_persona).unwrap().is_some());
+    }
+
+    #[test]
+    fn agent_tree_guard_covers_edges_of_and_case_variants() {
+        let mut m = LocalMemory::for_test(tmp_store());
+        let shesta = m
+            .import_record(Kind::Persona, "agents/shesta", "Shesta persona", "I am Shesta")
+            .unwrap();
+        let shared = m.remember("Shared record with an edge", "resources/notes", None, None, None).unwrap();
+        m.link(&shared, &shesta, "about").unwrap();
+
+        m.set_agent_view(Some("izu".into()));
+        // 2nd-opinion follow-up: /edges must not enumerate a foreign persona tree - neither
+        // by querying the foreign uri directly (predictable path) nor via a shared record's
+        // edge list leaking the foreign endpoint's slug.
+        assert!(m.edges_of(&shesta).unwrap().is_empty(), "probing the foreign uri yields nothing");
+        assert!(
+            m.edges_of(&shared).unwrap().iter().all(|e| e.from_uri != shesta && e.to_uri != shesta),
+            "a shared record's edges hide invisible endpoints"
+        );
+        // case-variant spelling is the SAME protected tree, not shared pool
+        assert!(
+            m.import_record(Kind::Persona, "Agents/Shesta", "sneaky", "case bypass attempt").is_err(),
+            "Agents/Shesta writes are guarded like agents/shesta"
+        );
+        assert!(m.import_record(Kind::Persona, "Agents/IZU", "own tree, odd case", "fine").is_ok());
+        m.set_agent_view(None);
+        assert_eq!(m.edges_of(&shesta).unwrap().len(), 1, "unrestricted view unchanged");
+    }
+
+    #[test]
+    fn expansion_refuses_out_of_scope_bridges_no_via_leak() {
+        // global seed -> private mid -> global far: a reader without the private scope must
+        // not reach `far` THROUGH `mid`, and no rider's `via` may name `mid` - the traversal
+        // gate exists because hydration-only filtering would leak the bridge node's title
+        // through provenance (scope design, section 3.3).
+        let mut m = LocalMemory::for_test(tmp_store());
+        let seed = m.remember("Sigma anchor matches the query text", "resources/notes", None, None, None).unwrap();
+        m.set_scope_context(Some("user:secret"), None); // write private, read everything (writer view)
+        let mid = m.remember("Hidden bridge record", "resources/notes", None, None, None).unwrap();
+        m.set_scope_context(Some(""), None);
+        let far = m.remember("Distant global fact", "resources/other", None, None, None).unwrap();
+        m.link(&seed, &mid, "links").unwrap();
+        m.link(&mid, &far, "links").unwrap();
+        // reader WITHOUT the private scope
+        m.set_scope_context(Some(""), Some(vec!["room:x".to_string()]));
+        let g = m.recall_expanded_graph("Sigma anchor matches", 2, 3).unwrap();
+        assert!(g.riders.iter().all(|r| r.entry.uri != mid), "invisible node never rides");
+        assert!(g.riders.iter().all(|r| r.entry.uri != far), "unreachable-except-through-invisible stays out");
+        assert!(g.riders.iter().all(|r| r.via != mid), "no via provenance names the invisible node");
+        assert!(g.links.iter().all(|e| e.from_uri != mid && e.to_uri != mid), "mini-subgraph never names it either");
+        // the same reader WITH the scope sees the full chain
+        m.set_scope_context(Some(""), Some(vec!["user:secret".to_string()]));
+        let g = m.recall_expanded_graph("Sigma anchor matches", 3, 3).unwrap();
+        assert!(g.riders.iter().any(|r| r.entry.uri == mid), "granted scope: bridge rides");
+        assert!(g.riders.iter().any(|r| r.entry.uri == far), "granted scope: far end reachable through it");
     }
 
     #[test]

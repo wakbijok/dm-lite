@@ -14,19 +14,41 @@ use serde_json::{json, Value};
 /// The whole viewer UI, compiled in.
 const PAGE: &str = include_str!("ui_graph.html");
 
-async fn index() -> Html<&'static str> {
-    Html(PAGE)
+/// DNS-rebinding guard (audit Medium #6): a hostile page can point its own DNS name at
+/// 127.0.0.1 and script requests to this port - but then the Host header carries THAT name.
+/// Allow only localhost or a literal IP host (IP literals cannot be rebound via DNS; this
+/// keeps a deliberate `--addr <lan-ip>` bind usable). Browsers always send Host.
+fn host_allowed(headers: &axum::http::HeaderMap) -> bool {
+    let Some(host) = headers.get(axum::http::header::HOST).and_then(|v| v.to_str().ok()) else {
+        return false;
+    };
+    let name = host.rsplit_once(':').map(|(h, _)| h).unwrap_or(host).trim_matches(['[', ']']);
+    name == "localhost" || name.parse::<std::net::IpAddr>().is_ok()
 }
 
-async fn graph() -> Json<Value> {
+async fn index(headers: axum::http::HeaderMap) -> Result<Html<&'static str>, axum::http::StatusCode> {
+    if !host_allowed(&headers) {
+        return Err(axum::http::StatusCode::FORBIDDEN);
+    }
+    Ok(Html(PAGE))
+}
+
+async fn graph(headers: axum::http::HeaderMap) -> Result<Json<Value>, axum::http::StatusCode> {
+    if !host_allowed(&headers) {
+        return Err(axum::http::StatusCode::FORBIDDEN);
+    }
     // Memory access is blocking (SQLite, or HTTP to the daemon); keep it off the async worker.
-    // Never 500 the viewer: on any error return an empty graph plus the message for the page.
+    // Never 500 the viewer: on any error return an empty graph plus a GENERIC message - the
+    // anyhow chain can carry absolute paths, which belong in the server log, not the page.
     let v = tokio::task::spawn_blocking(build_graph)
         .await
         .map_err(|e| anyhow::anyhow!("graph task: {e}"))
         .and_then(|r| r)
-        .unwrap_or_else(|e| json!({ "error": e.to_string(), "nodes": [], "edges": [] }));
-    Json(v)
+        .unwrap_or_else(|e| {
+            eprintln!("dmem ui: graph build failed: {e:#}");
+            json!({ "error": "graph unavailable (see the dmem ui terminal for details)", "nodes": [], "edges": [] })
+        });
+    Ok(Json(v))
 }
 
 /// Build the graph payload for the current tenant: current records (capped) + the edge layer.
