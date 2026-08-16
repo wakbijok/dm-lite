@@ -4,3 +4,6 @@
 *.db
 *.db-*
 .fastembed_cache/
+
+# local AI banner drafts / Hallmark WIP (not product SoT)
+assets/banner-wip/
