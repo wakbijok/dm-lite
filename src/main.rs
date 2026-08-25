@@ -267,6 +267,10 @@ enum Cmd {
     /// Import a template/markdown file (or a directory of them) as memory records.
     Import {
         path: String,
+        /// re-import files even when unchanged since the last import (bypass the sha256
+        /// manifest; the store's idempotent put still deduplicates identical content)
+        #[arg(long)]
+        force: bool,
     },
     /// Migrate a daimon-memory v1 export (JSONL) into dm-lite. Needs --features client.
     #[cfg(feature = "client")]
@@ -693,8 +697,13 @@ fn run() -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Import { path } => {
+        Cmd::Import { path, force } => {
             let m = Memory::open()?;
+            // sha256 manifest : skip files unchanged since the last
+            // import - saves the parse, the network round-trip, and the server-side embedding
+            // per record. Purely an optimization: --force (or a lost manifest) falls back to
+            // the store's idempotent put.
+            let mut manifest = config::import_manifest_load();
             let p = std::path::Path::new(&path);
             let (root, mut files) = if p.is_dir() {
                 let mut v = Vec::new();
@@ -708,12 +717,18 @@ fn run() -> Result<()> {
                 println!("no .md files at {}", p.display());
                 return Ok(());
             }
-            let (mut ok, mut skipped) = (0usize, 0usize);
+            let (mut ok, mut skipped, mut unchanged) = (0usize, 0usize, 0usize);
             for f in &files {
                 let text = match std::fs::read_to_string(f) {
                     Ok(t) => t,
                     Err(_) => { skipped += 1; continue; }
                 };
+                let fkey = f.canonicalize().unwrap_or_else(|_| f.clone()).display().to_string();
+                let fhash = config::sha256_hex_bytes(text.as_bytes());
+                if !force && manifest.get(&fkey) == Some(&fhash) {
+                    unchanged += 1;
+                    continue;
+                }
                 // our templates carry frontmatter; arbitrary markdown (an Obsidian vault) does
                 // not, so fall back to inferring kind/namespace/title from the file.
                 let (kind, ns, title, body) = match entry::parse_frontmatter(&text) {
@@ -727,12 +742,14 @@ fn run() -> Result<()> {
                 match m.import_record(kind, &ns, &title, &body) {
                     Ok(uri) => {
                         ok += 1;
+                        manifest.insert(fkey, fhash);
                         println!("imported {} ({}) -> {}", f.file_name().and_then(|n| n.to_str()).unwrap_or("?"), kind.as_str(), uri);
                     }
                     Err(e) => { skipped += 1; eprintln!("skip {}: {e}", f.display()); }
                 }
             }
-            println!("imported {ok}, skipped {skipped}");
+            config::import_manifest_save(&manifest);
+            println!("imported {ok}, unchanged {unchanged} (manifest), skipped {skipped}");
             Ok(())
         }
         #[cfg(feature = "client")]

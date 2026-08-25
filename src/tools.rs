@@ -134,7 +134,10 @@ pub(crate) fn parse_wikilinks(s: &str) -> Vec<String> {
         rest = &rest[i + 2..];
         match rest.find("]]") {
             Some(j) => {
-                let name = rest[..j].trim();
+                // Pipe alias form [[Target|shown text]]: the link target is the part before
+                // the pipe (ours ate the
+                // whole thing and produced an unresolvable slug).
+                let name = rest[..j].split('|').next().unwrap_or("").trim();
                 // A well-formed [[name]] carries no brackets inside; skip nested/garbled captures.
                 if !name.is_empty() && !name.contains('[') && !name.contains(']') {
                     out.push(name.to_string());
@@ -272,7 +275,7 @@ fn floor_survivors(
             .filter(|(_, s)| *s >= f.abs_keyword && (top_kw <= 0.0 || *s >= f.rel_ratio * top_kw))
             .map(|(u, _)| u.clone())
             .collect();
-        // Small-corpus guard (TencentDB-Agent-Memory study, 09-08-2026): BM25 absolute
+        // Small-corpus guard (09-08-2026): BM25 absolute
         // magnitudes are meaningless when FTS matched only a handful of docs (IDF -> 0 on a
         // tiny/fresh corpus), so an absolute floor calibrated on a real corpus wrongly gates
         // everything and a fresh install looks broken. When the floor rejects the WHOLE pool
@@ -956,16 +959,26 @@ impl LocalMemory {
                 by_slug.entry(slug.to_string()).or_insert_with(|| e.uri.clone());
             }
         }
+        let live_uris: std::collections::HashSet<&str> = records.iter().map(|e| e.uri.as_str()).collect();
         let mut linked = 0usize;
         for e in &records {
             for name in parse_wikilinks(&e.body) {
-                let slug = crate::entry::slug(&name);
-                if slug.is_empty() {
-                    continue;
-                }
-                if let Some(target) = by_slug.get(&slug) {
-                    if target != &e.uri {
-                        self.store.link(&e.uri, target, "links")?;
+                // Resolution ladder : a direct [[daimon://...]] uri
+                // reference resolves exactly when that record is live; everything else goes
+                // through the title slug (slug() lowercases, so title matching is already
+                // case-insensitive).
+                let target: Option<String> = if name.starts_with("daimon://") {
+                    live_uris.contains(name.as_str()).then(|| name.clone())
+                } else {
+                    let slug = crate::entry::slug(&name);
+                    if slug.is_empty() {
+                        continue;
+                    }
+                    by_slug.get(&slug).cloned()
+                };
+                if let Some(target) = target {
+                    if target != e.uri {
+                        self.store.link(&e.uri, &target, "links")?;
                         linked += 1;
                     }
                 }
@@ -1467,6 +1480,22 @@ mod tests {
         assert!(neighbors.iter().any(|e| e.uri == live), "live neighbor hydrated");
         assert!(neighbors.iter().all(|e| e.kind != Kind::Skill), "skills never ride recall (invariant)");
         assert!(neighbors.iter().all(|e| e.uri != "daimon://resources/notes/memory/long-forgotten"), "dead endpoint dropped");
+    }
+
+    #[test]
+    fn wikilinks_pipe_alias_and_direct_uri_resolve() {
+        // parse: the pipe alias form yields the TARGET, not the shown text
+        assert_eq!(parse_wikilinks("see [[Real Target|the shown words]] here"), vec!["Real Target"]);
+        assert_eq!(parse_wikilinks("[[Plain]] and [[A|b]] and [[]]"), vec!["Plain", "A"]);
+        // reindex: title-slug (case handled by slug()), pipe alias, and direct daimon:// uri
+        let m = LocalMemory::for_test(tmp_store());
+        let beta = m.remember("Beta Target Record", "resources/notes", None, None, None).unwrap();
+        m.remember(&format!("Alpha refers to [[beta target record|itu]] and [[{beta}]] twice"), "resources/notes", None, None, None)
+            .unwrap();
+        let (linked, _pruned) = m.reindex_links().unwrap();
+        assert!(linked >= 2, "pipe alias and direct uri both resolve: {linked}");
+        let hits = m.recall_expanded("Alpha refers twice", 3, 1).unwrap();
+        assert!(hits.iter().any(|e| e.uri == beta), "neighbor rides in via the resolved edges");
     }
 
     #[test]

@@ -339,6 +339,37 @@ pub fn scope() -> Option<String> {
     std::env::var("DM_SCOPE").ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
 }
 
+/// Import manifest (sha256 incremental ingest): maps an imported
+/// file's absolute path to the sha256 of its content at last import, so a re-import of an
+/// unchanged corpus skips the parse + network + embedding work per file. Lives CLIENT-SIDE
+/// under the data dir - import parses on the client, so the memo belongs where the work
+/// happens; it is an optimization only (a stale or missing manifest just falls back to the
+/// store's idempotent put), so per-machine state is fine.
+pub fn import_manifest_load() -> std::collections::HashMap<String, String> {
+    let Ok(dir) = data_dir() else { return Default::default() };
+    std::fs::read_to_string(dir.join("import-manifest.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+pub fn import_manifest_save(m: &std::collections::HashMap<String, String>) {
+    let Ok(dir) = data_dir() else { return };
+    if let Ok(s) = serde_json::to_string_pretty(m) {
+        let _ = std::fs::write(dir.join("import-manifest.json"), s + "\n");
+    }
+}
+
+/// Hex sha256 of a byte slice (import manifest keying).
+pub fn sha256_hex_bytes(data: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut out = String::with_capacity(64);
+    for b in Sha256::digest(data) {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
+}
+
 fn parse_recall_decay(v: Option<&str>) -> f64 {
     const DEFAULT: f64 = 0.5;
     match v.map(str::trim) {

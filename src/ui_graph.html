@@ -225,7 +225,7 @@
     ctx.save(); ctx.translate(view.x, view.y); ctx.scale(view.k, view.k);
     // Focus mode (hover wins over click-select): non-incident edges are HIDDEN, not dimmed,
     // and out-of-focus nodes lose their labels - the cheapest legibility trick on a dense
-    // graph (adopted from the TencentDB panel's sigma reducers).
+    // graph (a pattern adopted from studied graph-panel sigma reducers).
     var focus = hovered || selected;
     var hl = focus ? neighborSet(focus) : null;
     // project every visible node once per frame; in 3D, paint far-to-near (painter's sort)
