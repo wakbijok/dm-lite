@@ -6,8 +6,9 @@
 //! then replaces the running binary (and the native vector lib when the archive carries a
 //! newer one). An unsigned or tampered archive never touches disk outside the temp dir.
 //!
-//! Signing (release runbook): `rsign sign -s <secret key> -x <asset>.minisig <asset>` for
-//! every release asset. The secret key lives only on the release machine.
+//! Signing (release runbook): `contrib/sign-release.py <tag>` on the release machine. It
+//! checks the release, asks for the key passphrase once, signs and verifies every asset,
+//! and uploads the `.minisig` files. The secret key never leaves that machine.
 
 use anyhow::{anyhow, bail, Context, Result};
 use std::io::Read;
@@ -16,18 +17,81 @@ use std::path::Path;
 const OWNER: &str = "wakbijok";
 const REPO: &str = "dm-lite";
 
-/// The dm-lite release signing public key (minisign format). Verification is NOT optional:
+/// The dm-lite release signing public keys (minisign format). Verification is NOT optional:
 /// compromising the GitHub account is no longer enough to push code to upgraders - the
-/// attacker would also need the offline secret key.
-const RELEASE_PUBKEY: &str = "RWQE/am58ZREHA5bpSZ6y4IutRTO5G/AuojqEEysr0S1jnY/WucccMdE";
+/// attacker would also need an offline secret key. A list, so a new key can ship (and be
+/// trusted) before releases are signed with it. Each release still carries one signature, so
+/// an install that skips the whole overlap window needs a manual reinstall.
+/// 0.3.6: key 1C4494F1B9A9FD04 retired (its passphrase was lost), CD4359A138D28837 added.
+const RELEASE_PUBKEYS: &[&str] = &["RWQ3iNI4oVlDzaiCJtUwwBiPjx2dcWaDHxh00Pw0lQbluZ1V33c0+gyR"];
+
+/// Ok when any of `keys` verifies `sig_text` over `archive` AND the signed trusted comment
+/// names `expected_file` (`file:<name>`, as the release signing script writes it). Without the
+/// name check, a genuinely signed archive could be replayed under another version or target.
+/// A key that fails to parse is skipped, never trusted; legacy (non-prehashed) signatures are
+/// refused.
+fn verify_release_sig(keys: &[&str], archive: &[u8], sig_text: &str, expected_file: &str) -> Result<()> {
+    let sig = minisign_verify::Signature::decode(sig_text).map_err(|e| anyhow!("decode signature: {e}"))?;
+    let mut last_err = anyhow!("no trusted release key");
+    for k in keys {
+        match minisign_verify::PublicKey::from_base64(k) {
+            Ok(pk) => match pk.verify(archive, &sig, false) {
+                Ok(()) => {
+                    // The trusted comment is covered by the signature, so this check is authentic.
+                    let want = format!("file:{expected_file}");
+                    if sig.trusted_comment().split('\t').any(|f| f == want) {
+                        return Ok(());
+                    }
+                    bail!("signature is for a different file (trusted comment: {})", sig.trusted_comment());
+                }
+                Err(e) => last_err = anyhow!("{e}"),
+            },
+            Err(e) => last_err = anyhow!("bad compiled-in release public key: {e}"),
+        }
+    }
+    Err(last_err)
+}
 
 #[cfg(test)]
 mod tests {
+    use super::verify_release_sig;
+
+    // Throwaway test key pair, not a release key. FIXTURE_SIG signs FIXTURE with FIXTURE_KEY.
+    const FIXTURE: &[u8] = b"dm-lite release signature fixture\n";
+    const FIXTURE_KEY: &str = "RWT+b3NoBHVhGotlhgZvMbNSUFnVOErxhyWm7VY494qtY1OKL9wdITti";
+    const OTHER_KEY: &str = "RWRbObgKQoAhYxvfwilUhuTnV1CUQsEuRs0xPf79if1EMvh8weYLlRdW";
+    const FIXTURE_SIG: &str = "untrusted comment: signature from rsign secret key\n\
+        RUT+b3NoBHVhGkt5tFJFWYDXBcQaF/c5H7GTwdi0cGo9aKm0U24Yc2aDhVlY4CVY8UvIz+UeWVWtFfmRLe16I4/e6mgJDufVlQg=\n\
+        trusted comment: timestamp:1790135640\tfile:fixture.bin\tprehashed\n\
+        qLQchMvxIvkFZVr3RuCyaJSnGOQyVO0EN9a4bsM9JOvPaTT7X+/eWCrY4ucw1xq7f/3jt4t23EswjS+GyrOhDQ==\n";
+
     #[test]
-    fn release_pubkey_parses() {
-        // If this key ever fails to parse, every future `dmem upgrade` is bricked - catch it
-        // at test time, not on a user's machine.
-        minisign_verify::PublicKey::from_base64(super::RELEASE_PUBKEY).expect("compiled-in release key is valid");
+    fn any_trusted_key_verifies() {
+        verify_release_sig(&[FIXTURE_KEY], FIXTURE, FIXTURE_SIG, "fixture.bin").expect("signing key verifies");
+        verify_release_sig(&[OTHER_KEY, FIXTURE_KEY], FIXTURE, FIXTURE_SIG, "fixture.bin").expect("second key in the list verifies");
+        verify_release_sig(&["not a key", FIXTURE_KEY], FIXTURE, FIXTURE_SIG, "fixture.bin").expect("a bad entry is skipped");
+    }
+
+    #[test]
+    fn untrusted_or_tampered_is_refused() {
+        assert!(verify_release_sig(&[OTHER_KEY], FIXTURE, FIXTURE_SIG, "fixture.bin").is_err(), "wrong key");
+        assert!(verify_release_sig(&[], FIXTURE, FIXTURE_SIG, "fixture.bin").is_err(), "no keys");
+        assert!(verify_release_sig(&[FIXTURE_KEY], b"tampered", FIXTURE_SIG, "fixture.bin").is_err(), "tampered archive");
+        let bad_comment = FIXTURE_SIG.replace("\tfile:", " file:");
+        assert!(verify_release_sig(&[FIXTURE_KEY], FIXTURE, &bad_comment, "fixture.bin").is_err(), "altered trusted comment");
+        // A valid signature replayed under another asset name (another version or target).
+        assert!(verify_release_sig(&[FIXTURE_KEY], FIXTURE, FIXTURE_SIG, "other.bin").is_err(), "signed for another file");
+        assert!(verify_release_sig(&[FIXTURE_KEY], FIXTURE, FIXTURE_SIG, "fixture").is_err(), "prefix of the signed name");
+    }
+
+    #[test]
+    fn release_pubkeys_parse() {
+        // If no key parses, every future `dmem upgrade` is bricked - catch it at test time,
+        // not on a user's machine.
+        assert!(!super::RELEASE_PUBKEYS.is_empty(), "at least one release key");
+        for k in super::RELEASE_PUBKEYS {
+            minisign_verify::PublicKey::from_base64(k).expect("compiled-in release key is valid");
+        }
     }
 }
 
@@ -120,8 +184,12 @@ pub fn run(pre: bool, yes: bool) -> Result<()> {
         })
     };
     let t = target();
-    let (archive_name, archive_url) = asset_url(&|n| n.contains(t) && n.ends_with(".tar.gz"))
-        .ok_or_else(|| anyhow!("release {latest} has no .tar.gz asset for {t}"))?;
+    // Exactly the archive the release workflow names for this tag and target; the signature
+    // must name the same file (checked in verify_release_sig).
+    let tag = release.get("tag_name").and_then(|v| v.as_str()).unwrap_or_default();
+    let expected = format!("dmem-{tag}-{t}.tar.gz").to_lowercase();
+    let (archive_name, archive_url) = asset_url(&|n| n == expected)
+        .ok_or_else(|| anyhow!("release {latest} has no {expected} asset"))?;
     let (_, sig_url) = asset_url(&|n| n == format!("{}.minisig", archive_name.to_lowercase()))
         .ok_or_else(|| anyhow!("release {latest} has no {archive_name}.minisig - refusing an unsigned upgrade"))?;
 
@@ -130,11 +198,8 @@ pub fn run(pre: bool, yes: bool) -> Result<()> {
     let sig_raw = download(&client, &sig_url)?;
 
     // Verify BEFORE anything is extracted or replaced.
-    let pk = minisign_verify::PublicKey::from_base64(RELEASE_PUBKEY)
-        .map_err(|e| anyhow!("bad compiled-in release public key: {e}"))?;
-    let sig = minisign_verify::Signature::decode(std::str::from_utf8(&sig_raw).context("signature is not UTF-8")?)
-        .map_err(|e| anyhow!("decode {archive_name}.minisig: {e}"))?;
-    pk.verify(&archive, &sig, false)
+    let sig_text = std::str::from_utf8(&sig_raw).context("signature is not UTF-8")?;
+    verify_release_sig(RELEASE_PUBKEYS, &archive, sig_text, &archive_name)
         .map_err(|e| anyhow!("SIGNATURE VERIFICATION FAILED for {archive_name}: {e} - refusing to install"))?;
     println!("signature verified (minisign, dm-lite release key)");
 

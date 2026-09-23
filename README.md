@@ -102,6 +102,7 @@ The trust boundaries, plainly:
 - **Startup is fail-closed:** an unopenable IAM database refuses to start (revocation would not be enforced) unless you pass `--allow-env-only`; `DM_TOKEN_*` env secrets under 16 characters are rejected outright.
 - **Tokens:** prefer `dmem login <url>` with `$DM_LOGIN_TOKEN` or the prompt - a positional token lands in shell history and `ps`.
 - **Files:** tenant DBs and `iam.db` are created/re-chmodded 0600 on Unix. On Windows there is no ACL tightening yet - rely on the account boundary.
+- **Upgrades are signed:** `dmem upgrade` installs a release only when its `.minisig` verifies against a release key compiled into your binary, and refuses otherwise. 0.3.6 replaced that key, so an install on 0.3.5 or older cannot verify 0.3.6: install 0.3.6 once by hand from the release page, and `dmem upgrade` works again from there.
 - **The local graph viewer (`dmem ui`) has no auth** by design: keep it on the default loopback bind and reach it over an SSH tunnel. It rejects DNS-name Host headers (rebinding guard); IP-literal and localhost Hosts are allowed.
 
 ## Docs
