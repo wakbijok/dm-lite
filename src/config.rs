@@ -24,7 +24,9 @@ pub struct Config {
 pub struct ServerLink {
     pub url: String,
     pub token: String,
-    /// Accept a self-signed / invalid TLS cert (for trusted networks).
+    /// Legacy switch that disabled TLS verification. No longer honoured: the client refuses to
+    /// start while it is set (see `client::INSECURE_REFUSED`). Still parsed so an old config gets
+    /// that message instead of an unexplained certificate error. Pin the cert with `ca_cert`.
     #[serde(default)]
     pub insecure: bool,
     /// Trust a specific CA / self-signed cert (PEM path) instead of the system roots.
@@ -422,6 +424,7 @@ mod tests {
         assert_eq!(cfg.tenant.as_deref(), Some("acme"));
         let s = cfg.server.unwrap();
         assert_eq!(s.url, "https://x");
+        // still parsed (so the client can refuse it with a clear message), never honoured
         assert!(s.insecure && s.ca_cert.is_none());
     }
 

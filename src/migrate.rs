@@ -120,15 +120,12 @@ pub fn import_jsonl(m: &Memory, text: &str) -> (usize, usize) {
     (ok, skip)
 }
 
-/// Pull a JSONL export from a running daimon-memory v1 (`GET /admin/export`). TLS is verified by
-/// default (the request carries the v1 admin token, so accepting any cert would expose it to a
-/// MITM); `insecure` accepts a self-signed/invalid cert and `ca_cert` trusts a specific PEM.
-fn fetch_export(url: &str, token: &str, insecure: bool, ca_cert: Option<&str>) -> Result<String> {
+/// Pull a JSONL export from a running daimon-memory v1 (`GET /admin/export`). TLS is always
+/// verified (the request carries the v1 admin token, so accepting any cert would expose it to a
+/// MITM); `ca_cert` trusts a specific PEM for a self-signed v1 server.
+fn fetch_export(url: &str, token: &str, ca_cert: Option<&str>) -> Result<String> {
     let base = url.trim_end_matches('/');
     let mut builder = reqwest::blocking::Client::builder().timeout(std::time::Duration::from_secs(180));
-    if insecure {
-        builder = builder.danger_accept_invalid_certs(true);
-    }
     if let Some(ca) = ca_cert {
         let pem = std::fs::read(ca).map_err(|e| anyhow!("read ca_cert {ca}: {e}"))?;
         let cert = reqwest::Certificate::from_pem(&pem).map_err(|e| anyhow!("parse ca_cert {ca}: {e}"))?;
@@ -146,10 +143,10 @@ fn fetch_export(url: &str, token: &str, insecure: bool, ca_cert: Option<&str>) -
     Ok(resp.text().unwrap_or_default())
 }
 
-pub fn run(file: Option<String>, url: Option<String>, token: Option<String>, insecure: bool, ca_cert: Option<String>) -> Result<()> {
+pub fn run(file: Option<String>, url: Option<String>, token: Option<String>, ca_cert: Option<String>) -> Result<()> {
     let text = if let Some(u) = url {
         let t = token.ok_or_else(|| anyhow!("--url needs --token (the v1 admin token)"))?;
-        fetch_export(&u, &t, insecure, ca_cert.as_deref())?
+        fetch_export(&u, &t, ca_cert.as_deref())?
     } else if let Some(f) = file {
         if f == "-" {
             use std::io::Read;

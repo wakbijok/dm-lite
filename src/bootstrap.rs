@@ -156,6 +156,32 @@ fn rfc3339_utc() -> String {
     format!("{y:04}-{m:02}-{d:02}T{h:02}:{mi:02}:{s:02}Z")
 }
 
+/// Codex spills a hook's `additionalContext` to a temp file once it passes an approximate token
+/// threshold (2,500 tokens by default, about 10,000 bytes) and injects only a head/tail preview
+/// under a "Warning: truncated output" banner. The session-start block (persona + protocols) can
+/// exceed that, which silently drops the middle of the protocols from the model's context while
+/// the host still reports the hook as run. `additionalContextLimit` on a command handler raises
+/// the per-hook threshold (0 disables spilling); Codex honours it for SessionStart and
+/// UserPromptSubmit. Sized with headroom over render::SESSION_BUDGET (about 2,300 tokens) so the
+/// host cap is never the tighter one; UserPromptSubmit carries a smaller recall block and fires
+/// every turn, so it gets a smaller limit.
+const CODEX_SESSION_START_CONTEXT_LIMIT: u64 = 8_000;
+const CODEX_USER_PROMPT_SUBMIT_CONTEXT_LIMIT: u64 = 4_000;
+
+/// The dm-lite Codex plugin's hooks.json body: both lifecycle hooks call the dmem binary.
+fn codex_hooks(dm: &str) -> Value {
+    json!({
+        "hooks": {
+            "SessionStart": [ { "matcher": "*", "hooks": [
+                { "type": "command", "command": format!("{} hook session_start", sh_quote(dm)), "timeout": 10,
+                  "additionalContextLimit": CODEX_SESSION_START_CONTEXT_LIMIT } ] } ],
+            "UserPromptSubmit": [ { "matcher": "*", "hooks": [
+                { "type": "command", "command": format!("{} hook user_prompt_submit", sh_quote(dm)), "timeout": 8,
+                  "additionalContextLimit": CODEX_USER_PROMPT_SUBMIT_CONTEXT_LIMIT } ] } ]
+        }
+    })
+}
+
 /// Write the dm-lite Codex plugin tree (a local marketplace) whose hooks call the dmem binary.
 /// Codex shares Claude Code's hook output shape (hookSpecificOutput.additionalContext), so the
 /// same `dmem hook ...` commands drive persona on SessionStart and recall on UserPromptSubmit.
@@ -174,15 +200,7 @@ fn codex_write_plugin(mp_dir: &Path, dm: &str) -> Result<()> {
         "hooks": "./hooks/hooks.json"
     });
     std::fs::write(plug.join(".codex-plugin/plugin.json"), serde_json::to_string_pretty(&manifest)? + "\n")?;
-    let hooks = json!({
-        "hooks": {
-            "SessionStart": [ { "matcher": "*", "hooks": [
-                { "type": "command", "command": format!("{} hook session_start", sh_quote(dm)), "timeout": 10 } ] } ],
-            "UserPromptSubmit": [ { "matcher": "*", "hooks": [
-                { "type": "command", "command": format!("{} hook user_prompt_submit", sh_quote(dm)), "timeout": 8 } ] } ]
-        }
-    });
-    std::fs::write(plug.join("hooks/hooks.json"), serde_json::to_string_pretty(&hooks)? + "\n")?;
+    std::fs::write(plug.join("hooks/hooks.json"), serde_json::to_string_pretty(&codex_hooks(dm))? + "\n")?;
     Ok(())
 }
 
@@ -278,6 +296,8 @@ fn codex_install(dm: &str, remove: bool) -> Result<()> {
         }
         println!("    On your next Codex session, Codex asks once to TRUST the dmem hooks");
         println!("    (session_start + user_prompt_submit). Accept to enable persona + auto-recall.");
+        println!("    The same review appears after any dmem upgrade that changes a hook definition:");
+        println!("    Codex marks a changed hook as modified and skips it until it is trusted again.");
     }
     Ok(())
 }
@@ -1256,5 +1276,64 @@ mod tests {
             .filter_map(|v| v.as_str())
             .collect();
         assert_eq!(enabled3, vec!["security-guidance"]);
+    }
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn scratch(tag: &str) -> PathBuf {
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("dmboot-{tag}-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn read_json(p: &Path) -> Value {
+        serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn codex_plugin_hooks_carry_additional_context_limits() {
+        let mp = scratch("codex");
+        codex_write_plugin(&mp, "/opt/dmem").unwrap();
+        let hooks = read_json(&mp.join("plugins/dmem/hooks/hooks.json"));
+        let ss = &hooks["hooks"]["SessionStart"][0]["hooks"][0];
+        assert_eq!(ss["type"], "command");
+        assert_eq!(ss["command"], "/opt/dmem hook session_start");
+        assert_eq!(ss["timeout"], 10);
+        assert_eq!(ss["additionalContextLimit"], CODEX_SESSION_START_CONTEXT_LIMIT);
+        let ups = &hooks["hooks"]["UserPromptSubmit"][0]["hooks"][0];
+        assert_eq!(ups["type"], "command");
+        assert_eq!(ups["command"], "/opt/dmem hook user_prompt_submit");
+        assert_eq!(ups["timeout"], 8);
+        assert_eq!(ups["additionalContextLimit"], CODEX_USER_PROMPT_SUBMIT_CONTEXT_LIMIT);
+        // The limit exists to keep the whole session-start block in context, so it must clear
+        // Codex's 2,500-token default with room for persona + protocol growth.
+        assert!(CODEX_SESSION_START_CONTEXT_LIMIT > 2_500);
+        assert!(CODEX_USER_PROMPT_SUBMIT_CONTEXT_LIMIT > 2_500);
+        let _ = std::fs::remove_dir_all(&mp);
+    }
+
+    #[test]
+    fn codex_plugin_tree_is_self_consistent() {
+        let mp = scratch("codex-tree");
+        codex_write_plugin(&mp, "/opt/dmem").unwrap();
+        let market = read_json(&mp.join(".claude-plugin/marketplace.json"));
+        assert_eq!(market["name"], "dmem");
+        assert_eq!(market["plugins"][0]["source"], "./plugins/dmem");
+        let plug = mp.join("plugins/dmem");
+        let manifest = read_json(&plug.join(".codex-plugin/plugin.json"));
+        assert_eq!(manifest["name"], "dmem");
+        assert_eq!(manifest["version"], env!("CARGO_PKG_VERSION"));
+        let hooks_rel = manifest["hooks"].as_str().unwrap();
+        assert!(plug.join(hooks_rel).is_file(), "manifest hooks path must resolve inside the plugin");
+        let _ = std::fs::remove_dir_all(&mp);
+    }
+
+    #[test]
+    fn codex_hooks_shell_quote_the_binary_path() {
+        let hooks = codex_hooks("/Users/some one/.local/bin/dmem");
+        let cmd = hooks["hooks"]["SessionStart"][0]["hooks"][0]["command"].as_str().unwrap();
+        assert_eq!(cmd, "'/Users/some one/.local/bin/dmem' hook session_start");
     }
 }

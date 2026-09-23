@@ -29,20 +29,15 @@ pub fn run() -> Result<()> {
         server.insert("url".into(), toml::Value::String(url.trim().to_string()));
         server.insert("token".into(), toml::Value::String(token));
         if url.trim().starts_with("https://") {
-            let insecure = Confirm::with_theme(&theme)
-                .with_prompt("Accept a self-signed certificate (insecure)?")
-                .default(false)
-                .interact()?;
-            if insecure {
-                server.insert("insecure".into(), toml::Value::Boolean(true));
-            } else {
-                let ca: String = Input::with_theme(&theme)
-                    .with_prompt("Path to the server's cert/CA PEM (blank = system roots)")
-                    .allow_empty(true)
-                    .interact_text()?;
-                if !ca.trim().is_empty() {
-                    server.insert("ca_cert".into(), toml::Value::String(ca.trim().to_string()));
-                }
+            // TLS verification cannot be switched off (the token rides every request). A
+            // self-signed server is pinned by its cert file instead: the one `dmem serve
+            // --tls-generate` writes under <data>/tls/cert.pem, copied to this machine.
+            let ca: String = Input::with_theme(&theme)
+                .with_prompt("Path to the server's cert/CA PEM (self-signed server: its cert.pem; blank = system roots)")
+                .allow_empty(true)
+                .interact_text()?;
+            if !ca.trim().is_empty() {
+                server.insert("ca_cert".into(), toml::Value::String(ca.trim().to_string()));
             }
         }
         doc.insert("server".into(), toml::Value::Table(server));
@@ -88,7 +83,7 @@ pub fn run() -> Result<()> {
                 );
                 let title = format!("{agent_name} for {user_name}");
                 match m.import_record(crate::entry::Kind::Persona, "agent/persona", &title, &persona_body) {
-                    Ok(_) => println!("  persona set: {agent_name} working with {user_name}"),
+                    Ok(_) => println!("  persona set for {agent_name}"),
                     Err(e) => eprintln!("  persona not set ({e:#})"),
                 }
                 for tpl in [

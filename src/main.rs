@@ -284,9 +284,6 @@ enum Cmd {
         /// v1 admin token (with --url)
         #[arg(long)]
         token: Option<String>,
-        /// accept a self-signed/invalid TLS cert from the v1 server (with --url)
-        #[arg(long)]
-        insecure: bool,
         /// trust a specific CA/self-signed cert (PEM path) for the v1 server (with --url)
         #[arg(long = "ca-cert")]
         ca_cert: Option<String>,
@@ -340,6 +337,11 @@ enum Cmd {
         /// generate a self-signed cert for HTTPS (saved under the data dir)
         #[arg(long = "tls-generate")]
         tls_generate: bool,
+        /// extra hostname or IP to put in the generated cert's SAN list (repeatable). Use the
+        /// name clients connect with, e.g. --tls-san dmem.example.net, so `ca_cert` pinning on
+        /// the client passes hostname verification.
+        #[arg(long = "tls-san")]
+        tls_san: Vec<String>,
     },
     /// Manage the local `dmem serve` daemon as an OS service (launchd/systemd). Needs --features server.
     #[cfg(feature = "server")]
@@ -362,8 +364,8 @@ enum Cmd {
         /// One-time member token. PREFER omitting it: dmem then reads $DM_LOGIN_TOKEN or
         /// prompts on stdin - a positional token lands in shell history and `ps` output.
         token: Option<String>,
-        #[arg(long)]
-        insecure: bool,
+        /// trust a specific CA / self-signed server cert (PEM path). The file `dmem serve
+        /// --tls-generate` writes; TLS verification itself cannot be turned off.
         #[arg(long = "ca-cert")]
         ca_cert: Option<String>,
     },
@@ -753,7 +755,7 @@ fn run() -> Result<()> {
             Ok(())
         }
         #[cfg(feature = "client")]
-        Cmd::Migrate { file, url, token, insecure, ca_cert } => migrate::run(file, url, token, insecure, ca_cert),
+        Cmd::Migrate { file, url, token, ca_cert } => migrate::run(file, url, token, ca_cert),
         Cmd::Template(TemplateCmd::Export { dir }) => {
             let d = std::path::Path::new(&dir);
             std::fs::create_dir_all(d)?;
@@ -775,10 +777,10 @@ fn run() -> Result<()> {
         #[cfg(feature = "ui")]
         Cmd::Ui { addr, open } => ui::run(&addr, open),
         #[cfg(feature = "server")]
-        Cmd::Serve { addr, tls_cert, tls_key, tls_generate, allow_insecure_http, allow_env_only } => {
+        Cmd::Serve { addr, tls_cert, tls_key, tls_generate, tls_san, allow_insecure_http, allow_env_only } => {
             server::run_blocking(
                 &addr,
-                server::TlsOpts { cert: tls_cert, key: tls_key, generate: tls_generate },
+                server::TlsOpts { cert: tls_cert, key: tls_key, generate: tls_generate, sans: tls_san },
                 server::HardeningOpts { allow_insecure_http, allow_env_only },
             )
         }
@@ -794,7 +796,7 @@ fn run() -> Result<()> {
         #[cfg(feature = "self-update")]
         Cmd::Upgrade { pre, yes } => upgrade::run(pre, yes),
         #[cfg(feature = "client")]
-        Cmd::Login { url, token, insecure, ca_cert } => {
+        Cmd::Login { url, token, ca_cert } => {
             // Token sourcing ladder (audit High #3): flag-less env var, then an stdin prompt.
             // The positional form still works but is discouraged - it leaks via shell history
             // and process listings.
@@ -817,7 +819,7 @@ fn run() -> Result<()> {
                     }
                 },
             };
-            client::login(&url, &token, insecure, ca_cert)
+            client::login(&url, &token, ca_cert)
         }
         #[cfg(feature = "client")]
         Cmd::Logout => client::logout(),

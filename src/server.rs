@@ -793,17 +793,35 @@ pub struct TlsOpts {
     pub cert: Option<String>,
     pub key: Option<String>,
     pub generate: bool,
+    /// Extra SAN entries for the generated cert (`--tls-san`): the public names clients use.
+    pub sans: Vec<String>,
 }
 
-/// Generate a self-signed cert + key (PEM), persisting them under `<data>/tls/` so clients
-/// can trust the cert via `ca_cert`. SANs cover localhost and the bind host.
-fn generate_self_signed(addr: &str) -> Result<(String, String)> {
+/// SAN list for the generated cert: localhost, the bind host when it is a real name (a
+/// `0.0.0.0` bind names nothing a client could connect to), then the operator's `--tls-san`
+/// entries, deduplicated in order. Without the public name here, a client that pins the cert
+/// via `ca_cert` still fails hostname verification, which is what used to push people to
+/// disable verification altogether.
+fn self_signed_sans(addr: &str, extra: &[String]) -> Vec<String> {
     let host = addr.rsplit_once(':').map(|(h, _)| h).unwrap_or(addr);
     let mut sans = vec!["localhost".to_string()];
     if !host.is_empty() && host != "0.0.0.0" && host != "localhost" {
         sans.push(host.to_string());
     }
-    let ck = rcgen::generate_simple_self_signed(sans).map_err(|e| anyhow::anyhow!("rcgen: {e}"))?;
+    for s in extra {
+        let s = s.trim();
+        if !s.is_empty() && !sans.iter().any(|x| x == s) {
+            sans.push(s.to_string());
+        }
+    }
+    sans
+}
+
+/// Generate a self-signed cert + key (PEM), persisting them under `<data>/tls/` so clients
+/// can pin the cert via `ca_cert`.
+fn generate_self_signed(addr: &str, extra_sans: &[String]) -> Result<(String, String)> {
+    let sans = self_signed_sans(addr, extra_sans);
+    let ck = rcgen::generate_simple_self_signed(sans.clone()).map_err(|e| anyhow::anyhow!("rcgen: {e}"))?;
     let cert_pem = ck.cert.pem();
     let key_pem = ck.key_pair.serialize_pem();
     if let Ok(dir) = crate::config::data_dir() {
@@ -813,8 +831,9 @@ fn generate_self_signed(addr: &str) -> Result<(String, String)> {
         let _ = std::fs::write(&cpath, &cert_pem);
         // the private key is a secret: 0600, unlike the (public) cert beside it
         let _ = crate::config::write_secret(&tdir.join("key.pem"), &key_pem);
-        eprintln!("dmem serve: generated self-signed cert at {}", cpath.display());
-        eprintln!("           clients: set `ca_cert` to that file (or `insecure = true`)");
+        eprintln!("dmem serve: generated self-signed cert at {} (SANs: {})", cpath.display(), sans.join(", "));
+        eprintln!("           clients: copy that file and run `dmem login <url> --ca-cert <file>`;");
+        eprintln!("           if the name clients use is missing from the SANs, restart with --tls-san <name>.");
     }
     Ok((cert_pem, key_pem))
 }
@@ -907,7 +926,7 @@ pub fn run_blocking(addr: &str, tls: TlsOpts, hardening: HardeningOpts) -> Resul
                     .map_err(|e| anyhow::anyhow!("load TLS cert/key: {e}"))?,
             )
         } else if tls.generate {
-            let (cert_pem, key_pem) = generate_self_signed(addr)?;
+            let (cert_pem, key_pem) = generate_self_signed(addr, &tls.sans)?;
             Some(
                 axum_server::tls_rustls::RustlsConfig::from_pem(cert_pem.into_bytes(), key_pem.into_bytes())
                     .await
@@ -945,6 +964,16 @@ pub fn run_blocking(addr: &str, tls: TlsOpts, hardening: HardeningOpts) -> Resul
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn self_signed_sans_cover_bind_host_and_operator_names() {
+        use super::self_signed_sans;
+        // wildcard bind names nothing: only localhost + the operator's public name
+        assert_eq!(self_signed_sans("0.0.0.0:8077", &["dmem.example.net".into()]), vec!["localhost", "dmem.example.net"]);
+        // explicit bind host is included; duplicates from --tls-san are dropped
+        assert_eq!(self_signed_sans("10.0.0.5:8077", &["10.0.0.5".into(), " ".into()]), vec!["localhost", "10.0.0.5"]);
+        assert_eq!(self_signed_sans("localhost:1", &[]), vec!["localhost"]);
+    }
+
     #[test]
     fn loopback_addr_detection() {
         for ok in ["127.0.0.1:8077", "127.9.9.9:80", "localhost:8077", "[::1]:8077"] {

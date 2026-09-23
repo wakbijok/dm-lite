@@ -1,7 +1,9 @@
 //! Remote-client mode: talk to a remote `dmem serve` over HTTP(S) with a bearer token.
 //! Selected when the config has a `[server]` block. Blocking reqwest (rustls), so the CLI and
-//! hooks stay synchronous (no tokio). `insecure` accepts a self-signed cert; `ca_cert` trusts
-//! a specific CA. The server enforces tenant isolation; this client just carries the token.
+//! hooks stay synchronous (no tokio). TLS is always verified: `ca_cert` pins a specific CA or
+//! self-signed server cert; there is no switch to skip verification, because every request
+//! carries the bearer token and an unverified channel would hand it to a MITM. The server
+//! enforces tenant isolation; this client just carries the token.
 
 use crate::config::ServerLink;
 use crate::entry::{Edge, Entry, Kind};
@@ -15,6 +17,37 @@ pub struct RemoteClient {
     http: reqwest::blocking::Client,
 }
 
+/// Why a config with `[server].insecure = true` is refused instead of silently ignored: the old
+/// switch disabled certificate verification, which sent the bearer token to whoever answered.
+/// Refusing with the fix spelled out beats an unexplained TLS failure from the hooks.
+pub const INSECURE_REFUSED: &str = "[server].insecure is no longer honoured: it disabled TLS verification and sent the bearer token to whoever answered. \
+Pin the server certificate instead: `dmem login <url> --ca-cert <cert.pem>` (`dmem serve --tls-generate` writes it under <data>/tls/cert.pem; \
+start the server with `--tls-san <public hostname>` so the cert covers the name clients use), then delete `insecure` from the config.";
+
+/// Hint appended to a request error when the failure is the server certificate not being
+/// trusted (self-signed without `ca_cert`, or a cert that does not cover the hostname).
+const TLS_TRUST_HINT: &str = "; the server certificate is not trusted: pin it with `dmem login <url> --ca-cert <cert.pem>` (see README, Security model)";
+
+/// Walk an error's source chain looking for a rustls/webpki certificate-trust failure.
+fn is_tls_trust_error(e: &dyn std::error::Error) -> bool {
+    let mut cur: Option<&dyn std::error::Error> = Some(e);
+    while let Some(err) = cur {
+        let s = err.to_string();
+        if s.contains("certificate") || s.contains("UnknownIssuer") || s.contains("NotValidForName") {
+            return true;
+        }
+        cur = err.source();
+    }
+    false
+}
+
+/// Wrap a transport error with the request label, keeping the source chain (so `main`'s `{:#}`
+/// still walks reqwest -> connect -> rustls) and adding the pinning hint when it is a trust failure.
+fn send_context(e: reqwest::Error, what: String) -> anyhow::Error {
+    let hint = if is_tls_trust_error(&e) { TLS_TRUST_HINT } else { "" };
+    anyhow::Error::new(e).context(format!("{what}{hint}"))
+}
+
 impl RemoteClient {
     pub fn new(link: &ServerLink) -> Result<Self> {
         // connect_timeout bounds the unreachable-server case: without it a packet-dropping
@@ -23,7 +56,7 @@ impl RemoteClient {
             .timeout(std::time::Duration::from_secs(15))
             .connect_timeout(std::time::Duration::from_secs(3));
         if link.insecure {
-            b = b.danger_accept_invalid_certs(true);
+            anyhow::bail!("{INSECURE_REFUSED}");
         }
         if let Some(ca) = &link.ca_cert {
             let pem = std::fs::read(ca).map_err(|e| anyhow!("read ca_cert {ca}: {e}"))?;
@@ -45,9 +78,9 @@ impl RemoteClient {
             .bearer_auth(&self.token)
             .json(&body)
             .send()
-            // `.context` (not `anyhow!("{e}")`) preserves the reqwest error as a source, so
+            // `send_context` (not `anyhow!("{e}")`) preserves the reqwest error as a source, so
             // `main`'s `{:#}` walks the whole chain (reqwest -> connect -> rustls -> root cause).
-            .with_context(|| format!("POST {path}"))?;
+            .map_err(|e| send_context(e, format!("POST {path}")))?;
         let status = resp.status();
         let text = resp.text().unwrap_or_default();
         if !status.is_success() {
@@ -65,7 +98,7 @@ impl RemoteClient {
             .get(format!("{}{}", self.base, path))
             .bearer_auth(&self.token)
             .send()
-            .with_context(|| format!("GET {path}"))?;
+            .map_err(|e| send_context(e, format!("GET {path}")))?;
         let status = resp.status();
         let text = resp.text().unwrap_or_default();
         if !status.is_success() {
@@ -284,8 +317,9 @@ impl RemoteClient {
     }
 }
 
-/// `dmem login`: write the `[server]` block into the config (preserving other keys), 0600.
-pub fn login(url: &str, token: &str, insecure: bool, ca_cert: Option<String>) -> Result<()> {
+/// `dmem login`: write the `[server]` block into the config (preserving other keys), 0600. The
+/// block is rebuilt from scratch, so a legacy `insecure` key does not survive a re-login.
+pub fn login(url: &str, token: &str, ca_cert: Option<String>) -> Result<()> {
     let path = crate::config::config_path().ok_or_else(|| anyhow!("could not resolve a config dir"))?;
     if let Some(p) = path.parent() {
         std::fs::create_dir_all(p)?;
@@ -297,9 +331,6 @@ pub fn login(url: &str, token: &str, insecure: bool, ca_cert: Option<String>) ->
     let mut server = toml::Table::new();
     server.insert("url".into(), toml::Value::String(url.trim_end_matches('/').to_string()));
     server.insert("token".into(), toml::Value::String(token.to_string()));
-    if insecure {
-        server.insert("insecure".into(), toml::Value::Boolean(true));
-    }
     if let Some(ca) = ca_cert {
         server.insert("ca_cert".into(), toml::Value::String(ca));
     }
@@ -329,8 +360,46 @@ pub fn logout() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use crate::entry::{Entry, Kind};
     use serde_json::json;
+
+    #[test]
+    fn insecure_link_is_refused_with_the_fix_spelled_out() {
+        let link = ServerLink { url: "https://x".into(), token: "t".into(), insecure: true, ca_cert: None };
+        let err = RemoteClient::new(&link).err().expect("insecure must be refused");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("no longer honoured"), "{msg}");
+        assert!(msg.contains("--ca-cert"), "must point at the pinning fix: {msg}");
+    }
+
+    #[test]
+    fn verified_link_builds() {
+        let link = ServerLink { url: "https://x/".into(), token: "t".into(), insecure: false, ca_cert: None };
+        let c = RemoteClient::new(&link).expect("plain verified client");
+        assert_eq!(c.base, "https://x", "trailing slash trimmed");
+    }
+
+    #[derive(Debug)]
+    struct Nested(&'static str, Option<Box<Nested>>);
+    impl std::fmt::Display for Nested {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(self.0)
+        }
+    }
+    impl std::error::Error for Nested {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            self.1.as_deref().map(|n| n as &(dyn std::error::Error + 'static))
+        }
+    }
+
+    #[test]
+    fn tls_trust_error_is_detected_anywhere_in_the_chain() {
+        let deep = Nested("error sending request", Some(Box::new(Nested("client error (Connect)", Some(Box::new(Nested("invalid peer certificate: UnknownIssuer", None)))))));
+        assert!(is_tls_trust_error(&deep));
+        let plain = Nested("error sending request", Some(Box::new(Nested("connection refused", None))));
+        assert!(!is_tls_trust_error(&plain));
+    }
 
     /// The server returns a bare JSON array of Entry (e.g. `json!(m.persona()?)`); the client
     /// decodes it via `serde_json::from_value::<Vec<Entry>>`. This guards that contract so the
