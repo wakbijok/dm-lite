@@ -1,0 +1,6 @@
+name: dmem
+version: 0.3.1
+description: "dm-lite per-turn recall for Hermes desktop/CLI/gateway. Desktop never registers config.yaml shell hooks (tui_gateway skips register_from_config); this plugin rides AIAgent discover_plugins + pre_llm_call."
+author: daimon
+hooks:
+  - pre_llm_call

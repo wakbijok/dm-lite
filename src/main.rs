@@ -1,0 +1,1061 @@
+//! dmem - daimon-memory v2: typed memory with hybrid recall; client/server in one binary. A
+//! `[server]` block points the binary at a `dmem serve` (local loopback or remote); without one
+//! it falls back to the deprecated embedded mode (a single local tenant).
+
+mod bootstrap;
+#[cfg(feature = "client")]
+mod client;
+#[cfg(feature = "client")]
+mod migrate;
+mod config;
+mod embedder;
+mod entry;
+mod hooks;
+mod mcp;
+mod render;
+mod sqlite;
+mod store;
+mod tools;
+mod skills;
+#[cfg(feature = "server")]
+mod iam;
+#[cfg(feature = "server")]
+mod server;
+#[cfg(feature = "server")]
+mod service;
+#[cfg(feature = "wizard")]
+mod setup;
+#[cfg(feature = "self-update")]
+mod upgrade;
+#[cfg(feature = "zvec")]
+mod zvec_index;
+#[cfg(feature = "ui")]
+mod ui;
+
+use anyhow::Result;
+use clap::{Parser, Subcommand};
+use tools::Memory;
+
+/// The default template set, embedded so `dmem template export` is self-contained.
+const TPL_FILES: &[(&str, &str)] = &[
+    ("README.md", include_str!("../templates/README.md")),
+    ("persona.md", include_str!("../templates/persona.md")),
+    ("save-discipline.md", include_str!("../templates/save-discipline.md")),
+    ("behavioral-discipline.md", include_str!("../templates/behavioral-discipline.md")),
+];
+
+#[derive(Parser)]
+#[command(name = "dmem", version, about = "daimon-memory v2: typed memory with hybrid recall; client/server in one binary")]
+struct Cli {
+    /// Point at a remote server URL for this invocation (overrides DM_ENDPOINT and the [server]
+    /// config; the token still comes from DM_TOKEN or the config). For CI and scripted ops.
+    #[arg(long, global = true)]
+    endpoint: Option<String>,
+    #[command(subcommand)]
+    cmd: Cmd,
+}
+
+#[derive(Subcommand)]
+#[command(rename_all = "snake_case")]
+enum Cmd {
+    /// Interactive first-run setup: detect agents, wire hooks, seed memory. Needs --features wizard.
+    #[cfg(feature = "wizard")]
+    Setup,
+    /// Wire (or with --remove, unwire) dmem into your agents (hooks for Devin/Claude Code/Codex/
+    /// Hermes/Grok; an MCP entry for hook-less Claude Desktop).
+    Bootstrap {
+        #[arg(long)]
+        devin: bool,
+        #[arg(long)]
+        claude: bool,
+        #[arg(long)]
+        codex: bool,
+        #[arg(long)]
+        hermes: bool,
+        /// OpenCode (TypeScript plugin for persona/recall/idle-nudge + an mcp.dmem entry).
+        #[arg(long)]
+        opencode: bool,
+        /// Grok CLI (MCP entry only: Grok v0 hooks cannot inject context, so recall is tool-driven).
+        #[arg(long)]
+        grok: bool,
+        /// Claude Desktop (MCP only; no hooks). Adds an mcpServers.dmem entry.
+        #[arg(long = "claude-desktop")]
+        claude_desktop: bool,
+        #[arg(long)]
+        all: bool,
+        /// remove dm's hooks instead of adding them
+        #[arg(long)]
+        remove: bool,
+    },
+    /// Lifecycle hook handlers (called by the agent; emit context on stdout).
+    Hook {
+        #[command(subcommand)]
+        event: HookCmd,
+        /// emit Hermes-shape output ({"context": ...}) and read Hermes hook-input fields
+        #[arg(long, global = true)]
+        hermes: bool,
+        /// emit the text verbatim (no JSON envelope) for hosts that inject strings directly
+        /// (e.g. the OpenCode plugin pushes hook output onto the system prompt)
+        #[arg(long, global = true, conflicts_with = "hermes")]
+        raw: bool,
+    },
+    /// Save a typed Decision.
+    LogDecision {
+        #[arg(long)]
+        title: String,
+        #[arg(long, default_value = "")]
+        context: String,
+        #[arg(long)]
+        decision: String,
+        #[arg(long, default_value = "")]
+        rationale: String,
+        #[arg(long, default_value = "resources/notes")]
+        namespace: String,
+    },
+    /// Save a typed Lesson.
+    LogLesson {
+        #[arg(long)]
+        title: String,
+        #[arg(long)]
+        lesson: String,
+        #[arg(long, default_value = "agent/lessons")]
+        namespace: String,
+    },
+    /// Save a typed Incident.
+    LogIncident {
+        #[arg(long)]
+        title: String,
+        #[arg(long)]
+        impact: String,
+        #[arg(long, default_value = "")]
+        resolution: String,
+        #[arg(long, default_value = "resources/incidents")]
+        namespace: String,
+    },
+    /// Save a free-form memory.
+    Remember {
+        text: String,
+        #[arg(long, default_value = "resources/notes")]
+        namespace: String,
+        /// valid-time start epoch-ms (default now); backdate when a fact became true
+        #[arg(long = "valid-from")]
+        valid_from: Option<i64>,
+        /// valid-time end epoch-ms (default open / still true)
+        #[arg(long = "valid-to")]
+        valid_to: Option<i64>,
+    },
+    /// Invalidate a record from a valid time onward (keeps history; distinct from forget).
+    Invalidate {
+        uri: String,
+        /// epoch-ms from which the fact stops being true
+        #[arg(long = "valid-to")]
+        valid_to: i64,
+    },
+    /// Recall memory for a query (human-readable).
+    Recall {
+        query: Vec<String>,
+        #[arg(long, default_value_t = 6)]
+        limit: usize,
+        /// Bitemporal: recall the store AS OF this system-time epoch-ms (what we believed then).
+        #[arg(long = "as-of", visible_alias = "as_of")]
+        as_of: Option<i64>,
+        /// Bitemporal: recall facts VALID AT this epoch-ms (what was true then); defaults to as-of.
+        #[arg(long = "valid-at", visible_alias = "valid_at")]
+        valid_at: Option<i64>,
+        /// Graph: also pull each hit's neighborhood within this many hops (default 1 - linked
+        /// records ride along, marked `linked`; 0 = content matches only; ignored when
+        /// --as-of/--valid-at is set).
+        #[arg(long, default_value_t = 1)]
+        expand: usize,
+    },
+    /// Show recent high-importance memory.
+    Recent {
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+    },
+    /// Show the full version lineage of a record (append-only history).
+    History {
+        uri: String,
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
+    /// Retract a record by uri: drop it from recall, keep its history.
+    Forget {
+        uri: String,
+    },
+    /// Link two records (the graph layer): from -[rel]-> to.
+    Link {
+        from: String,
+        to: String,
+        #[arg(long, default_value = "links")]
+        rel: String,
+    },
+    /// Remove an edge: from -[rel]-> to.
+    Unlink {
+        from: String,
+        to: String,
+        #[arg(long, default_value = "links")]
+        rel: String,
+    },
+    /// Show the edges touching a record (its graph connections).
+    Links {
+        uri: String,
+    },
+    /// Show the records reachable from a uri within N hops (its graph neighborhood).
+    Neighbors {
+        uri: String,
+        #[arg(long, default_value_t = 1)]
+        depth: usize,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
+    /// Rebuild edges from the [[name]] references in every record body (batch).
+    ReindexLinks,
+    /// Deterministic graph pass: link records to the entities they mention in plain text
+    /// (word-boundary, exact case). Adds `mentions` edges, distinct from curated `links`.
+    ReindexMentions {
+        /// Count what would be linked without writing any edges.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Re-embed every live record's body into the vector index, healing records whose embedding
+    /// predates an embedder fix (e.g. long bodies that overflowed bge's 512-token limit and were
+    /// stored as a zero vector). Idempotent.
+    ReindexEmbeddings,
+    /// Create or update a domain entity (a knowledge-graph node): org, engagement, product,
+    /// solution_stack, person, framework, site. Relate entities with `dmem link`.
+    Entity {
+        #[arg(long)]
+        kind: String,
+        #[arg(long)]
+        name: String,
+        /// repeatable key=value attribute (e.g. --attr role=principal --attr sector=private)
+        #[arg(long = "attr")]
+        attr: Vec<String>,
+        #[arg(long, default_value = "")]
+        desc: String,
+        #[arg(long, default_value = "resources/entities")]
+        namespace: String,
+    },
+    /// Save a typed Reminder.
+    AddReminder {
+        #[arg(long)]
+        title: String,
+        #[arg(long)]
+        text: String,
+        #[arg(long, default_value = "agent/reminders")]
+        namespace: String,
+    },
+    /// Save a typed Runbook (a procedure worth repeating).
+    LogRunbook {
+        #[arg(long)]
+        title: String,
+        #[arg(long)]
+        steps: String,
+        #[arg(long, default_value = "resources/runbooks")]
+        namespace: String,
+    },
+    /// Save a typed Convention (a standing rule).
+    LogConvention {
+        #[arg(long)]
+        title: String,
+        #[arg(long)]
+        rule: String,
+        #[arg(long, default_value = "resources/conventions")]
+        namespace: String,
+    },
+    /// Import a template/markdown file (or a directory of them) as memory records.
+    Import {
+        path: String,
+        /// re-import files even when unchanged since the last import (bypass the sha256
+        /// manifest; the store's idempotent put still deduplicates identical content)
+        #[arg(long)]
+        force: bool,
+    },
+    /// Migrate a daimon-memory v1 export (JSONL) into dm-lite. Needs --features client.
+    #[cfg(feature = "client")]
+    Migrate {
+        /// JSONL export file (or - for stdin)
+        #[arg(long)]
+        file: Option<String>,
+        /// v1 server URL to pull GET /admin/export from
+        #[arg(long)]
+        url: Option<String>,
+        /// v1 admin token (with --url)
+        #[arg(long)]
+        token: Option<String>,
+        /// trust a specific CA/self-signed cert (PEM path) for the v1 server (with --url)
+        #[arg(long = "ca-cert")]
+        ca_cert: Option<String>,
+    },
+    /// Template helpers (export the bundled defaults to edit).
+    #[command(subcommand)]
+    Template(TemplateCmd),
+    /// Manage SA skills as a queryable memory kind, projected into Claude Code (~/.claude/skills).
+    #[command(subcommand)]
+    Skills(SkillsCmd),
+    /// Show store + wiring status.
+    Status,
+    /// Diagnose readiness, especially for offline / air-gapped deploys: active embedder + model,
+    /// HuggingFace cache dir and whether the model is already cached, CPU features, and env.
+    Doctor {
+        /// Emit machine-parseable JSON instead of the human-readable report.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Run as an MCP stdio server (recall + typed save tools for MCP-aware agents).
+    Mcp,
+    /// Launch the optional local graph viewer (an embedded offline web page). Needs --features ui.
+    #[cfg(feature = "ui")]
+    Ui {
+        #[arg(long, default_value = "127.0.0.1:8088")]
+        addr: String,
+        /// also open it in your default browser
+        #[arg(long)]
+        open: bool,
+    },
+    /// Run the network API server (multi-token bearer -> tenant). Needs --features server.
+    #[cfg(feature = "server")]
+    Serve {
+        #[arg(long, default_value = "127.0.0.1:8077")]
+        addr: String,
+        /// TLS certificate (PEM); pair with --tls-key for HTTPS
+        #[arg(long = "tls-cert")]
+        tls_cert: Option<String>,
+        /// TLS private key (PEM)
+        #[arg(long = "tls-key")]
+        tls_key: Option<String>,
+        /// DANGEROUS: allow serving plain HTTP on a non-loopback address (token + memory
+        /// content travel cleartext). Without this flag, a public bind requires TLS.
+        #[arg(long = "allow-insecure-http")]
+        allow_insecure_http: bool,
+        /// DANGEROUS: keep serving with env tokens when the IAM database cannot be opened
+        /// (revocation/suspension is then NOT enforced). Without this flag, IAM failure
+        /// refuses to start.
+        #[arg(long = "allow-env-only")]
+        allow_env_only: bool,
+        /// generate a self-signed cert for HTTPS (saved under the data dir)
+        #[arg(long = "tls-generate")]
+        tls_generate: bool,
+        /// extra hostname or IP to put in the generated cert's SAN list (repeatable). Use the
+        /// name clients connect with, e.g. --tls-san dmem.example.net, so `ca_cert` pinning on
+        /// the client passes hostname verification.
+        #[arg(long = "tls-san")]
+        tls_san: Vec<String>,
+    },
+    /// Manage the local `dmem serve` daemon as an OS service (launchd/systemd). Needs --features server.
+    #[cfg(feature = "server")]
+    #[command(subcommand)]
+    Service(ServiceCmd),
+    /// Update dmem in place from GitHub Releases. Needs --features self-update.
+    #[cfg(feature = "self-update")]
+    Upgrade {
+        /// include pre-releases (rc/beta), not just stable
+        #[arg(long)]
+        pre: bool,
+        /// skip the confirmation prompt (signature verification still always runs)
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+    /// Connect this dmem to a remote server (writes the [server] config). Needs --features client.
+    #[cfg(feature = "client")]
+    Login {
+        url: String,
+        /// One-time member token. PREFER omitting it: dmem then reads $DM_LOGIN_TOKEN or
+        /// prompts on stdin - a positional token lands in shell history and `ps` output.
+        token: Option<String>,
+        /// trust a specific CA / self-signed server cert (PEM path). The file `dmem serve
+        /// --tls-generate` writes; TLS verification itself cannot be turned off.
+        #[arg(long = "ca-cert")]
+        ca_cert: Option<String>,
+    },
+    /// Disconnect from the remote server (clears [server]). Needs --features client.
+    #[cfg(feature = "client")]
+    Logout,
+    /// Admin (root token): manage tenants on a server. Needs --features client.
+    #[cfg(feature = "client")]
+    #[command(subcommand)]
+    Admin(AdminCmd),
+}
+
+#[cfg(feature = "server")]
+#[derive(Subcommand)]
+#[command(rename_all = "snake_case")]
+enum ServiceCmd {
+    /// Install + start `dmem serve` as a login service (writes the launchd/systemd unit + [server] config)
+    Install {
+        #[arg(long, default_value = "127.0.0.1:8077")]
+        addr: String,
+    },
+    /// Stop + remove the service unit
+    Uninstall,
+    /// Start the service
+    Start,
+    /// Stop the service (reclaims the model RAM)
+    Stop,
+    /// Restart the service
+    Restart,
+    /// Show whether the service is running
+    Status,
+}
+
+#[cfg(feature = "client")]
+#[derive(Subcommand)]
+#[command(rename_all = "snake_case")]
+enum AdminCmd {
+    /// Create a tenant and issue a one-time token.
+    Add {
+        tenant: String,
+        #[arg(long, default_value = "")]
+        label: String,
+        #[arg(long, default_value = "")]
+        display: String,
+        /// Per-agent identity for the token (persona selection + write attribution); omit for agent-less.
+        #[arg(long)]
+        agent: Option<String>,
+        /// Scope this token may READ (repeatable; global '' always rides along). Any scope
+        /// flag makes the token scope-bound; omit all three for a full-tenant token.
+        #[arg(long = "scope-read")]
+        scope_read: Vec<String>,
+        /// The single scope stamped on this token's WRITES. Omit on a scope-bound token for
+        /// a read-only token (global writes from scoped tokens are always forbidden).
+        #[arg(long = "scope-write")]
+        scope_write: Option<String>,
+        /// Adapter token: trusted to assert the reader's scope set per request
+        /// (X-DM-Scopes / X-DM-Write-Scope headers).
+        #[arg(long)]
+        adapter: bool,
+    },
+    /// List tenants and live token counts.
+    List,
+    /// Revoke a token (by value) or all of a tenant's tokens.
+    Revoke { target: String },
+    /// Suspend a tenant and revoke its tokens.
+    Rm { tenant: String },
+}
+
+#[derive(Subcommand)]
+#[command(rename_all = "snake_case")]
+enum TemplateCmd {
+    /// Write the bundled default templates to a directory to edit.
+    Export { dir: String },
+}
+
+#[derive(Subcommand)]
+#[command(rename_all = "snake_case")]
+enum SkillsCmd {
+    /// Import each <dir>/<name>/SKILL.md as a skill record (idempotent upsert).
+    Import { dir: String },
+    /// Materialize skill records to ~/.claude/skills/<name>/SKILL.md (overwrite).
+    Sync,
+    /// List skill records (name + first line of description).
+    List,
+}
+
+#[derive(Subcommand)]
+#[command(rename_all = "snake_case")]
+enum HookCmd {
+    /// SessionStart: inject persona/protocol + recent context.
+    SessionStart,
+    /// UserPromptSubmit: recall for the prompt (read from stdin JSON or arg).
+    UserPromptSubmit { prompt: Vec<String> },
+    /// SessionEnd: nudge to capture uncaptured decisions before the session ends.
+    SessionEnd,
+}
+
+fn main() {
+    if let Err(e) = run() {
+        eprintln!("dm: {:#}", e);
+        std::process::exit(1);
+    }
+}
+
+fn run() -> Result<()> {
+    let cli = Cli::parse();
+    // Fold the global --endpoint flag into DM_ENDPOINT before any config/server resolution, so the
+    // flag transparently overrides the env and the [server] config (see config::server_link).
+    if let Some(ep) = &cli.endpoint {
+        std::env::set_var("DM_ENDPOINT", ep);
+        // Warn (not fail) when no token will resolve: requests would be unauthenticated (a visible
+        // 401, not silent), but for CI/scripted ops this catches the missing DM_TOKEN early.
+        #[cfg(feature = "client")]
+        if config::server_link().map(|l| l.token.is_empty()).unwrap_or(false) {
+            eprintln!("dmem: --endpoint set but no token resolved (set DM_TOKEN or a [server].token); requests will be unauthenticated");
+        }
+    }
+    match cli.cmd {
+        #[cfg(feature = "wizard")]
+        Cmd::Setup => setup::run(),
+        Cmd::Bootstrap { devin, claude, codex, hermes, opencode, grok, claude_desktop, all, remove } => {
+            bootstrap::run_mode(devin || all, claude || all, codex || all, hermes || all, opencode || all, grok || all, claude_desktop || all, remove)
+        }
+        Cmd::Hook { event, hermes, raw } => match event {
+            HookCmd::SessionStart => hooks::session_start(hermes, raw),
+            HookCmd::UserPromptSubmit { prompt } => {
+                let arg = if prompt.is_empty() { None } else { Some(prompt.join(" ")) };
+                hooks::user_prompt_submit(arg, hermes, raw)
+            }
+            HookCmd::SessionEnd => hooks::session_end(raw),
+        },
+        Cmd::LogDecision { title, context, decision, rationale, namespace } => {
+            let uri = Memory::open()?.log_decision(&title, &context, &decision, &rationale, &namespace)?;
+            println!("stored {}", uri);
+            Ok(())
+        }
+        Cmd::LogLesson { title, lesson, namespace } => {
+            let uri = Memory::open()?.log_lesson(&title, &lesson, &namespace)?;
+            println!("stored {}", uri);
+            Ok(())
+        }
+        Cmd::LogIncident { title, impact, resolution, namespace } => {
+            let uri = Memory::open()?.log_incident(&title, &impact, &resolution, &namespace)?;
+            println!("stored {}", uri);
+            Ok(())
+        }
+        Cmd::Remember { text, namespace, valid_from, valid_to } => {
+            let uri = Memory::open()?.remember(&text, &namespace, valid_from, valid_to)?;
+            println!("stored {}", uri);
+            Ok(())
+        }
+        Cmd::Invalidate { uri, valid_to } => {
+            let n = Memory::open()?.invalidate(&uri, valid_to)?;
+            if n == 0 {
+                println!("nothing to invalidate for {}", uri);
+            } else {
+                println!("invalidated {} ({} segment{} ended at {})", uri, n, if n == 1 { "" } else { "s" }, valid_to);
+            }
+            Ok(())
+        }
+        Cmd::Recall { query, limit, as_of, valid_at, expand } => {
+            let q = query.join(" ");
+            let m = Memory::open()?;
+            let graph = if as_of.is_some() || valid_at.is_some() {
+                let now = entry::now_ms();
+                let sys = as_of.unwrap_or(now);
+                let val = valid_at.or(as_of).unwrap_or(now);
+                tools::RecallGraph { seeds: m.recall_as_of(&q, limit, sys, val)?, riders: Vec::new(), links: Vec::new() }
+            } else if expand > 0 {
+                m.recall_expanded_graph(&q, limit, expand)?
+            } else {
+                tools::RecallGraph { seeds: m.recall(&q, limit)?, riders: Vec::new(), links: Vec::new() }
+            };
+            if graph.seeds.is_empty() && graph.riders.is_empty() {
+                println!("(no matches for '{}')", q);
+            } else {
+                for e in &graph.seeds {
+                    println!("- ({}) {}  [{}]", e.kind.as_str(), e.title, e.uri);
+                }
+                for r in &graph.riders {
+                    if r.via.is_empty() {
+                        println!("- ({}, linked) {}  [{}]", r.entry.kind.as_str(), r.entry.title, r.entry.uri);
+                    } else {
+                        println!(
+                            "- ({}, linked, hop {}, score {:.2}, via {}) {}  [{}]",
+                            r.entry.kind.as_str(),
+                            r.hop,
+                            r.score,
+                            r.via,
+                            r.entry.title,
+                            r.entry.uri
+                        );
+                    }
+                }
+                for e in &graph.links {
+                    println!("  edge: {} -[{}]-> {}", e.from_uri, e.rel, e.to_uri);
+                }
+            }
+            Ok(())
+        }
+        Cmd::Link { from, to, rel } => {
+            Memory::open()?.link(&from, &to, &rel)?;
+            println!("linked {} -[{}]-> {}", from, rel, to);
+            Ok(())
+        }
+        Cmd::Unlink { from, to, rel } => {
+            let n = Memory::open()?.unlink(&from, &to, &rel)?;
+            if n == 0 {
+                println!("no such edge: {} -[{}]-> {}", from, rel, to);
+            } else {
+                println!("unlinked {} -[{}]-> {}", from, rel, to);
+            }
+            Ok(())
+        }
+        Cmd::Links { uri } => {
+            let edges = Memory::open()?.edges_of(&uri)?;
+            if edges.is_empty() {
+                println!("(no edges for {})", uri);
+            } else {
+                for e in edges {
+                    if e.from_uri == uri {
+                        println!("-> [{}] {}", e.rel, e.to_uri);
+                    } else {
+                        println!("<- [{}] {}", e.rel, e.from_uri);
+                    }
+                }
+            }
+            Ok(())
+        }
+        Cmd::Neighbors { uri, depth, limit } => {
+            let uris = Memory::open()?.neighbors(&[uri.clone()], depth, limit)?;
+            if uris.is_empty() {
+                println!("(no neighbors for {} within {} hop{})", uri, depth, if depth == 1 { "" } else { "s" });
+            } else {
+                for u in uris {
+                    println!("- {}", u);
+                }
+            }
+            Ok(())
+        }
+        Cmd::ReindexLinks => {
+            let (n, pruned) = Memory::open()?.reindex_links()?;
+            println!(
+                "reindexed: {} [[link]] reference{} linked, {} dangling edge{} pruned",
+                n,
+                if n == 1 { "" } else { "s" },
+                pruned,
+                if pruned == 1 { "" } else { "s" }
+            );
+            Ok(())
+        }
+        Cmd::ReindexMentions { dry_run } => {
+            let (found, added) = Memory::open()?.reindex_mentions(dry_run)?;
+            let verb = if dry_run { "would add" } else { "added" };
+            println!("mention pairs: {found}; {verb} {added} new `mentions` edge{}", if added == 1 { "" } else { "s" });
+            Ok(())
+        }
+        Cmd::ReindexEmbeddings => {
+            #[cfg(feature = "zvec")]
+            {
+                let (total, long) = Memory::open()?.reindex_embeddings()?;
+                println!(
+                    "re-embedded {total} live record{} ({long} over 2048 bytes)",
+                    if total == 1 { "" } else { "s" }
+                );
+                Ok(())
+            }
+            #[cfg(not(feature = "zvec"))]
+            {
+                println!("built without zvec; no vector index to reindex");
+                Ok(())
+            }
+        }
+        Cmd::Entity { kind, name, attr, desc, namespace } => {
+            let k = entry::Kind::from_str(&kind).filter(|k| k.is_entity()).ok_or_else(|| {
+                anyhow::anyhow!("not an entity kind: '{kind}' (use org/engagement/product/solution_stack/person/framework/site)")
+            })?;
+            let attrs: Vec<(String, String)> = attr
+                .iter()
+                .filter_map(|a| a.split_once('=').map(|(k, v)| (k.trim().to_string(), v.trim().to_string())))
+                .collect();
+            let body = tools::entity_body(k, &name, &attrs, &desc);
+            let uri = Memory::open()?.import_record(k, &namespace, &name, &body)?;
+            println!("entity stored {}", uri);
+            Ok(())
+        }
+        Cmd::Recent { limit } => {
+            for e in Memory::open()?.recent(limit)? {
+                println!("- ({}) {}  [{}]", e.kind.as_str(), e.title, e.uri);
+            }
+            Ok(())
+        }
+        Cmd::History { uri, limit } => {
+            let versions = Memory::open()?.history(&uri, limit)?;
+            if versions.is_empty() {
+                println!("(no record for '{}')", uri);
+            } else {
+                for (i, e) in versions.iter().enumerate() {
+                    let sys_to = e.system_to_ms.map(|t| t.to_string()).unwrap_or_else(|| "current".into());
+                    let val_to = e.valid_to_ms.map(|t| t.to_string()).unwrap_or_else(|| "open".into());
+                    println!(
+                        "- [v{}] ({}) {}  sys[{}..{}] valid[{}..{}]",
+                        versions.len() - i, e.kind.as_str(), e.title,
+                        e.system_from_ms, sys_to, e.valid_from_ms, val_to
+                    );
+                }
+            }
+            Ok(())
+        }
+        Cmd::AddReminder { title, text, namespace } => {
+            let uri = Memory::open()?.add_reminder(&title, &text, &namespace)?;
+            println!("stored {}", uri);
+            Ok(())
+        }
+        Cmd::LogRunbook { title, steps, namespace } => {
+            let uri = Memory::open()?.log_runbook(&title, &steps, &namespace)?;
+            println!("stored {}", uri);
+            Ok(())
+        }
+        Cmd::LogConvention { title, rule, namespace } => {
+            let uri = Memory::open()?.log_convention(&title, &rule, &namespace)?;
+            println!("stored {}", uri);
+            Ok(())
+        }
+        Cmd::Forget { uri } => {
+            let n = Memory::open()?.forget(&uri)?;
+            if n == 0 {
+                println!("nothing to forget for {}", uri);
+            } else {
+                println!("forgot {} ({} version{} retired, history kept)", uri, n, if n == 1 { "" } else { "s" });
+            }
+            Ok(())
+        }
+        Cmd::Import { path, force } => {
+            let m = Memory::open()?;
+            // sha256 manifest : skip files unchanged since the last
+            // import - saves the parse, the network round-trip, and the server-side embedding
+            // per record. Purely an optimization: --force (or a lost manifest) falls back to
+            // the store's idempotent put.
+            let mut manifest = config::import_manifest_load();
+            let p = std::path::Path::new(&path);
+            let (root, mut files) = if p.is_dir() {
+                let mut v = Vec::new();
+                collect_md(p, &mut v)?;
+                (p.to_path_buf(), v)
+            } else {
+                (p.parent().map(|x| x.to_path_buf()).unwrap_or_default(), vec![p.to_path_buf()])
+            };
+            files.sort();
+            if files.is_empty() {
+                println!("no .md files at {}", p.display());
+                return Ok(());
+            }
+            let (mut ok, mut skipped, mut unchanged) = (0usize, 0usize, 0usize);
+            for f in &files {
+                let text = match std::fs::read_to_string(f) {
+                    Ok(t) => t,
+                    Err(_) => { skipped += 1; continue; }
+                };
+                let fkey = f.canonicalize().unwrap_or_else(|_| f.clone()).display().to_string();
+                let fhash = config::sha256_hex_bytes(text.as_bytes());
+                if !force && manifest.get(&fkey) == Some(&fhash) {
+                    unchanged += 1;
+                    continue;
+                }
+                // our templates carry frontmatter; arbitrary markdown (an Obsidian vault) does
+                // not, so fall back to inferring kind/namespace/title from the file.
+                let (kind, ns, title, body) = match entry::parse_frontmatter(&text) {
+                    Ok(r) => r,
+                    Err(_) => infer_record(&root, f, &text),
+                };
+                if title.trim().is_empty() {
+                    skipped += 1;
+                    continue;
+                }
+                match m.import_record(kind, &ns, &title, &body) {
+                    Ok(uri) => {
+                        ok += 1;
+                        manifest.insert(fkey, fhash);
+                        println!("imported {} ({}) -> {}", f.file_name().and_then(|n| n.to_str()).unwrap_or("?"), kind.as_str(), uri);
+                    }
+                    Err(e) => { skipped += 1; eprintln!("skip {}: {e}", f.display()); }
+                }
+            }
+            config::import_manifest_save(&manifest);
+            println!("imported {ok}, unchanged {unchanged} (manifest), skipped {skipped}");
+            Ok(())
+        }
+        #[cfg(feature = "client")]
+        Cmd::Migrate { file, url, token, ca_cert } => migrate::run(file, url, token, ca_cert),
+        Cmd::Template(TemplateCmd::Export { dir }) => {
+            let d = std::path::Path::new(&dir);
+            std::fs::create_dir_all(d)?;
+            for (name, content) in TPL_FILES {
+                std::fs::write(d.join(name), content)?;
+            }
+            println!("wrote {} templates to {}", TPL_FILES.len(), d.display());
+            println!("edit persona.md (fill the <PLACEHOLDERS>), then:  dmem import {}", d.display());
+            Ok(())
+        }
+        Cmd::Skills(s) => match s {
+            SkillsCmd::Import { dir } => skills::import(&dir),
+            SkillsCmd::Sync => skills::sync(),
+            SkillsCmd::List => skills::list(),
+        },
+        Cmd::Status => status(),
+        Cmd::Doctor { json } => doctor(json),
+        Cmd::Mcp => mcp::serve(),
+        #[cfg(feature = "ui")]
+        Cmd::Ui { addr, open } => ui::run(&addr, open),
+        #[cfg(feature = "server")]
+        Cmd::Serve { addr, tls_cert, tls_key, tls_generate, tls_san, allow_insecure_http, allow_env_only } => {
+            server::run_blocking(
+                &addr,
+                server::TlsOpts { cert: tls_cert, key: tls_key, generate: tls_generate, sans: tls_san },
+                server::HardeningOpts { allow_insecure_http, allow_env_only },
+            )
+        }
+        #[cfg(feature = "server")]
+        Cmd::Service(s) => match s {
+            ServiceCmd::Install { addr } => service::install(&addr),
+            ServiceCmd::Uninstall => service::uninstall(),
+            ServiceCmd::Start => service::start(),
+            ServiceCmd::Stop => service::stop(),
+            ServiceCmd::Restart => service::restart(),
+            ServiceCmd::Status => service::status(),
+        },
+        #[cfg(feature = "self-update")]
+        Cmd::Upgrade { pre, yes } => upgrade::run(pre, yes),
+        #[cfg(feature = "client")]
+        Cmd::Login { url, token, ca_cert } => {
+            // Token sourcing ladder (audit High #3): flag-less env var, then an stdin prompt.
+            // The positional form still works but is discouraged - it leaks via shell history
+            // and process listings.
+            let token = match token {
+                Some(t) => {
+                    eprintln!("dmem login: NOTE - passing the token as an argument leaks it into shell history/ps; prefer $DM_LOGIN_TOKEN or the interactive prompt.");
+                    t
+                }
+                None => match std::env::var("DM_LOGIN_TOKEN").ok().filter(|t| !t.trim().is_empty()) {
+                    Some(t) => t.trim().to_string(),
+                    None => {
+                        eprint!("token: ");
+                        let mut buf = String::new();
+                        std::io::stdin().read_line(&mut buf)?;
+                        let t = buf.trim().to_string();
+                        if t.is_empty() {
+                            anyhow::bail!("no token provided (set $DM_LOGIN_TOKEN or paste it at the prompt)");
+                        }
+                        t
+                    }
+                },
+            };
+            client::login(&url, &token, ca_cert)
+        }
+        #[cfg(feature = "client")]
+        Cmd::Logout => client::logout(),
+        #[cfg(feature = "client")]
+        Cmd::Admin(a) => {
+            let link = config::server_link().ok_or_else(|| {
+                anyhow::anyhow!("no [server] in config; run `dmem login <url> <admin-token>` first")
+            })?;
+            let rc = client::RemoteClient::new(link)?;
+            match a {
+                AdminCmd::Add { tenant, label, display, agent, scope_read, scope_write, adapter } => {
+                    let (t, tok) =
+                        rc.admin_add(&tenant, &label, &display, agent.as_deref(), &scope_read, scope_write.as_deref(), adapter)?;
+                    let scoped = !scope_read.is_empty() || scope_write.is_some() || adapter;
+                    match (&agent, scoped) {
+                        (Some(a), false) => println!("created tenant '{t}' (token agent: {a}). one-time token (save it now, shown once):"),
+                        (None, false) => println!("created tenant '{t}'. one-time token (save it now, shown once):"),
+                        (_, true) => println!(
+                            "minted scope-bound token for tenant '{t}' (read: [{}], write: {}, adapter: {adapter}). one-time token (save it now, shown once):",
+                            scope_read.join(", "),
+                            scope_write.as_deref().map(|s| if s.is_empty() { "'' (global)" } else { s }.to_string()).unwrap_or_else(|| "none (read-only)".into()),
+                        ),
+                    }
+                    println!("    {tok}");
+                    println!("the user runs:  dmem login {} {tok}", link.url);
+                }
+                AdminCmd::List => {
+                    if let Some(arr) = rc.admin_list()?.as_array() {
+                        for row in arr {
+                            let agents = row.get("agents").and_then(|x| x.as_str()).unwrap_or("");
+                            println!(
+                                "- {:<20} {:<10} {} token(s){}",
+                                row.get("tenant").and_then(|x| x.as_str()).unwrap_or("?"),
+                                row.get("status").and_then(|x| x.as_str()).unwrap_or("?"),
+                                row.get("tokens").and_then(|x| x.as_i64()).unwrap_or(0),
+                                if agents.is_empty() { String::new() } else { format!("  agents: {agents}") }
+                            );
+                        }
+                    }
+                }
+                AdminCmd::Revoke { target } => println!("revoked {} token(s)", rc.admin_revoke(&target)?),
+                AdminCmd::Rm { tenant } => {
+                    rc.admin_rm(&tenant)?;
+                    println!("removed tenant {tenant}");
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Recursively collect `.md` files under `dir`, skipping hidden dirs (e.g. `.obsidian`).
+fn collect_md(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) -> Result<()> {
+    for e in std::fs::read_dir(dir)? {
+        let p = e?.path();
+        if p.is_dir() {
+            let hidden = p.file_name().and_then(|n| n.to_str()).map(|n| n.starts_with('.')).unwrap_or(false);
+            if !hidden {
+                collect_md(&p, out)?;
+            }
+        } else if p.extension().map(|x| x == "md").unwrap_or(false) {
+            out.push(p);
+        }
+    }
+    Ok(())
+}
+
+/// Infer a record from a plain markdown file (no frontmatter): title from the first `# H1`
+/// (else the filename), namespace from the folder path under `root`, kind defaults to memory.
+fn infer_record(root: &std::path::Path, file: &std::path::Path, content: &str) -> (entry::Kind, String, String, String) {
+    let title = content
+        .lines()
+        .find_map(|l| l.strip_prefix("# ").map(|s| s.trim().to_string()))
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| file.file_stem().and_then(|s| s.to_str()).unwrap_or("untitled").to_string());
+    let folders = file
+        .strip_prefix(root)
+        .ok()
+        .and_then(|p| p.parent())
+        .map(|p| p.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_default();
+    let folders = folders
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_lowercase().replace(' ', "-"))
+        .collect::<Vec<_>>()
+        .join("/");
+    let ns = if folders.is_empty() { "resources/notes".to_string() } else { format!("resources/{folders}") };
+    (entry::Kind::Memory, ns, title, content.to_string())
+}
+
+fn wired(config_path: &std::path::Path, needle: &str) -> &'static str {
+    match std::fs::read_to_string(config_path) {
+        Ok(s) if s.contains(needle) => "wired",
+        Ok(_) => "present, not wired",
+        Err(_) => "not found",
+    }
+}
+
+fn status() -> Result<()> {
+    println!("dmem {} - daimon-memory v2", env!("CARGO_PKG_VERSION"));
+    #[cfg(feature = "client")]
+    if let Some(link) = config::server_link() {
+        let m = Memory::open()?;
+        println!("mode   : remote client");
+        println!("server : {}", link.url);
+        println!("recall : {}", m.recall_mode());
+        return Ok(());
+    }
+    let tenant = config::tenant();
+    let db = config::db_path(&tenant)?;
+    println!("mode   : embedded (local fallback, deprecated; run `dmem setup` for client/server)");
+    println!("tenant : {}", tenant);
+    println!("store  : {}", db.display());
+    let m = Memory::open()?;
+    let counts = m.counts()?;
+    let total: usize = counts.iter().map(|(_, n)| n).sum();
+    println!("records: {} live", total);
+    println!("recall : {}", m.recall_mode());
+    for (k, n) in counts {
+        println!("  {:<18} {}", k, n);
+    }
+    if let Some(h) = dirs::home_dir() {
+        println!("devin  : {}", wired(&h.join(".config/devin/config.json"), "dmem hook"));
+        println!("claude : {}", wired(&h.join(".claude/settings.json"), "dmem hook"));
+        // OpenCode merges config.json < opencode.json < opencode.jsonc; probe the winner.
+        let oc = ["opencode.jsonc", "opencode.json", "config.json"]
+            .iter()
+            .map(|f| h.join(".config/opencode").join(f))
+            .find(|p| p.exists());
+        match oc {
+            Some(p) => println!("opencode: {}", wired(&p, "dmem")),
+            None => println!("opencode: not found"),
+        }
+    }
+    Ok(())
+}
+
+/// Readiness diagnostics, especially for offline / air-gapped deploys. Reports the embedder that
+/// WOULD load, its HuggingFace cache dir and whether the model is already cached, CPU features, and
+/// any DM_/HF_ env overrides, WITHOUT loading the model (so it never triggers a download).
+fn doctor(json: bool) -> Result<()> {
+    let d = crate::embedder::active_embedder_diag();
+
+    #[cfg(feature = "client")]
+    let server_url = config::server_link().map(|l| l.url.clone());
+    #[cfg(not(feature = "client"))]
+    let server_url: Option<String> = None;
+    let mode = if server_url.is_some() { "remote client" } else { "embedded" };
+    // A remote client never loads the embedder: recall/save go over HTTPS and the server embeds.
+    // The embedder section below is capability info for serve/embedded/air-gapped use only.
+    let embedder_used = server_url.is_none();
+
+    let tenant = config::tenant();
+    let store = config::db_path(&tenant).ok().map(|p| p.display().to_string());
+
+    #[cfg(target_arch = "x86_64")]
+    let avx2 = if std::is_x86_feature_detected!("avx2") { "yes" } else { "no" };
+    #[cfg(not(target_arch = "x86_64"))]
+    let avx2 = "n/a (non-x86)";
+
+    let cache_dir = d.cache_dir.as_ref().map(|p| p.display().to_string());
+    let needs_network = embedder_used && d.neural && !d.cache_present;
+    let env: Vec<(&str, String)> = ["HF_HOME", "HUGGINGFACE_HUB_CACHE", "DM_CANDLE_MODEL", "DM_M2V_MODEL", "DM_CANDLE_F16", "DM_ENDPOINT", "DM_RECALL_FLOOR", "DM_RECALL_EXPAND"]
+        .iter()
+        .filter_map(|k| std::env::var(k).ok().map(|v| (*k, v)))
+        .collect();
+
+    if json {
+        let obj = serde_json::json!({
+            "version": env!("CARGO_PKG_VERSION"),
+            "mode": mode,
+            "server": server_url,
+            "tenant": tenant,
+            "store": store,
+            "embedder": d.name,
+            "embedder_used": embedder_used,
+            "model": d.model_id,
+            "neural": d.neural,
+            "model_cache": cache_dir,
+            "model_cached": d.cache_present,
+            "first_run_needs_network": needs_network,
+            "avx2": avx2,
+            "env": env.iter().map(|(k, v)| (k.to_string(), v.clone())).collect::<std::collections::BTreeMap<_, _>>(),
+        });
+        println!("{}", serde_json::to_string_pretty(&obj)?);
+        return Ok(());
+    }
+
+    println!("dmem {} - doctor", env!("CARGO_PKG_VERSION"));
+    println!("mode        : {mode}");
+    if let Some(u) = &server_url {
+        println!("server      : {u}");
+    }
+    println!("tenant      : {tenant}");
+    if let Some(s) = &store {
+        println!("store       : {s}");
+    }
+    let embedder_suffix = if !embedder_used {
+        " (unused in remote client mode; embedding runs on the server)"
+    } else if d.neural {
+        ""
+    } else {
+        " (placeholder, no real semantics)"
+    };
+    println!("embedder    : {}{embedder_suffix}", d.name);
+    if let Some(m) = &d.model_id {
+        println!("model       : {m}");
+    }
+    if d.neural {
+        println!("model_cache : {}", cache_dir.as_deref().unwrap_or("unknown"));
+        let cached = if d.cache_present {
+            "yes"
+        } else if embedder_used {
+            "NO (first run downloads ~130 MB, needs network)"
+        } else {
+            "no (not needed in remote client mode)"
+        };
+        println!("model_cached: {cached}");
+        let offline = if !embedder_used {
+            "n/a (remote client; offline readiness depends on the server, not the model cache)"
+        } else if d.cache_present {
+            "yes"
+        } else {
+            "no - pre-populate the cache (README: Offline / air-gapped)"
+        };
+        println!("offline_ok  : {offline}");
+    }
+    println!("avx2        : {avx2}");
+    if env.is_empty() {
+        println!("env         : (no DM_/HF_ overrides set)");
+    } else {
+        println!("env         :");
+        for (k, v) in &env {
+            println!("  {k} = {v}");
+        }
+    }
+    Ok(())
+}

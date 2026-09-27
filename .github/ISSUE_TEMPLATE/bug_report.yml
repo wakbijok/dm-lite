@@ -1,0 +1,69 @@
+name: Bug report
+description: Something is broken in dmem / dm-lite
+title: "bug: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Search existing issues first. For security problems use the private path in SECURITY.md, not this form.
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Output of `dmem --version` or the release tag.
+      placeholder: "dmem 0.3.0"
+    validations:
+      required: true
+  - type: dropdown
+    id: install
+    attributes:
+      label: How did you install?
+      options:
+        - GitHub release binary (dist)
+        - Built from source (features below)
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: features
+    attributes:
+      label: Cargo features (if built from source)
+      placeholder: "dist / candle,server,client / …"
+  - type: dropdown
+    id: mode
+    attributes:
+      label: Run mode
+      options:
+        - Local dmem serve (same machine)
+        - Remote client against a host
+        - Unsure
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: Expected vs actual.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: Minimal commands or config.
+      placeholder: |
+        1. dmem serve …
+        2. dmem recall …
+    validations:
+      required: true
+  - type: textarea
+    id: doctor
+    attributes:
+      label: dmem doctor (optional)
+      description: Paste `dmem doctor` or `dmem doctor --json` if relevant.
+  - type: textarea
+    id: os
+    attributes:
+      label: OS / arch
+      placeholder: "Debian 13 x86_64 / macOS arm64 / Windows …"

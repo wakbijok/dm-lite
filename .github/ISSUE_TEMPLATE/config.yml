@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Documentation (wiki)
+    url: https://github.com/wakbijok/dm-lite/wiki
+    about: Install, wiring agents, server/client, embedding models.
+  - name: Security report (private)
+    url: https://github.com/wakbijok/dm-lite/security/advisories/new
+    about: Vulnerabilities only. Do not file public issues for security.

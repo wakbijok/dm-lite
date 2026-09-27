@@ -1,0 +1,523 @@
+//! Paths, config file, and tenant resolution. The model is client/server: a `[server]` block puts
+//! the binary in remote-client mode (it talks to a `dmem serve`, local loopback or remote; server
+//! mode selects the tenant per request). Without one it falls back to the deprecated embedded mode
+//! (one local tenant). One database file per tenant.
+
+use anyhow::{anyhow, Result};
+use serde::Deserialize;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+
+/// The on-disk config (`~/.config/dmem/config.toml`, or `$DM_CONFIG`). All fields optional;
+/// an absent file means the deprecated embedded fallback with defaults (prefer a `[server]` block).
+#[derive(Debug, Default, Deserialize)]
+pub struct Config {
+    pub data_dir: Option<String>,
+    pub tenant: Option<String>,
+    /// Presence of this block puts the binary in remote-client mode.
+    pub server: Option<ServerLink>,
+}
+
+/// How a client reaches a remote `dmem serve`. Fields are read by the remote-client path.
+#[derive(Debug, Clone, Deserialize)]
+#[cfg_attr(not(feature = "client"), allow(dead_code))]
+pub struct ServerLink {
+    pub url: String,
+    pub token: String,
+    /// Legacy switch that disabled TLS verification. No longer honoured: the client refuses to
+    /// start while it is set (see `client::INSECURE_REFUSED`). Still parsed so an old config gets
+    /// that message instead of an unexplained certificate error. Pin the cert with `ca_cert`.
+    #[serde(default)]
+    pub insecure: bool,
+    /// Trust a specific CA / self-signed cert (PEM path) instead of the system roots.
+    pub ca_cert: Option<String>,
+}
+
+static CONFIG: OnceLock<Config> = OnceLock::new();
+
+/// Path to the config file: `$DM_CONFIG`, else `<config-dir>/dmem/config.toml`.
+pub fn config_path() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("DM_CONFIG") {
+        return Some(PathBuf::from(p));
+    }
+    dirs::config_dir().map(|d| d.join("dmem").join("config.toml"))
+}
+
+/// The loaded config (cached). An ABSENT/unreadable file is fine (the embedded fallback with
+/// defaults). A file that is PRESENT but invalid TOML is fatal: silently falling back to embedded
+/// would route reads/writes to the wrong (local) store while the user believes they are connected
+/// to a server. We never echo the file body in the error (it may hold a bearer token); only the
+/// parse position is reported.
+pub fn config() -> &'static Config {
+    CONFIG.get_or_init(load_config)
+}
+
+fn load_config() -> Config {
+    let Some(path) = config_path() else {
+        return Config::default();
+    };
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(_) => return Config::default(), // absent or unreadable -> embedded fallback
+    };
+    match toml::from_str::<Config>(&raw) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!(
+                "dmem: config at {} is present but not valid TOML (at {}). Refusing to fall back \
+                 to local storage; fix it or re-run `dmem login` / `dmem setup`.",
+                path.display(),
+                parse_position(&raw, &e)
+            );
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Line/column of a TOML parse error, computed from the byte span WITHOUT printing any file
+/// content (the file may contain a bearer token).
+fn parse_position(raw: &str, e: &toml::de::Error) -> String {
+    match e.span() {
+        Some(span) => {
+            let upto = &raw[..span.start.min(raw.len())];
+            let line = upto.bytes().filter(|&b| b == b'\n').count() + 1;
+            let col = upto.len() - upto.rfind('\n').map(|i| i + 1).unwrap_or(0) + 1;
+            format!("line {line}, column {col}")
+        }
+        None => "unknown position".to_string(),
+    }
+}
+
+/// A token is safe to interpolate into config/unit files if it is non-empty and limited to the
+/// opaque-token charset dmem mints (`dmem_<hex>`) plus `-`. Rejects quotes, whitespace, and
+/// control characters that could break TOML/plist/systemd or inject extra directives.
+pub fn is_safe_token(s: &str) -> bool {
+    !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// Write a file that holds a secret (bearer token) with 0600 from the start. Writes to a sibling
+/// temp file opened 0600, then atomically renames over the target, so there is no window where the
+/// secret is readable at the default umask (the previous write-then-chmod had a TOCTOU gap).
+pub fn write_secret(path: &Path, contents: &str) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "secret".into());
+        let tmp = path.with_file_name(format!(".{name}.tmp.{}", std::process::id()));
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        f.write_all(contents.as_bytes())?;
+        f.sync_all().ok();
+        std::fs::rename(&tmp, path)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, contents)
+    }
+}
+
+#[cfg_attr(not(feature = "client"), allow(dead_code))]
+static SERVER_LINK: OnceLock<Option<ServerLink>> = OnceLock::new();
+
+/// The remote server link, if remote-client mode is selected. Each field resolves independently:
+/// url = `$DM_ENDPOINT` (set by the global `--endpoint` flag for CI/automation) else config
+/// `[server].url`; token = `$DM_TOKEN` else config `[server].token`; `insecure`/`ca_cert` from the
+/// config. Returns None (embedded mode) only when neither an endpoint nor a `[server]` block exists.
+/// Cached: the env is read once, after `--endpoint` has been folded into `DM_ENDPOINT` in `main`.
+#[cfg_attr(not(feature = "client"), allow(dead_code))]
+pub fn server_link() -> Option<&'static ServerLink> {
+    SERVER_LINK
+        .get_or_init(|| {
+            resolve_server_link(
+                std::env::var("DM_ENDPOINT").ok().filter(|s| !s.trim().is_empty()),
+                std::env::var("DM_TOKEN").ok().filter(|s| !s.trim().is_empty()),
+                config().server.clone(),
+            )
+        })
+        .as_ref()
+}
+
+/// Pure precedence resolver for the server link (unit-tested). url = endpoint else config; token =
+/// token_env else config; insecure/ca_cert from config. None only when neither is present.
+#[cfg_attr(not(feature = "client"), allow(dead_code))]
+fn resolve_server_link(endpoint: Option<String>, token_env: Option<String>, cfg: Option<ServerLink>) -> Option<ServerLink> {
+    match (endpoint, cfg) {
+        (Some(url), cfg) => Some(ServerLink {
+            url,
+            token: token_env.or_else(|| cfg.as_ref().map(|s| s.token.clone())).unwrap_or_default(),
+            insecure: cfg.as_ref().map(|s| s.insecure).unwrap_or(false),
+            ca_cert: cfg.and_then(|s| s.ca_cert),
+        }),
+        (None, Some(cfg)) => Some(ServerLink { token: token_env.unwrap_or(cfg.token), ..cfg }),
+        (None, None) => None,
+    }
+}
+
+/// Base data dir: $DM_DATA_DIR, else config `data_dir`, else ~/.local/share/dm, else ~/.dm.
+pub fn data_dir() -> Result<PathBuf> {
+    if let Ok(d) = std::env::var("DM_DATA_DIR") {
+        return Ok(PathBuf::from(d));
+    }
+    if let Some(d) = &config().data_dir {
+        return Ok(PathBuf::from(d));
+    }
+    if let Some(d) = dirs::data_dir() {
+        return Ok(d.join("dm"));
+    }
+    if let Some(h) = dirs::home_dir() {
+        return Ok(h.join(".dm"));
+    }
+    Err(anyhow!("could not resolve a data directory"))
+}
+
+/// Claude Code skills dir: `$DM_CLAUDE_DIR/skills` (a test/CI seam), else `~/.claude/skills`.
+/// Reuses the same `dirs::home_dir()` helper as `data_dir()`/`status`/`bootstrap`, not `$HOME`.
+pub fn claude_skills_dir() -> Result<PathBuf> {
+    if let Ok(d) = std::env::var("DM_CLAUDE_DIR") {
+        return Ok(PathBuf::from(d).join("skills"));
+    }
+    dirs::home_dir()
+        .map(|h| h.join(".claude").join("skills"))
+        .ok_or_else(|| anyhow!("could not resolve home directory for ~/.claude/skills"))
+}
+
+/// Canonical tenant identity: lowercased and restricted to [a-z0-9_-]; empty -> "default".
+/// Used by BOTH auth and path derivation so one logical tenant maps to exactly one store
+/// regardless of case or punctuation (tenant names are case-insensitive), and so the record
+/// store and its vector index never diverge.
+pub fn canonical_tenant(raw: &str) -> String {
+    let safe: String = raw
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect();
+    if safe.is_empty() {
+        "default".to_string()
+    } else {
+        safe
+    }
+}
+
+/// Canonical per-agent identity label: the tenant alphabet (lowercased [a-z0-9_-]) so an agent
+/// maps to exactly one `agents/<agent>/` namespace regardless of case, but empty means "no
+/// agent" (None) rather than a default. Used by token minting, env-token parsing, and the
+/// per-agent persona query, so all three agree on what an agent is called.
+pub fn canonical_agent(raw: &str) -> Option<String> {
+    let safe: String = raw
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect();
+    if safe.is_empty() {
+        None
+    } else {
+        Some(safe)
+    }
+}
+
+/// Database file for a tenant. Database-per-tenant: physical isolation per tenant.
+pub fn db_path(tenant: &str) -> Result<PathBuf> {
+    let dir = data_dir()?.join("tenants");
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir.join(format!("{}.db", canonical_tenant(tenant))))
+}
+
+/// Per-tenant vector-index directory (zvec). Same canonical tenant as `db_path`, so the
+/// SQLite record store and its vector index for a tenant always co-locate consistently.
+#[cfg_attr(not(feature = "zvec"), allow(dead_code))]
+pub fn vector_dir(tenant: &str) -> Result<PathBuf> {
+    Ok(data_dir()?.join("vectors").join(canonical_tenant(tenant)))
+}
+
+/// Resolve the active tenant: $DM_TENANT, else config `tenant`, else "default".
+pub fn tenant() -> String {
+    std::env::var("DM_TENANT")
+        .ok()
+        .or_else(|| config().tenant.clone())
+        .unwrap_or_else(|| "default".to_string())
+}
+
+/// Recall relevance-floor settings: the precision gate that stops recall from injecting a fixed
+/// count of weak/irrelevant hits. Thresholds are on the underlying CHANNEL MAGNITUDES (cosine for
+/// the vector channel, `-bm25` for the keyword channel), both "higher = better"; a hit survives a
+/// channel iff it clears the absolute floor AND a relative-to-top ratio.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RecallFloor {
+    pub enabled: bool,
+    /// Absolute cosine-similarity floor for the vector channel (bge-small scale).
+    pub abs_cosine: f64,
+    /// Absolute keyword (`-bm25`) floor for the keyword channel.
+    pub abs_keyword: f64,
+    /// Keep a hit only if its magnitude is >= this fraction of the channel's top magnitude.
+    pub rel_ratio: f64,
+}
+
+impl RecallFloor {
+    /// Conservative defaults, calibrated by the `floor_eval` harness (Step B) on the bge-small
+    /// (candle) production embedder, validated on a held-out split.
+    ///
+    /// `abs_cosine = 0.62`: cosine is bounded [-1,1] and corpus-INDEPENDENT, so an absolute floor on
+    /// it is robust and IS the real precision gate. The harness measured off-topic queries topping
+    /// out at ~0.61 cosine while on-topic clusters sit at ~0.74+, so 0.62 makes off-topic inject
+    /// ZERO while held-out cluster recall stayed 1.0 with zero junk; it also kept a zero-keyword-
+    /// overlap paraphrase (semantic recall where bm25 is silent). Cosine is the floor in hybrid -
+    /// the keyword channel cannot bypass it, so a shared common word can't drag in off-topic junk.
+    ///
+    /// `abs_keyword = 0.0`: bm25 is unbounded and corpus-RELATIVE (a constant suiting a 468-record
+    /// store is far too high for a tiny one), so the keyword channel gates on the scale-free
+    /// relative-to-top ratio only; it is the floor solely in keyword-only builds (no cosine).
+    ///
+    /// `rel_ratio = 0.45`: relaxed below the sweep's min-junk pick (0.70, the upper bound of the
+    /// swept [0.20, 0.70] range, not a proven optimum beyond it) to favor recall - the
+    /// absolute cosine floor already delivers off-topic-zero, so the relative gate is a gentle tail
+    /// trim, not the guarantee. The placeholder HashEmbedder disables the absolute cosine gate at
+    /// the call site (its cosine is keyword-overlap, not bge-scale). Dial via `DM_RECALL_FLOOR=0`.
+    pub const DEFAULTS: RecallFloor =
+        RecallFloor { enabled: true, abs_cosine: 0.62, abs_keyword: 0.0, rel_ratio: 0.45 };
+}
+
+/// Parse the `DM_RECALL_FLOOR` kill-switch value into a RecallFloor. "0"/"off"/"false"/"no"
+/// disables the floor (returns pre-floor recall); anything else (or unset) enables it with the
+/// calibrated defaults. Pure (env read happens in `recall_floor`) so it is unit-testable without
+/// touching the process environment.
+pub fn parse_recall_floor(val: Option<&str>) -> RecallFloor {
+    match val.map(|v| v.trim().to_ascii_lowercase()) {
+        Some(v) if matches!(v.as_str(), "0" | "off" | "false" | "no") => {
+            RecallFloor { enabled: false, ..RecallFloor::DEFAULTS }
+        }
+        _ => RecallFloor::DEFAULTS,
+    }
+}
+
+/// The active recall floor, read fresh from `DM_RECALL_FLOOR` (like `data_dir`'s env read), so the
+/// kill-switch takes effect for any new process without touching the cached config.
+pub fn recall_floor() -> RecallFloor {
+    parse_recall_floor(std::env::var("DM_RECALL_FLOOR").ok().as_deref())
+}
+
+/// Graph-expansion depth for the per-prompt recall hook, read fresh from `DM_RECALL_EXPAND`
+/// (default 1 hop; "0"/"off"/"false"/"no" => plain recall, no expansion). An env knob like
+/// `recall_floor` so it can be dialed without a config-file edit; capped at 5 hops. Expansion is
+/// adaptive: it only adds connected records where the graph has edges, so generic prompts stay lean
+/// and graph-covered topics get their neighborhood.
+pub fn recall_expand_depth() -> usize {
+    parse_expand_depth(std::env::var("DM_RECALL_EXPAND").ok().as_deref())
+}
+
+fn parse_expand_depth(v: Option<&str>) -> usize {
+    match v.map(|s| s.trim().to_ascii_lowercase()) {
+        None => 1,
+        Some(s) => match s.as_str() {
+            "" => 1,
+            "0" | "off" | "false" | "no" => 0,
+            other => other.parse::<usize>().unwrap_or(1).min(5),
+        },
+    }
+}
+
+/// Per-hop score decay for graph-expanded recall riders, read fresh from `DM_RECALL_DECAY`
+/// (default 0.5). A rider's rank score is `seed_weight * decay^hop`, so a record one hop off
+/// the top seed outranks one two hops out or one hanging off a weak seed - rider slots fill by
+/// that score instead of BFS arrival order. Must be in (0, 1]; anything else falls back to the
+/// default. 1.0 disables hop penalty (all reachable riders rank purely by seed weight).
+pub fn recall_decay() -> f64 {
+    parse_recall_decay(std::env::var("DM_RECALL_DECAY").ok().as_deref())
+}
+
+/// Scope for a scope-bound LOCAL session (`DM_SCOPE`, scope primitive): stamps writes with
+/// that scope and narrows reads to it + global. Unset/empty = full-tenant global session -
+/// the default, and byte-identical to pre-scope behavior. Server mode resolves scope from
+/// the TOKEN, never from this env (the env is the local trust boundary, the token is the
+/// remote one).
+pub fn scope() -> Option<String> {
+    std::env::var("DM_SCOPE").ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
+/// Import manifest (sha256 incremental ingest): maps an imported
+/// file's absolute path to the sha256 of its content at last import, so a re-import of an
+/// unchanged corpus skips the parse + network + embedding work per file. Lives CLIENT-SIDE
+/// under the data dir - import parses on the client, so the memo belongs where the work
+/// happens; it is an optimization only (a stale or missing manifest just falls back to the
+/// store's idempotent put), so per-machine state is fine.
+pub fn import_manifest_load() -> std::collections::HashMap<String, String> {
+    let Ok(dir) = data_dir() else { return Default::default() };
+    std::fs::read_to_string(dir.join("import-manifest.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+pub fn import_manifest_save(m: &std::collections::HashMap<String, String>) {
+    let Ok(dir) = data_dir() else { return };
+    if let Ok(s) = serde_json::to_string_pretty(m) {
+        let _ = std::fs::write(dir.join("import-manifest.json"), s + "\n");
+    }
+}
+
+/// Hex sha256 of a byte slice (import manifest keying).
+pub fn sha256_hex_bytes(data: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut out = String::with_capacity(64);
+    for b in Sha256::digest(data) {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
+}
+
+fn parse_recall_decay(v: Option<&str>) -> f64 {
+    const DEFAULT: f64 = 0.5;
+    match v.map(str::trim) {
+        None | Some("") => DEFAULT,
+        Some(s) => match s.parse::<f64>() {
+            Ok(d) if d > 0.0 && d <= 1.0 => d,
+            _ => DEFAULT,
+        },
+    }
+}
+
+/// Save-discipline nudge opt-in, read fresh from `DM_SAVE_NUDGE`. Default OFF: the save
+/// discipline already rides every session as a binding protocol (SOUL.md for Hermes, the MCP
+/// `initialize.instructions` for MCP clients, the SessionStart persona block for Claude Code),
+/// so the per-prompt `<daimon-memory>` nudge was a redundant third copy (maintainer decision,
+/// 17-07-2026: turn it off, the other reminders already cover it). Set `DM_SAVE_NUDGE=1`/`on` to re-enable
+/// the cadence backstop for hosts that lack the protocol layer.
+pub fn save_nudge_enabled() -> bool {
+    parse_save_nudge(std::env::var("DM_SAVE_NUDGE").ok().as_deref())
+}
+
+fn parse_save_nudge(v: Option<&str>) -> bool {
+    matches!(
+        v.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("1") | Some("on") | Some("true") | Some("yes")
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn save_nudge_default_off_env_opt_in() {
+        assert!(!parse_save_nudge(None), "unset -> nudge off (protocol layer already covers it)");
+        for on in ["1", "on", "true", "yes", "ON", " 1 "] {
+            assert!(parse_save_nudge(Some(on)), "{on:?} should enable");
+        }
+        for off in ["0", "off", "false", "no", "", "garbage"] {
+            assert!(!parse_save_nudge(Some(off)), "{off:?} should stay off");
+        }
+    }
+
+    #[test]
+    fn parses_server_block() {
+        let cfg: Config = toml::from_str(
+            "tenant = \"acme\"\n[server]\nurl = \"https://x\"\ntoken = \"t\"\ninsecure = true\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.tenant.as_deref(), Some("acme"));
+        let s = cfg.server.unwrap();
+        assert_eq!(s.url, "https://x");
+        // still parsed (so the client can refuse it with a clear message), never honoured
+        assert!(s.insecure && s.ca_cert.is_none());
+    }
+
+    #[test]
+    fn empty_config_is_default() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert!(cfg.server.is_none() && cfg.tenant.is_none() && cfg.data_dir.is_none());
+    }
+
+    #[test]
+    fn recall_floor_kill_switch_parses() {
+        // unset / anything else -> enabled with defaults
+        assert!(parse_recall_floor(None).enabled);
+        assert_eq!(parse_recall_floor(None), RecallFloor::DEFAULTS);
+        assert!(parse_recall_floor(Some("1")).enabled);
+        assert!(parse_recall_floor(Some("on")).enabled);
+        // explicit off values disable, keeping the same thresholds otherwise
+        for off in ["0", "off", "false", "no", "OFF", " 0 "] {
+            assert!(!parse_recall_floor(Some(off)).enabled, "{off:?} should disable");
+            assert_eq!(parse_recall_floor(Some(off)).abs_cosine, RecallFloor::DEFAULTS.abs_cosine);
+        }
+    }
+
+    #[test]
+    fn expand_depth_parses() {
+        assert_eq!(parse_expand_depth(None), 1, "unset defaults to 1 hop");
+        assert_eq!(parse_expand_depth(Some("")), 1);
+        assert_eq!(parse_expand_depth(Some("2")), 2);
+        assert_eq!(parse_expand_depth(Some("99")), 5, "capped at 5");
+        for off in ["0", "off", "false", "no", "OFF", " 0 "] {
+            assert_eq!(parse_expand_depth(Some(off)), 0, "{off:?} should disable expansion");
+        }
+        assert_eq!(parse_expand_depth(Some("garbage")), 1, "unparseable falls back to 1");
+    }
+
+    #[test]
+    fn recall_decay_parses() {
+        assert_eq!(parse_recall_decay(None), 0.5, "unset defaults to 0.5");
+        assert_eq!(parse_recall_decay(Some("")), 0.5);
+        assert_eq!(parse_recall_decay(Some("0.3")), 0.3);
+        assert_eq!(parse_recall_decay(Some("1")), 1.0, "1.0 disables the hop penalty");
+        for bad in ["0", "-0.2", "1.5", "garbage"] {
+            assert_eq!(parse_recall_decay(Some(bad)), 0.5, "{bad:?} falls back to the default");
+        }
+    }
+
+    #[test]
+    fn server_link_resolution_precedence() {
+        let cfg = || ServerLink { url: "https://cfg".into(), token: "ctok".into(), insecure: true, ca_cert: Some("/ca.pem".into()) };
+        // endpoint overrides url; token + insecure + ca_cert inherited from config when no DM_TOKEN
+        let r = resolve_server_link(Some("https://flag".into()), None, Some(cfg())).unwrap();
+        assert_eq!(r.url, "https://flag");
+        assert_eq!(r.token, "ctok");
+        assert!(r.insecure && r.ca_cert.as_deref() == Some("/ca.pem"));
+        // DM_TOKEN overrides the config token
+        assert_eq!(resolve_server_link(Some("https://flag".into()), Some("etok".into()), Some(cfg())).unwrap().token, "etok");
+        // endpoint with no config -> empty token
+        let r = resolve_server_link(Some("https://flag".into()), None, None).unwrap();
+        assert_eq!((r.url.as_str(), r.token.as_str(), r.insecure), ("https://flag", "", false));
+        // no endpoint, config only -> config url + token
+        let r = resolve_server_link(None, None, Some(cfg())).unwrap();
+        assert_eq!((r.url.as_str(), r.token.as_str()), ("https://cfg", "ctok"));
+        // DM_TOKEN overrides even without an endpoint
+        assert_eq!(resolve_server_link(None, Some("etok".into()), Some(cfg())).unwrap().token, "etok");
+        // nothing -> embedded
+        assert!(resolve_server_link(None, None, None).is_none());
+    }
+
+    #[test]
+    fn is_safe_token_rejects_injection_chars() {
+        assert!(is_safe_token("dmem_0123abcdef"));
+        assert!(is_safe_token("tenant-laptop_1"));
+        assert!(!is_safe_token(""), "empty is not safe");
+        assert!(!is_safe_token("has space"));
+        assert!(!is_safe_token("has\"quote"));
+        assert!(!is_safe_token("has\nnewline"));
+        assert!(!is_safe_token("has=equals"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_secret_is_0600_and_creates_parents() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("dmcfg-{}-{}", std::process::id(), crate::entry::now_ms()));
+        let p = dir.join("nested").join("secret.toml");
+        write_secret(&p, "token = \"x\"\n").unwrap();
+        let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "a secret-bearing file must be 0600");
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "token = \"x\"\n");
+        // overwriting an existing (looser) file still ends at 0600
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
+        write_secret(&p, "token = \"y\"\n").unwrap();
+        let mode2 = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode2, 0o600, "rewrite must re-tighten to 0600");
+    }
+}

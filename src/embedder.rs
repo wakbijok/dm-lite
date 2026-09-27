@@ -1,0 +1,483 @@
+//! Embedder trait + two impls behind it. The vector store (zvec) stores and searches
+//! vectors; SOMETHING must turn text into a vector.
+//! - `FastEmbedder` (feature `fastembed`): the real one - bge-small-en-v1.5 (384-d) via
+//!   ONNX. Produces genuine semantic vectors; this is what earns the vector half its keep.
+//! - `HashEmbedder` (default / fallback): a deterministic, offline bag-of-hashed-tokens
+//!   vector (256-d). It approximates keyword overlap, NOT real semantics - used when
+//!   `fastembed` is off or the model can't load, so the vector path stays wired and tested
+//!   with no model download. Kept honest: the hash path is a placeholder, the bge path is real.
+#![allow(dead_code)]
+
+/// Embedding dimension. Tied to the active model so the zvec collection schema matches:
+/// bge-small-en-v1.5 is 384-d; the placeholder uses 256.
+#[cfg(any(feature = "fastembed", feature = "candle"))]
+pub const DIM: usize = 384;
+#[cfg(not(any(feature = "fastembed", feature = "candle")))]
+pub const DIM: usize = 256;
+
+pub trait Embedder: Send + Sync {
+    fn dim(&self) -> usize;
+    fn embed(&self, text: &str) -> Vec<f32>;
+    /// Embed a record body as one or more vectors. A body within the model's token limit yields a
+    /// single vector (identical to `embed`); a longer body is split into windows so its TAIL is
+    /// represented too, not just the leading tokens. Recall max-pools these per record, so a query
+    /// matching any section scores on that section. Default: one chunk (overridden by neural
+    /// embedders with a real position limit). Queries always use `embed` (single vector).
+    fn embed_chunks(&self, text: &str) -> Vec<Vec<f32>> {
+        vec![self.embed(text)]
+    }
+    /// Stable identity of the active embedder. Used by the recall relevance floor (cosine
+    /// magnitudes are embedder-relative, so the floor must know which model produced them) and
+    /// by the calibration harness to ASSERT the real model loaded (a silent HashEmbedder
+    /// fallback would make every cosine number bogus). "hash" marks the placeholder, whose
+    /// cosine approximates keyword overlap, NOT bge-scale semantics.
+    fn name(&self) -> &'static str;
+}
+
+pub struct HashEmbedder;
+
+impl HashEmbedder {
+    pub fn new() -> Self {
+        HashEmbedder
+    }
+}
+
+impl Default for HashEmbedder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn fnv1a(token: &str) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in token.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+impl Embedder for HashEmbedder {
+    fn dim(&self) -> usize {
+        DIM
+    }
+    fn name(&self) -> &'static str {
+        "hash"
+    }
+
+    fn embed(&self, text: &str) -> Vec<f32> {
+        let mut v = vec![0f32; DIM];
+        for tok in text.to_lowercase().split(|c: char| !c.is_ascii_alphanumeric()) {
+            if tok.len() < 2 {
+                continue;
+            }
+            let idx = (fnv1a(tok) as usize) % DIM;
+            v[idx] += 1.0;
+        }
+        let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if norm > 0.0 {
+            for x in v.iter_mut() {
+                *x /= norm;
+            }
+        }
+        v
+    }
+}
+
+/// Real semantic embedder: bge-small-en-v1.5 (384-d) via fastembed/ONNX. Downloads the
+/// model to the fastembed cache on first construction (needs network once).
+#[cfg(feature = "fastembed")]
+pub struct FastEmbedder {
+    model: fastembed::TextEmbedding,
+}
+
+#[cfg(feature = "fastembed")]
+impl FastEmbedder {
+    pub fn new() -> anyhow::Result<Self> {
+        use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
+        let model = TextEmbedding::try_new(InitOptions::new(EmbeddingModel::BGESmallENV15))?;
+        Ok(Self { model })
+    }
+}
+
+#[cfg(feature = "fastembed")]
+impl Embedder for FastEmbedder {
+    fn dim(&self) -> usize {
+        DIM
+    }
+    fn name(&self) -> &'static str {
+        "fastembed-bge-small"
+    }
+    fn embed(&self, text: &str) -> Vec<f32> {
+        match self.model.embed(vec![text], None) {
+            Ok(mut v) => v.pop().unwrap_or_else(|| vec![0.0; DIM]),
+            Err(e) => {
+                eprintln!("dmem: fastembed embed failed: {e:?}");
+                vec![0.0; DIM]
+            }
+        }
+    }
+}
+
+/// Tiny STATIC embedder: a Model2Vec token->vector table (NO neural net, NO ONNX runtime).
+/// Loaded via model2vec-rs from a `.safetensors` model; embedding is tokenize + mean-pool
+/// lookup over `ndarray`. The model id is overridable via `DM_M2V_MODEL` so we can benchmark
+/// variants (potion-base-8M, retrieval, multilingual) without recompiling. Output is
+/// L2-normalized (normalize=true) so dot product == cosine, matching the recall fusion.
+#[cfg(feature = "model2vec")]
+pub struct Model2VecEmbedder {
+    model: model2vec_rs::model::StaticModel,
+}
+
+#[cfg(feature = "model2vec")]
+impl Model2VecEmbedder {
+    pub fn new() -> anyhow::Result<Self> {
+        let repo = std::env::var("DM_M2V_MODEL").unwrap_or_else(|_| "minishlab/potion-base-8M".to_string());
+        let model = model2vec_rs::model::StaticModel::from_pretrained(repo.as_str(), None, Some(true), None)
+            .map_err(|e| anyhow::anyhow!("model2vec load {repo}: {e:#}"))?;
+        Ok(Self { model })
+    }
+}
+
+#[cfg(feature = "model2vec")]
+impl Embedder for Model2VecEmbedder {
+    fn dim(&self) -> usize {
+        DIM
+    }
+    fn name(&self) -> &'static str {
+        "model2vec"
+    }
+    fn embed(&self, text: &str) -> Vec<f32> {
+        let mut v = self.model.encode_single(text);
+        // Benchmark guard: a model whose native dim != DIM still measures RAM correctly; for the
+        // chosen end-to-end model (potion-base-8M = 256-d = DIM) the dims match and this is a no-op.
+        if v.len() != DIM {
+            v.resize(DIM, 0.0);
+        }
+        v
+    }
+}
+
+/// Same model as FastEmbedder (bge-small-en-v1.5, 384-d) but run on **Candle** (pure-Rust ML),
+/// NOT ONNX Runtime. Identical weights -> identical accuracy; the point is dropping the heavy
+/// ONNX C++ runtime to cut RAM while keeping a real transformer. Pooling follows the model:
+/// CLS + L2 normalize by default (bge's documented pooling); `DM_CANDLE_POOLING=mean` switches
+/// to mask-weighted mean pooling for models trained that way (e5, paraphrase-multilingual).
+/// Model id overridable via DM_CANDLE_MODEL; any 384-d BertModel-architecture checkpoint with a
+/// tokenizer.json works (e.g. intfloat/multilingual-e5-small). E5-family models expect role
+/// prefixes - set DM_CANDLE_PREFIX_QUERY="query: " and DM_CANDLE_PREFIX_DOC="passage: ".
+#[cfg(feature = "candle")]
+pub struct CandleEmbedder {
+    model: candle_transformers::models::bert::BertModel,
+    tokenizer: tokenizers::Tokenizer,
+    device: candle_core::Device,
+    mean_pool: bool,
+    prefix_query: String,
+    prefix_doc: String,
+    custom_model: bool,
+}
+
+#[cfg(feature = "candle")]
+impl CandleEmbedder {
+    pub fn new() -> anyhow::Result<Self> {
+        use candle_nn::VarBuilder;
+        use candle_transformers::models::bert::{BertModel, Config, DTYPE};
+        use hf_hub::api::sync::Api;
+        let repo = std::env::var("DM_CANDLE_MODEL").unwrap_or_else(|_| "BAAI/bge-small-en-v1.5".to_string());
+        let custom_model = repo != "BAAI/bge-small-en-v1.5";
+        let r = Api::new()?.model(repo);
+        let config: Config = serde_json::from_str(&std::fs::read_to_string(r.get("config.json")?)?)?;
+        let tokenizer = tokenizers::Tokenizer::from_file(r.get("tokenizer.json")?)
+            .map_err(|e| anyhow::anyhow!("tokenizer: {e}"))?;
+        let device = candle_core::Device::Cpu;
+        let weights = r.get("model.safetensors")?;
+        // DM_CANDLE_F16=1 loads weights as f16 (half the model RAM). from_mmaped keeps the file's
+        // f32 bytes zero-copy, so we load buffered and convert to the target dtype instead.
+        let dtype = if std::env::var("DM_CANDLE_F16").is_ok() { candle_core::DType::F16 } else { DTYPE };
+        let vb = if dtype == DTYPE {
+            unsafe { VarBuilder::from_mmaped_safetensors(&[weights], DTYPE, &device)? }
+        } else {
+            let bytes = std::fs::read(&weights)?;
+            VarBuilder::from_buffered_safetensors(bytes, dtype, &device)?
+        };
+        let model = BertModel::load(vb, &config)?;
+        let mean_pool = std::env::var("DM_CANDLE_POOLING").map(|p| p.eq_ignore_ascii_case("mean")).unwrap_or(false);
+        let prefix_query = std::env::var("DM_CANDLE_PREFIX_QUERY").unwrap_or_default();
+        let prefix_doc = std::env::var("DM_CANDLE_PREFIX_DOC").unwrap_or_default();
+        Ok(Self { model, tokenizer, device, mean_pool, prefix_query, prefix_doc, custom_model })
+    }
+
+    /// Forward one already-bounded token window ([CLS] .. [SEP], <= 512 ids) to a normalized
+    /// vector - CLS token (bge) or mask-weighted mean over token states (e5 & friends), per
+    /// `mean_pool`. Shared by the single-vector path and the chunked path.
+    fn forward_window(&self, ids: &[u32], mask: &[u32]) -> anyhow::Result<Vec<f32>> {
+        use candle_core::{IndexOp, Tensor};
+        let t_ids = Tensor::new(ids, &self.device)?.unsqueeze(0)?;
+        let type_ids = t_ids.zeros_like()?;
+        let t_mask = Tensor::new(mask, &self.device)?.unsqueeze(0)?;
+        let out = self.model.forward(&t_ids, &type_ids, Some(&t_mask))?; // [1, seq, hidden]
+        let v: Vec<f32> = if self.mean_pool {
+            // Mask-weighted mean pooling on the CPU side: seq <= 512 x hidden 384 makes tensor
+            // gymnastics pointless; a plain loop is exact and obvious.
+            let states: Vec<Vec<f32>> = out.i(0)?.to_vec2()?;
+            let dim = states.first().map(|r| r.len()).unwrap_or(0);
+            let mut acc = vec![0f32; dim];
+            let mut n = 0f32;
+            for (row, m) in states.iter().zip(mask) {
+                if *m == 0 {
+                    continue;
+                }
+                for (a, x) in acc.iter_mut().zip(row) {
+                    *a += x;
+                }
+                n += 1.0;
+            }
+            if n > 0.0 {
+                for a in acc.iter_mut() {
+                    *a /= n;
+                }
+            }
+            acc
+        } else {
+            out.i((0, 0))?.to_vec1()? // CLS token
+        };
+        let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        Ok(if norm > 0.0 { v.iter().map(|x| x / norm).collect() } else { v })
+    }
+
+    fn embed_inner(&self, text: &str) -> anyhow::Result<Vec<f32>> {
+        // bge-small-en-v1.5 has 512 position embeddings; a longer token sequence overflows the
+        // position index-select and fails the forward pass. Cap at the model max so long records
+        // (and every query) embed from their leading 512 tokens instead of not at all.
+        const MAX_TOKENS: usize = 512;
+        let enc = self.tokenizer.encode(text, true).map_err(|e| anyhow::anyhow!("encode: {e}"))?;
+        let ids = enc.get_ids();
+        let mask = enc.get_attention_mask();
+        let n = ids.len().min(MAX_TOKENS);
+        self.forward_window(&ids[..n], &mask[..n])
+    }
+
+    /// Split a body into <=510-token content windows, each re-wrapped with the model's [CLS]/[SEP]
+    /// so every window is a valid sequence with its own positions. A body within the limit is one
+    /// window (byte-identical to `embed_inner`, so single-chunk records need no migration). Bounded
+    /// at MAX_CHUNKS windows (~130 KB of body); content past that embeds only via FTS.
+    /// With DM_CANDLE_PREFIX_DOC set (e5-family), the prefix's token ids are injected into EVERY
+    /// window - not just the leading one - so late windows keep their role marker too.
+    fn embed_chunks_inner(&self, text: &str) -> anyhow::Result<Vec<Vec<f32>>> {
+        const MAX_TOKENS: usize = 512;
+        const MAX_CHUNKS: usize = 64;
+        let pids: Vec<u32> = if self.prefix_doc.is_empty() {
+            Vec::new()
+        } else {
+            self.tokenizer
+                .encode(self.prefix_doc.as_str(), false)
+                .map_err(|e| anyhow::anyhow!("encode prefix: {e}"))?
+                .get_ids()
+                .to_vec()
+        };
+        let enc = self.tokenizer.encode(text, true).map_err(|e| anyhow::anyhow!("encode: {e}"))?;
+        let ids = enc.get_ids();
+        let mask = enc.get_attention_mask();
+        if ids.len() + pids.len() <= MAX_TOKENS && pids.is_empty() {
+            return Ok(vec![self.forward_window(ids, mask)?]);
+        }
+        // ids is [CLS] content.. [SEP]; window the content, re-wrapping each with CLS/prefix/SEP.
+        let cls = ids[0];
+        let sep = ids[ids.len() - 1];
+        let content = &ids[1..ids.len() - 1];
+        let win = MAX_TOKENS - 2 - pids.len(); // room for CLS + SEP + per-window prefix
+        let mut out = Vec::new();
+        for w in content.chunks(win.max(16)).take(MAX_CHUNKS) {
+            let mut cids = Vec::with_capacity(w.len() + pids.len() + 2);
+            cids.push(cls);
+            cids.extend_from_slice(&pids);
+            cids.extend_from_slice(w);
+            cids.push(sep);
+            let cmask = vec![1u32; cids.len()];
+            out.push(self.forward_window(&cids, &cmask)?);
+        }
+        Ok(out)
+    }
+}
+
+#[cfg(feature = "candle")]
+impl Embedder for CandleEmbedder {
+    fn dim(&self) -> usize {
+        DIM
+    }
+    /// "candle-custom" for a DM_CANDLE_MODEL override: cosine magnitudes are model-relative, so
+    /// the recall floor must not mistake a custom model's scores for bge-calibrated ones.
+    fn name(&self) -> &'static str {
+        if self.custom_model { "candle-custom" } else { "candle-bge-small" }
+    }
+    fn embed(&self, text: &str) -> Vec<f32> {
+        // Query path: e5-family models want their role prefix on queries too.
+        let prefixed;
+        let t = if self.prefix_query.is_empty() {
+            text
+        } else {
+            prefixed = format!("{}{}", self.prefix_query, text);
+            &prefixed
+        };
+        match self.embed_inner(t) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("dmem: candle embed failed: {e:?}");
+                vec![0.0; DIM]
+            }
+        }
+    }
+    fn embed_chunks(&self, text: &str) -> Vec<Vec<f32>> {
+        match self.embed_chunks_inner(text) {
+            Ok(v) if !v.is_empty() => v,
+            Ok(_) => vec![vec![0.0; DIM]],
+            Err(e) => {
+                eprintln!("dmem: candle embed_chunks failed: {e:?}");
+                vec![vec![0.0; DIM]]
+            }
+        }
+    }
+}
+
+/// Read-only diagnostics about the embedder that WOULD load (mirrors `build_embedder`'s selection
+/// order WITHOUT constructing it, so `dmem doctor` never triggers a model download). For neural
+/// embedders it reports the HuggingFace hub cache dir and whether the model is already present,
+/// so an air-gapped operator can pre-populate it.
+pub struct EmbedderDiag {
+    pub name: &'static str,
+    pub model_id: Option<String>,
+    pub neural: bool,
+    pub cache_dir: Option<std::path::PathBuf>,
+    pub cache_present: bool,
+}
+
+/// The HuggingFace hub cache dir (HUGGINGFACE_HUB_CACHE, else HF_HOME/hub, else
+/// ~/.cache/huggingface/hub, matching hf-hub's own resolution), and whether `model_id`'s snapshot
+/// is already cached there.
+#[cfg(any(feature = "fastembed", feature = "candle", feature = "model2vec"))]
+fn hf_model_cache(model_id: &str) -> (Option<std::path::PathBuf>, bool) {
+    let hub = if let Ok(c) = std::env::var("HUGGINGFACE_HUB_CACHE") {
+        std::path::PathBuf::from(c)
+    } else if let Ok(h) = std::env::var("HF_HOME") {
+        std::path::PathBuf::from(h).join("hub")
+    } else if let Some(h) = dirs::home_dir() {
+        h.join(".cache").join("huggingface").join("hub")
+    } else {
+        return (None, false);
+    };
+    let model_dir = hub.join(format!("models--{}", model_id.replace('/', "--")));
+    let present = model_dir.join("snapshots").is_dir();
+    (Some(hub), present)
+}
+
+/// Diagnostics for the active embedder, computed without loading the model.
+pub fn active_embedder_diag() -> EmbedderDiag {
+    #[cfg(feature = "fastembed")]
+    {
+        let m = std::env::var("DM_CANDLE_MODEL").unwrap_or_else(|_| "BAAI/bge-small-en-v1.5".to_string());
+        let (dir, present) = hf_model_cache(&m);
+        return EmbedderDiag { name: "fastembed-bge-small", model_id: Some(m), neural: true, cache_dir: dir, cache_present: present };
+    }
+    #[cfg(all(feature = "candle", not(feature = "fastembed")))]
+    {
+        let m = std::env::var("DM_CANDLE_MODEL").unwrap_or_else(|_| "BAAI/bge-small-en-v1.5".to_string());
+        let name = if m == "BAAI/bge-small-en-v1.5" { "candle-bge-small" } else { "candle-custom" };
+        let (dir, present) = hf_model_cache(&m);
+        return EmbedderDiag { name, model_id: Some(m), neural: true, cache_dir: dir, cache_present: present };
+    }
+    #[cfg(all(feature = "model2vec", not(feature = "fastembed"), not(feature = "candle")))]
+    {
+        let m = std::env::var("DM_M2V_MODEL").unwrap_or_else(|_| "minishlab/potion-base-8M".to_string());
+        let (dir, present) = hf_model_cache(&m);
+        return EmbedderDiag { name: "model2vec", model_id: Some(m), neural: true, cache_dir: dir, cache_present: present };
+    }
+    #[allow(unreachable_code)]
+    EmbedderDiag { name: "hash-256", model_id: None, neural: false, cache_dir: None, cache_present: false }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn similar_text_closer_than_unrelated() {
+        let e = HashEmbedder::new();
+        let cos = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| x * y).sum::<f32>();
+        let a = e.embed("lancedb vector substrate decision");
+        let b = e.embed("we chose the lancedb vector substrate");
+        let c = e.embed("totally unrelated cooking recipe");
+        assert!(cos(&a, &b) > cos(&a, &c), "shared-word text should score higher");
+    }
+
+    // Guards the REAL semantic path: bge-small must rank a semantically-related pair above
+    // an unrelated one even with NO shared keywords (the HashEmbedder above cannot - it is
+    // keyword-equivalent). Gated so the default `cargo test` never loads the model.
+    #[cfg(feature = "fastembed")]
+    #[test]
+    fn fastembed_related_closer_than_unrelated() {
+        // The related pair shares NO content tokens, so a keyword-equivalent embedder
+        // (HashEmbedder) would score them at 0 and FAIL this - only real semantics pass.
+        let sent_a = "the production database stopped responding";
+        let sent_b = "our postgres node became unreachable";
+        let sent_c = "a recipe for chocolate chip cookies";
+        let toks = |s: &str| {
+            s.split(|c: char| !c.is_ascii_alphanumeric())
+                .filter(|t| t.len() >= 2)
+                .map(|t| t.to_lowercase())
+                .collect::<std::collections::HashSet<_>>()
+        };
+        assert!(
+            toks(sent_a).is_disjoint(&toks(sent_b)),
+            "related pair must share no keywords, else the test doesn't isolate semantics from overlap"
+        );
+
+        let e = FastEmbedder::new().expect("load bge-small model");
+        // bge-small vectors are L2-normalized, so dot product == cosine similarity.
+        let cos = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| x * y).sum::<f32>();
+        let a = e.embed(sent_a);
+        let b = e.embed(sent_b);
+        let c = e.embed(sent_c);
+        assert_eq!(a.len(), DIM);
+        assert!(
+            cos(&a, &b) > cos(&a, &c),
+            "semantically-related pair must outscore unrelated: rel={} unrel={}",
+            cos(&a, &b),
+            cos(&a, &c)
+        );
+    }
+
+    // The 512-token cap (embed_inner): bge-small has only 512 position embeddings, so a record
+    // longer than that (e.g. a full SKILL.md body) must embed from its leading 512 tokens, not
+    // overflow the forward pass and fall back to the zero vector.
+    #[cfg(all(feature = "candle", not(feature = "fastembed")))]
+    #[test]
+    fn candle_caps_long_input_at_512_tokens() {
+        let e = CandleEmbedder::new().expect("load bge-small model");
+        let long = "word ".repeat(2000); // ~2000 tokens, well over the 512 cap
+        let v = e.embed(&long);
+        assert_eq!(v.len(), DIM, "must produce a DIM-length vector");
+        let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!(norm > 0.5, "a >512-token input must embed (capped), not fail to the zero vector (norm={norm})");
+    }
+
+    // embed_chunks: a body within the limit is one vector; a longer body splits into several real
+    // (non-zero) windows so its tail is representable, not just the leading 512 tokens.
+    #[cfg(all(feature = "candle", not(feature = "fastembed")))]
+    #[test]
+    fn candle_embed_chunks_splits_long_input() {
+        let e = CandleEmbedder::new().expect("load bge-small model");
+        assert_eq!(e.embed_chunks("a brief note").len(), 1, "short text is a single chunk");
+        let long = "word ".repeat(2000); // ~2000 tokens -> multiple 510-token windows
+        let chunks = e.embed_chunks(&long);
+        assert!(chunks.len() > 1, "a >512-token body must split into multiple chunks, got {}", chunks.len());
+        for (i, c) in chunks.iter().enumerate() {
+            assert_eq!(c.len(), DIM, "chunk {i} must be DIM-length");
+            let norm: f32 = c.iter().map(|x| x * x).sum::<f32>().sqrt();
+            assert!(norm > 0.5, "chunk {i} must be a real vector, norm={norm}");
+        }
+        // a body within the limit embeds identically via embed and embed_chunks, so a short record's
+        // single chunk (PK = pk_for(uri)) matches the pre-chunking vector: no migration for it.
+        let short = "a brief operational note about disk iowait on the mail relay";
+        assert_eq!(e.embed_chunks(short), vec![e.embed(short)], "short body: one chunk equal to embed()");
+    }
+}

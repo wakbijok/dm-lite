@@ -1,0 +1,385 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>dmem graph</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: #0f1115; color: #e6e6e6;
+    font: 13px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; overflow: hidden; }
+  #c { display: block; width: 100vw; height: 100vh; cursor: grab; }
+  #c.drag { cursor: grabbing; }
+  .panel { position: fixed; background: rgba(20,23,30,0.92); border: 1px solid #2a2f3a;
+    border-radius: 10px; padding: 10px 12px; backdrop-filter: blur(6px); }
+  #top { top: 12px; left: 12px; display: flex; gap: 8px; align-items: center; }
+  #top h1 { font-size: 14px; font-weight: 500; margin: 0 8px 0 0; }
+  #search { background: #11141a; border: 1px solid #2a2f3a; color: #e6e6e6;
+    border-radius: 6px; padding: 5px 8px; width: 220px; outline: none; }
+  #stat { color: #8b93a5; }
+  #hubs, #d3 { color: #b9c0cf; display: inline-flex; align-items: center; gap: 4px; cursor: pointer; user-select: none; }
+  #legend { bottom: 12px; left: 12px; max-width: 320px; display: flex; flex-wrap: wrap; gap: 4px 12px; }
+  #legend span { display: inline-flex; align-items: center; gap: 5px; color: #b9c0cf; }
+  #legend i { width: 10px; height: 10px; border-radius: 3px; display: inline-block; }
+  #detail { top: 12px; right: 12px; width: 320px; display: none; }
+  #detail .k { color: #8b93a5; }
+  #detail .t { font-weight: 500; margin: 2px 0 6px; word-break: break-word; }
+  #detail .u { color: #6f7789; font-size: 11px; word-break: break-all; }
+  #detail ul { margin: 8px 0 0; padding-left: 16px; }
+  #detail li { color: #b9c0cf; }
+  #hint { bottom: 12px; right: 12px; color: #6f7789; }
+  a { color: #7aa2f7; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="top" class="panel">
+  <h1>dmem graph</h1>
+  <input id="search" placeholder="filter by title...">
+  <label id="hubs" title="hide the highest-degree nodes (adaptive threshold): hubs link to everything and dominate the force layout, hiding the cluster structure"><input type="checkbox" id="hidehubs"> declutter hubs</label>
+  <label id="d3" title="3D layout: drag empty space to rotate, the graph slow-spins while idle"><input type="checkbox" id="mode3d"> 3D</label>
+  <span id="stat"></span>
+</div>
+<div id="legend" class="panel"></div>
+<div id="detail" class="panel"></div>
+<div id="hint" class="panel">scroll to zoom, drag a node to pull it, drag space to pan (3D: rotate, shift = pan), hover to focus, click to pin</div>
+<script>
+(function () {
+  "use strict";
+  // --- color by kind: entities in warm tones, memory records in cool tones ---
+  var COLORS = {
+    org: "#e0823c", engagement: "#d4553e", product: "#caa83a", solution_stack: "#c77dba",
+    person: "#d96f9a", framework: "#b98be0", site: "#8fae5d",
+    decision: "#378add", resource_summary: "#1d9e75", agent_lesson: "#5dcaa5",
+    incident_summary: "#e24b4a", known_failure_mode: "#cf5a4f", remediation_pattern: "#3aa0a0",
+    runbook: "#639922", project_convention: "#7f77dd", service_topology: "#4a9fd6",
+    persona: "#9a8cf0", protocol: "#7c74cf", reminder: "#caa83a", memory: "#8b93a5"
+  };
+  function colorOf(k) { return COLORS[k] || "#8b93a5"; }
+
+  var canvas = document.getElementById("c"), ctx = canvas.getContext("2d");
+  var W = 0, H = 0, DPR = window.devicePixelRatio || 1;
+  function resize() {
+    W = canvas.clientWidth; H = canvas.clientHeight;
+    canvas.width = W * DPR; canvas.height = H * DPR; ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  }
+  window.addEventListener("resize", function () { resize(); });
+
+  var nodes = [], edges = [], byId = {}, adj = {};
+  var view = { x: 0, y: 0, k: 1 }, alpha = 1, selected = null, hovered = null, filter = "";
+  // Scale knobs recomputed per build() from the visible node count (graceful degradation on
+  // big graphs instead of a hairball + hot CPU): global node-size downscale, label gating,
+  // layout cooling speed, and repulsion stride (see step()).
+  var maxDeg = 1, downscale = 1, labelDeg = 4, alphaDecay = 0.985, stride = 1, tick = 0;
+  var hideHubs = localStorage.getItem("dmem.hideHubs") === "1", hubDeg = Infinity;
+
+  // --- 3D: nodes carry a z axis; the camera is yaw (spin) + pitch (tilt) with a perspective
+  // projection. In 2D mode z is damped back to 0 and the projection is the identity, so the
+  // same layout/draw/hit-test code serves both modes.
+  var mode3d = localStorage.getItem("dmem.3d") === "1";
+  var yaw = 0, pitch = 0.25, FOV = 700;
+  // The camera must sit OUTSIDE the layout: FOV tracks the layout radius (updated per frame
+  // in draw), and the perspective divide is clamped strictly positive - a node can never
+  // reach a negative scale. (A negative scale once fed ctx.arc a negative radius, which
+  // THROWS and killed the rAF loop: the whole page froze. Guarded twice now.)
+  function fitFov(sample) {
+    var r2max = 0;
+    for (var i = 0; i < sample.length; i++) {
+      var nd = sample[i], r2 = nd.x * nd.x + nd.y * nd.y + nd.z * nd.z;
+      if (r2 > r2max) r2max = r2;
+    }
+    FOV = Math.max(700, Math.sqrt(r2max) * 1.4);
+  }
+  function project(nd) {
+    if (!mode3d) { nd.px = nd.x; nd.py = nd.y; nd.ps = 1; nd.pz = 0; return; }
+    var cy = Math.cos(yaw), sy = Math.sin(yaw), cp = Math.cos(pitch), sp = Math.sin(pitch);
+    var x = nd.x * cy + nd.z * sy, z1 = -nd.x * sy + nd.z * cy;
+    var y = nd.y * cp - z1 * sp, z = nd.y * sp + z1 * cp;
+    var s = FOV / Math.max(FOV * 0.15, FOV + z);
+    nd.px = x * s; nd.py = y * s; nd.ps = s; nd.pz = z;
+  }
+  // Camera-plane basis vectors in world space (transpose rows of Rx(pitch)*Ry(yaw)): used to
+  // drag a node "across the screen" at its own depth while in 3D.
+  function camRight() { return mode3d ? [Math.cos(yaw), 0, Math.sin(yaw)] : [1, 0, 0]; }
+  function camUp() {
+    if (!mode3d) return [0, 1, 0];
+    var cy = Math.cos(yaw), sy = Math.sin(yaw), cp = Math.cos(pitch), sp = Math.sin(pitch);
+    return [sp * sy, cp, -sp * cy];
+  }
+
+  // Node radius: base + power-curve share of the max degree (sub-linear, so one mega-hub
+  // does not flatten everyone else), then a global sqrt(150/N) downscale once the graph
+  // outgrows ~150 visible nodes so dense graphs stay legible instead of becoming blobs.
+  function nodeR(nd) { return (4 + Math.pow(nd.deg / maxDeg, 0.6) * 14) * downscale; }
+  function visible(nd) { return !(hideHubs && nd.deg >= hubDeg); }
+
+  function rescale() {
+    var vis = nodes.filter(visible), n = vis.length;
+    maxDeg = 1;
+    vis.forEach(function (nd) { if (nd.deg > maxDeg) maxDeg = nd.deg; });
+    downscale = n > 150 ? Math.max(0.45, Math.sqrt(150 / n)) : 1;
+    labelDeg = n > 600 ? 8 : n > 250 ? 6 : 4;
+    alphaDecay = n > 1200 ? 0.96 : n > 600 ? 0.975 : 0.985;
+    stride = n > 1600 ? 3 : n > 800 ? 2 : 1;
+    document.getElementById("stat").textContent =
+      n + " nodes, " + edges.filter(function (e) { return visible(e.a) && visible(e.b); }).length + " edges" +
+      (hideHubs && n < nodes.length ? " (" + (nodes.length - n) + " hubs hidden)" : "");
+  }
+
+  function load() {
+    fetch("/graph").then(function (r) { return r.json(); }).then(function (g) {
+      if (g.error) { document.getElementById("stat").textContent = "error: " + g.error; }
+      build(g.nodes || [], g.edges || []);
+    }).catch(function (e) { document.getElementById("stat").textContent = "load failed: " + e; });
+  }
+
+  function build(ns, es) {
+    byId = {}; adj = {};
+    nodes = ns.map(function (n, i) {
+      var ang = (i / Math.max(ns.length, 1)) * Math.PI * 2, rad = 60 + Math.random() * 240;
+      var node = { id: n.id, label: n.label || n.id, kind: n.kind || "memory",
+        x: Math.cos(ang) * rad, y: Math.sin(ang) * rad, z: (Math.random() - 0.5) * 240,
+        vx: 0, vy: 0, vz: 0, deg: 0 };
+      byId[n.id] = node; adj[n.id] = []; return node;
+    });
+    edges = [];
+    es.forEach(function (e) {
+      var a = byId[e.from], b = byId[e.to];
+      if (a && b) { edges.push({ a: a, b: b, rel: e.rel }); a.deg++; b.deg++; adj[a.id].push(b); adj[b.id].push(a); }
+    });
+    alpha = 1;
+    // Adaptive hub threshold: the 95th-percentile degree (floor 10). "Structural" hubs -
+    // entities that link to everything - sit far above it and can be hidden to reveal the
+    // cluster structure they otherwise crush in the force layout.
+    var degs = nodes.map(function (n) { return n.deg; }).sort(function (a, b) { return a - b; });
+    hubDeg = Math.max(10, degs[Math.min(degs.length - 1, Math.floor(degs.length * 0.95))] || 10);
+    rescale();
+    legend();
+    // center the view roughly
+    view = { x: W / 2, y: H / 2, k: nodes.length > 400 ? 0.55 : 0.9 };
+  }
+
+  function legend() {
+    var seen = {}; nodes.forEach(function (n) { seen[n.kind] = true; });
+    var el = document.getElementById("legend"); el.innerHTML = "";
+    Object.keys(seen).sort().forEach(function (k) {
+      var s = document.createElement("span");
+      s.innerHTML = '<i style="background:' + colorOf(k) + '"></i>' + k;
+      el.appendChild(s);
+    });
+  }
+
+  // --- force layout (cooling; iteration budget scales down with graph size) ---
+  function step() {
+    if (alpha < 0.02) return;
+    tick++;
+    var n = nodes.length, i, j, a, b, dx, dy, dz, d2, d, f;
+    // Repulsion: pairwise with a soft distance cutoff. On large graphs, sample every
+    // `stride`-th pair (rotating offset per frame so coverage evens out) and compensate the
+    // force by the stride - approximate, but the layout budget stays bounded instead of the
+    // O(n^2) inner loop eating the frame.
+    for (i = 0; i < n; i++) {
+      a = nodes[i];
+      if (!visible(a)) continue;
+      for (j = i + 1 + ((tick + i) % stride); j < n; j += stride) {
+        b = nodes[j];
+        if (!visible(b)) continue;
+        dx = a.x - b.x; dy = a.y - b.y; dz = mode3d ? a.z - b.z : 0;
+        d2 = dx * dx + dy * dy + dz * dz || 0.01;
+        if (d2 > 90000) continue;            // ignore far pairs (soft cutoff)
+        f = 900 * stride / d2;
+        a.vx += dx * f; a.vy += dy * f; b.vx -= dx * f; b.vy -= dy * f;
+        if (mode3d) { a.vz += dz * f; b.vz -= dz * f; }
+      }
+    }
+    // springs along edges (hidden endpoints exert no pull)
+    edges.forEach(function (e) {
+      if (!visible(e.a) || !visible(e.b)) return;
+      dx = e.b.x - e.a.x; dy = e.b.y - e.a.y; dz = mode3d ? e.b.z - e.a.z : 0;
+      d = Math.sqrt(dx * dx + dy * dy + dz * dz) || 0.01;
+      f = (d - 70) * 0.02; dx = dx / d * f; dy = dy / d * f; dz = dz / d * f;
+      e.a.vx += dx; e.a.vy += dy; e.b.vx -= dx; e.b.vy -= dy;
+      if (mode3d) { e.a.vz += dz; e.b.vz -= dz; }
+    });
+    // gravity to center + integrate (a grabbed node is pinned to the cursor, not integrated);
+    // in 2D mode any leftover z is damped away so switching back flattens the layout
+    for (i = 0; i < n; i++) {
+      a = nodes[i];
+      if (a === dragNode) { a.vx = 0; a.vy = 0; a.vz = 0; continue; }
+      a.vx -= a.x * 0.002; a.vy -= a.y * 0.002;
+      a.x += a.vx * alpha; a.y += a.vy * alpha; a.vx *= 0.85; a.vy *= 0.85;
+      if (mode3d) {
+        a.vz -= a.z * 0.002;
+        a.z += a.vz * alpha; a.vz *= 0.85;
+      } else if (a.z) {
+        a.z *= 0.9; a.vz = 0;
+        if (Math.abs(a.z) < 0.5) a.z = 0;
+      }
+    }
+    alpha *= alphaDecay;
+  }
+
+  function draw() {
+    ctx.clearRect(0, 0, W, H);
+    ctx.save(); ctx.translate(view.x, view.y); ctx.scale(view.k, view.k);
+    // Focus mode (hover wins over click-select): non-incident edges are HIDDEN, not dimmed,
+    // and out-of-focus nodes lose their labels - the cheapest legibility trick on a dense
+    // graph (a pattern adopted from studied graph-panel sigma reducers).
+    var focus = hovered || selected;
+    var hl = focus ? neighborSet(focus) : null;
+    // project every visible node once per frame; in 3D, paint far-to-near (painter's sort)
+    // with a depth fade so the far side of the brain recedes instead of cluttering
+    var order = [];
+    nodes.forEach(function (nd) { if (visible(nd)) order.push(nd); });
+    if (mode3d) fitFov(order);
+    order.forEach(project);
+    if (mode3d) order.sort(function (a, b) { return b.pz - a.pz; });
+    function fog(s) { return mode3d ? Math.max(0.25, Math.min(1, (s - 0.45) / 0.6 + 0.4)) : 1; }
+    // edges
+    ctx.lineWidth = 1 / view.k;
+    edges.forEach(function (e) {
+      if (!visible(e.a) || !visible(e.b)) return;
+      var ef = fog(Math.min(e.a.ps, e.b.ps));
+      if (hl) {
+        if (e.a !== focus && e.b !== focus) return; // hide non-incident edges in focus mode
+        ctx.strokeStyle = "rgba(122,162,247," + (0.8 * ef) + ")";
+      } else {
+        ctx.strokeStyle = "rgba(120,130,150," + (0.18 * ef) + ")";
+      }
+      ctx.beginPath(); ctx.moveTo(e.a.px, e.a.py); ctx.lineTo(e.b.px, e.b.py); ctx.stroke();
+    });
+    // nodes
+    order.forEach(function (nd) {
+      var r = Math.max(0.1, nodeR(nd) * nd.ps * (nd === focus ? 1.3 : 1));
+      var match = filter && nd.label.toLowerCase().indexOf(filter) >= 0;
+      var dim = (hl && !hl[nd.id]) || (filter && !match);
+      ctx.globalAlpha = (dim ? (hl ? 0.08 : 0.15) : 1) * fog(nd.ps);
+      ctx.fillStyle = colorOf(nd.kind);
+      ctx.beginPath(); ctx.arc(nd.px, nd.py, r, 0, Math.PI * 2); ctx.fill();
+      if (nd === selected || nd === hovered || match) { ctx.lineWidth = 2 / view.k; ctx.strokeStyle = "#e6e6e6"; ctx.stroke(); }
+      // labels: focus/neighbors, matches, hubs past the adaptive threshold, or when zoomed
+      // in - and NEVER on dimmed nodes (blanked labels are what makes focus mode readable);
+      // in 3D, far nodes also lose labels (their fog does the reading for them)
+      if (!dim && fog(nd.ps) > 0.55 && (nd === focus || (hl && hl[nd.id]) || match || nd.deg >= labelDeg || view.k > 1.4)) {
+        ctx.globalAlpha = 0.85 * fog(nd.ps); ctx.fillStyle = "#cdd3df";
+        ctx.font = (11 / view.k) + "px -apple-system, sans-serif";
+        ctx.fillText(trim(nd.label, 28), nd.px + r + 2 / view.k, nd.py + 3 / view.k);
+      }
+    });
+    ctx.globalAlpha = 1; ctx.restore();
+  }
+
+  function neighborSet(nd) { var s = {}; s[nd.id] = true; (adj[nd.id] || []).forEach(function (m) { s[m.id] = true; }); return s; }
+  function trim(s, n) { return s.length > n ? s.slice(0, n - 1) + "…" : s; }
+
+  var frameErr = 0;
+  function frame() {
+    // idle slow-spin in 3D: the brain keeps turning until you touch it
+    if (mode3d && !dragging && !dragNode && !hovered) yaw += 0.0012;
+    // one bad frame must NEVER kill the loop - log it and keep rendering
+    try { step(); draw(); } catch (err) { if (frameErr++ < 3) console.error("dmem ui frame:", err); }
+    requestAnimationFrame(frame);
+  }
+
+  // --- interaction: node-drag (grab a node, springs pull its neighbourhood along), pan, zoom, click ---
+  var dragging = false, moved = false, last = null, dragNode = null;
+  canvas.addEventListener("mousedown", function (e) {
+    moved = false; last = [e.clientX, e.clientY];
+    dragNode = hitTest(e.clientX, e.clientY); // grab a node if under the cursor, else pan
+    dragging = !dragNode;
+    canvas.classList.add("drag");
+  });
+  window.addEventListener("mouseup", function () { dragging = false; dragNode = null; canvas.classList.remove("drag"); });
+  function hitTest(cx, cy) {
+    // hit-test in projected space (px/py refreshed by draw every frame); among overlapping
+    // hits prefer the NEAREST node (largest perspective scale), matching what the eye sees
+    var wx = (cx - view.x) / view.k, wy = (cy - view.y) / view.k, hit = null, best = -1;
+    nodes.forEach(function (nd) {
+      if (!visible(nd) || nd.px === undefined) return;
+      var dx = nd.px - wx, dy = nd.py - wy, r = nodeR(nd) * nd.ps + 4;
+      if (dx * dx + dy * dy < r * r && nd.ps > best) { best = nd.ps; hit = nd; }
+    });
+    return hit;
+  }
+  window.addEventListener("mousemove", function (e) {
+    var dx = e.clientX - last[0], dy = e.clientY - last[1];
+    if (dragNode) {
+      // drag the node across the camera plane at its own depth and keep the simulation
+      // warm so the springs visibly pull its neighbourhood along - this is what makes the
+      // graph feel alive. In 2D the camera basis is the identity, so this is plain x/y.
+      var f = 1 / (view.k * (dragNode.ps || 1)), r = camRight(), u = camUp();
+      dragNode.x += r[0] * dx * f + u[0] * dy * f;
+      dragNode.y += r[1] * dx * f + u[1] * dy * f;
+      dragNode.z += r[2] * dx * f + u[2] * dy * f;
+      dragNode.vx = 0; dragNode.vy = 0; dragNode.vz = 0;
+      alpha = Math.max(alpha, 0.3);
+      if (Math.abs(dx) + Math.abs(dy) > 2) moved = true;
+      last = [e.clientX, e.clientY];
+      return;
+    }
+    if (!dragging) { hovered = hitTest(e.clientX, e.clientY); return; }
+    if (Math.abs(dx) + Math.abs(dy) > 2) moved = true;
+    if (mode3d && !e.shiftKey) {
+      // 3D: dragging empty space spins the brain (shift-drag still pans)
+      yaw += dx * 0.005;
+      pitch = Math.max(-1.25, Math.min(1.25, pitch + dy * 0.005));
+    } else {
+      view.x += dx; view.y += dy;
+    }
+    last = [e.clientX, e.clientY];
+  });
+  canvas.addEventListener("wheel", function (e) {
+    e.preventDefault(); var s = e.deltaY < 0 ? 1.1 : 0.9;
+    var wx = (e.clientX - view.x) / view.k, wy = (e.clientY - view.y) / view.k;
+    view.k = Math.max(0.1, Math.min(6, view.k * s));
+    view.x = e.clientX - wx * view.k; view.y = e.clientY - wy * view.k;
+  }, { passive: false });
+  canvas.addEventListener("click", function (e) {
+    if (moved) return;
+    var hit = hitTest(e.clientX, e.clientY);
+    selected = hit; detail(hit);
+  });
+
+  var hubsBox = document.getElementById("hidehubs");
+  hubsBox.checked = hideHubs;
+  hubsBox.addEventListener("change", function () {
+    hideHubs = hubsBox.checked;
+    localStorage.setItem("dmem.hideHubs", hideHubs ? "1" : "0");
+    if (selected && !visible(selected)) { selected = null; detail(null); }
+    hovered = null;
+    rescale();
+    alpha = Math.max(alpha, 0.3); // reheat so the layout settles around the new visible set
+  });
+
+  var d3Box = document.getElementById("mode3d");
+  d3Box.checked = mode3d;
+  d3Box.addEventListener("change", function () {
+    mode3d = d3Box.checked;
+    localStorage.setItem("dmem.3d", mode3d ? "1" : "0");
+    if (mode3d) {
+      yaw = 0; pitch = 0.25;
+      // inflate a flat layout into a slab so the springs have a third axis to work with
+      nodes.forEach(function (nd) { if (!nd.z) nd.z = (Math.random() - 0.5) * 240; });
+    }
+    alpha = Math.max(alpha, 0.5); // reheat: settle into (or back out of) the third axis
+  });
+
+  function detail(nd) {
+    var el = document.getElementById("detail");
+    if (!nd) { el.style.display = "none"; return; }
+    var conns = (adj[nd.id] || []).slice(0, 24).map(function (m) { return "<li>" + esc(trim(m.label, 40)) + " <span class='k'>(" + m.kind + ")</span></li>"; }).join("");
+    el.innerHTML = "<div class='k'>" + nd.kind + " &middot; " + (adj[nd.id] || []).length + " links</div>" +
+      "<div class='t'>" + esc(nd.label) + "</div><div class='u'>" + esc(nd.id) + "</div>" +
+      (conns ? "<ul>" + conns + "</ul>" : "");
+    el.style.display = "block";
+  }
+  function esc(s) { return String(s).replace(/[&<>]/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]; }); }
+
+  document.getElementById("search").addEventListener("input", function (e) { filter = e.target.value.trim().toLowerCase(); });
+
+  resize(); load(); requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
