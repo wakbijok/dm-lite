@@ -15,7 +15,24 @@ pub struct RemoteClient {
     base: String,
     token: String,
     http: reqwest::blocking::Client,
+    /// Sent as `X-DM-Write-Scope` on every memory request when set (`--scope` /
+    /// `DM_WRITE_SCOPE`): the scope this invocation's writes are stamped with, '' = a
+    /// deliberate global write. The server ignores it on reads.
+    write_scope: Option<String>,
+    /// Whether the server honours `write_scope` for this token, asked once before the first
+    /// write that carries it (`GET /capabilities`); Err holds why not.
+    scope_probe: std::sync::OnceLock<std::result::Result<(), String>>,
 }
+
+/// A server older than 0.3.7 ignores `X-DM-Write-Scope` from a full-tenant token, so a scoped
+/// write would quietly land in global (and a scoped forget would retract every scope's rows).
+pub const OLDER_SERVER_IGNORES_SCOPE: &str = "the server is older than 0.3.7 and ignores --scope/DM_WRITE_SCOPE: \
+the write would land in the token's default scope (global, for a full-tenant token), so nothing was written. \
+Upgrade the server, or run without --scope.";
+
+/// A plain scope-bound token always writes to its own scope; the server ignores the header.
+pub const TOKEN_IGNORES_SCOPE: &str = "this token is bound to its own write scope, so --scope/DM_WRITE_SCOPE cannot name \
+another; nothing was written. Run without --scope.";
 
 /// Why a config with `[server].insecure = true` is refused instead of silently ignored: the old
 /// switch disabled certificate verification, which sent the bearer token to whoever answered.
@@ -25,8 +42,10 @@ Pin the server certificate instead: `dmem login <url> --ca-cert <cert.pem>` (`dm
 start the server with `--tls-san <public hostname>` so the cert covers the name clients use), then delete `insecure` from the config.";
 
 /// Hint appended to a request error when the failure is the server certificate not being
-/// trusted (self-signed without `ca_cert`, or a cert that does not cover the hostname).
-const TLS_TRUST_HINT: &str = "; the server certificate is not trusted: pin it with `dmem login <url> --ca-cert <cert.pem>` (see README, Security model)";
+/// trusted (self-signed without `ca_cert`, or a cert that does not cover the hostname). Already
+/// pinned, rustls still refuses a server cert that is a CA or names the host only in its CN.
+const TLS_TRUST_HINT: &str = "; the server certificate is not trusted: pin it with `dmem login <url> --ca-cert <cert.pem>`; \
+the server cert itself must not be a CA and must name this host in a subjectAltName (see README, Security model)";
 
 /// Walk an error's source chain looking for a rustls/webpki certificate-trust failure.
 fn is_tls_trust_error(e: &dyn std::error::Error) -> bool {
@@ -52,7 +71,7 @@ impl RemoteClient {
     pub fn new(link: &ServerLink) -> Result<Self> {
         // connect_timeout bounds the unreachable-server case: without it a packet-dropping
         // host eats the FULL per-prompt hook budget (8s) before Claude Code kills the hook.
-        let mut b = reqwest::blocking::Client::builder()
+        let mut b = crate::tls::http_builder()
             .timeout(std::time::Duration::from_secs(15))
             .connect_timeout(std::time::Duration::from_secs(3));
         if link.insecure {
@@ -68,21 +87,94 @@ impl RemoteClient {
             base: link.url.trim_end_matches('/').to_string(),
             token: link.token.clone(),
             http,
+            write_scope: None,
+            scope_probe: std::sync::OnceLock::new(),
         })
     }
 
-    fn post(&self, path: &str, body: Value) -> Result<Value> {
-        let resp = self
-            .http
-            .post(format!("{}{}", self.base, path))
-            .bearer_auth(&self.token)
-            .json(&body)
+    /// Name the write scope this client's requests carry (`X-DM-Write-Scope`); None sends no
+    /// header, exactly as before. The value is trimmed and must be one scope the server accepts
+    /// (`entry::valid_write_scope`: printable ASCII, no comma); anything else is refused here,
+    /// not dropped, since a dropped scope lets the writes land in the token's default scope.
+    pub fn with_write_scope(mut self, scope: Option<String>) -> Result<Self> {
+        self.write_scope = match scope {
+            None => None,
+            Some(s) => {
+                let s = s.trim();
+                if !crate::entry::valid_write_scope(s) {
+                    anyhow::bail!("--scope/DM_WRITE_SCOPE must be one scope of printable ASCII text without commas ('' = global)");
+                }
+                Some(s.to_string())
+            }
+        };
+        self.scope_probe = std::sync::OnceLock::new();
+        Ok(self)
+    }
+
+    /// POST and return the status and body text, whatever the status.
+    fn send_post(&self, path: &str, body: &Value) -> Result<(reqwest::StatusCode, String)> {
+        let mut req = self.http.post(format!("{}{}", self.base, path)).bearer_auth(&self.token);
+        if let Some(ws) = &self.write_scope {
+            req = req.header("x-dm-write-scope", ws.as_str());
+        }
+        let resp = req
+            .json(body)
             .send()
             // `send_context` (not `anyhow!("{e}")`) preserves the reqwest error as a source, so
             // `main`'s `{:#}` walks the whole chain (reqwest -> connect -> rustls -> root cause).
             .map_err(|e| send_context(e, format!("POST {path}")))?;
         let status = resp.status();
+        Ok((status, resp.text().unwrap_or_default()))
+    }
+
+    /// Before a write that carries `--scope`: make sure the server will honour it for this
+    /// token (asked once per client). An older server ignores the header and a plain scoped
+    /// token always writes its own scope, and either would store the write somewhere other
+    /// than the caller asked, so the write is refused before it is sent.
+    fn ensure_write_scope_honoured(&self) -> Result<()> {
+        if self.write_scope.is_none() {
+            return Ok(());
+        }
+        self.scope_probe.get_or_init(|| self.probe_write_scope()).clone().map_err(|m| anyhow!(m))
+    }
+
+    fn probe_write_scope(&self) -> std::result::Result<(), String> {
+        let resp = self
+            .http
+            .get(format!("{}/capabilities", self.base))
+            .bearer_auth(&self.token)
+            .send()
+            .map_err(|e| format!("{:#}", send_context(e, "GET /capabilities".into())))?;
+        let status = resp.status();
         let text = resp.text().unwrap_or_default();
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Err(OLDER_SERVER_IGNORES_SCOPE.into());
+        }
+        if !status.is_success() {
+            return Err(format!(
+                "could not confirm that the server honours --scope/DM_WRITE_SCOPE (server {} on /capabilities: {}); nothing was written",
+                status.as_u16(),
+                text.trim()
+            ));
+        }
+        let v: Value = serde_json::from_str(&text).map_err(|e| format!("decode response from /capabilities: {e}"))?;
+        if v.get("write_scope").and_then(|x| x.as_bool()) != Some(true) {
+            return Err(OLDER_SERVER_IGNORES_SCOPE.into());
+        }
+        if v.get("write_scope_header").and_then(|x| x.as_bool()) == Some(false) {
+            return Err(TOKEN_IGNORES_SCOPE.into());
+        }
+        Ok(())
+    }
+
+    /// A POST that writes: with `--scope`, only once the server has confirmed it honours it.
+    fn post_write(&self, path: &str, body: Value) -> Result<Value> {
+        self.ensure_write_scope_honoured()?;
+        self.post(path, body)
+    }
+
+    fn post(&self, path: &str, body: Value) -> Result<Value> {
+        let (status, text) = self.send_post(path, &body)?;
         if !status.is_success() {
             anyhow::bail!("server {} on {}: {}", status.as_u16(), path, text.trim());
         }
@@ -144,6 +236,28 @@ impl RemoteClient {
         self.get("/admin/tenants")
     }
 
+    /// Read (`set` None) or set a tenant's explicit-write-scope policy; returns the policy now
+    /// in force.
+    pub fn admin_policy(&self, tenant: &str, set: Option<bool>) -> Result<bool> {
+        let mut body = json!({ "tenant": tenant });
+        if let Some(on) = set {
+            body["require_explicit_write_scope"] = json!(on);
+        }
+        let (status, text) = self.send_post("/admin/tenant_policy", &body)?;
+        if status == reqwest::StatusCode::NOT_FOUND {
+            anyhow::bail!(
+                "the server is older than 0.3.7 and has no tenant write-scope policy (server 404 on /admin/tenant_policy): nothing was changed; upgrade the server first"
+            );
+        }
+        if !status.is_success() {
+            anyhow::bail!("server {} on /admin/tenant_policy: {}", status.as_u16(), text.trim());
+        }
+        let v: Value = serde_json::from_str(&text).map_err(|e| anyhow!("decode response from /admin/tenant_policy: {e}"))?;
+        v.get("require_explicit_write_scope")
+            .and_then(|x| x.as_bool())
+            .ok_or_else(|| anyhow!("server response missing require_explicit_write_scope"))
+    }
+
     pub fn admin_revoke(&self, target: &str) -> Result<i64> {
         let v = self.post("/admin/revoke", json!({ "target": target }))?;
         Ok(v.get("revoked").and_then(|x| x.as_i64()).unwrap_or(0))
@@ -154,12 +268,25 @@ impl RemoteClient {
         Ok(())
     }
 
+    /// A save: the stored uri. With `--scope`, the server's echo of the scope it stamped must
+    /// match, or the save is reported as an error saying where it went (never as done).
     fn uri_of(&self, path: &str, body: Value) -> Result<String> {
-        let v = self.post(path, body)?;
-        v.get("uri")
+        let v = self.post_write(path, body)?;
+        let uri = v
+            .get("uri")
             .and_then(|u| u.as_str())
             .map(|s| s.to_string())
-            .ok_or_else(|| anyhow!("server response missing uri"))
+            .ok_or_else(|| anyhow!("server response missing uri"))?;
+        if let Some(ws) = &self.write_scope {
+            match v.get("scope").and_then(|x| x.as_str()) {
+                Some(got) if got == ws => {}
+                Some(got) => anyhow::bail!("the server stored {uri} in scope '{got}', not the requested '{ws}'"),
+                None => anyhow::bail!(
+                    "the server did not report the scope it stored {uri} in, so --scope '{ws}' cannot be confirmed (it may be in the token's default scope)"
+                ),
+            }
+        }
+        Ok(uri)
     }
 
     pub fn recall(&self, query: &str, limit: usize) -> Result<Vec<Entry>> {
@@ -181,7 +308,7 @@ impl RemoteClient {
         self.list("/history", json!({ "uri": uri, "limit": limit }))
     }
     pub fn forget(&self, uri: &str) -> Result<usize> {
-        let v = self.post("/forget", json!({ "uri": uri }))?;
+        let v = self.post_write("/forget", json!({ "uri": uri }))?;
         Ok(v.get("forgotten").and_then(|n| n.as_u64()).unwrap_or(0) as usize)
     }
     pub fn persona(&self) -> Result<Vec<Entry>> {
@@ -201,7 +328,7 @@ impl RemoteClient {
         self.uri_of("/remember", json!({ "text": text, "namespace": namespace, "valid_from": valid_from, "valid_to": valid_to }))
     }
     pub fn invalidate(&self, uri: &str, valid_to_ms: i64) -> Result<usize> {
-        let v = self.post("/invalidate", json!({ "uri": uri, "valid_to": valid_to_ms }))?;
+        let v = self.post_write("/invalidate", json!({ "uri": uri, "valid_to": valid_to_ms }))?;
         Ok(v.get("invalidated").and_then(|n| n.as_u64()).unwrap_or(0) as usize)
     }
     pub fn log_decision(&self, title: &str, context: &str, decision: &str, rationale: &str, namespace: &str) -> Result<String> {
@@ -244,11 +371,11 @@ impl RemoteClient {
     // --- graph layer ---
 
     pub fn link(&self, from_uri: &str, to_uri: &str, rel: &str) -> Result<()> {
-        self.post("/link", json!({ "from": from_uri, "to": to_uri, "rel": rel }))?;
+        self.post_write("/link", json!({ "from": from_uri, "to": to_uri, "rel": rel }))?;
         Ok(())
     }
     pub fn unlink(&self, from_uri: &str, to_uri: &str, rel: &str) -> Result<usize> {
-        let v = self.post("/unlink", json!({ "from": from_uri, "to": to_uri, "rel": rel }))?;
+        let v = self.post_write("/unlink", json!({ "from": from_uri, "to": to_uri, "rel": rel }))?;
         Ok(v.get("unlinked").and_then(|n| n.as_u64()).unwrap_or(0) as usize)
     }
     pub fn edges_of(&self, uri: &str) -> Result<Vec<Edge>> {
@@ -302,7 +429,7 @@ impl RemoteClient {
         Ok(RecallGraph { seeds, riders, links })
     }
     pub fn reindex_links(&self) -> Result<(usize, usize)> {
-        let v = self.post("/reindex_links", json!({}))?;
+        let v = self.post_write("/reindex_links", json!({}))?;
         // `pruned` is additive (new servers report it; old servers just don't).
         Ok((
             v.get("linked").and_then(|n| n.as_u64()).unwrap_or(0) as usize,
@@ -310,7 +437,7 @@ impl RemoteClient {
         ))
     }
     pub fn reindex_mentions(&self, dry_run: bool) -> Result<(usize, usize)> {
-        let v = self.post("/reindex_mentions", json!({ "dry_run": dry_run }))?;
+        let v = self.post_write("/reindex_mentions", json!({ "dry_run": dry_run }))?;
         let found = v.get("found").and_then(|n| n.as_u64()).unwrap_or(0) as usize;
         let added = v.get("added").and_then(|n| n.as_u64()).unwrap_or(0) as usize;
         Ok((found, added))
@@ -378,6 +505,36 @@ mod tests {
         let link = ServerLink { url: "https://x/".into(), token: "t".into(), insecure: false, ca_cert: None };
         let c = RemoteClient::new(&link).expect("plain verified client");
         assert_eq!(c.base, "https://x", "trailing slash trimmed");
+    }
+
+    // The client's TLS offers the X25519MLKEM768 hybrid first, with X25519 after it, so a server
+    // without ML-KEM (0.3.7) still negotiates a classical group.
+    #[test]
+    fn client_offers_the_pq_hybrid_first() {
+        let groups = crate::tls::tests::offered_groups(|url| {
+            let link = ServerLink { url, token: "t".into(), insecure: false, ca_cert: None };
+            let _ = RemoteClient::new(&link).unwrap().send_post("/recall", &json!({}));
+        });
+        assert_eq!(groups.first(), Some(&rustls::NamedGroup::X25519MLKEM768), "{groups:?}");
+        assert!(groups.contains(&rustls::NamedGroup::X25519), "{groups:?}");
+    }
+
+    #[test]
+    fn write_scope_must_travel_as_a_header_or_is_refused() {
+        let link = ServerLink { url: "https://x".into(), token: "t".into(), insecure: false, ca_cert: None };
+        let c = RemoteClient::new(&link).unwrap();
+        assert!(c.write_scope.is_none(), "no scope named: no header, as before");
+        let c = RemoteClient::new(&link).unwrap().with_write_scope(Some(String::new())).unwrap();
+        assert_eq!(c.write_scope.as_deref(), Some(""), "'' travels: a deliberate global write");
+        let c = RemoteClient::new(&link).unwrap().with_write_scope(Some(" room:x ".into())).unwrap();
+        assert_eq!(c.write_scope.as_deref(), Some("room:x"), "trimmed, as the server trims");
+        // what the server cannot use is refused here, never dropped: a control character, a
+        // non-ASCII byte (HeaderValue would carry it, the server's to_str() would not read it
+        // and the write used to land in the token's default scope), a list
+        for bad in ["room\nx", "room:caf\u{e9}", "room:a,room:b", "room\tx"] {
+            let err = RemoteClient::new(&link).unwrap().with_write_scope(Some(bad.into())).err().expect("refused, not dropped");
+            assert!(format!("{err:#}").contains("--scope/DM_WRITE_SCOPE"), "{bad:?}: {err:#}");
+        }
     }
 
     #[derive(Debug)]

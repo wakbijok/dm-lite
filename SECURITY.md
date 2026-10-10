@@ -29,8 +29,9 @@ Prefer **GitHub Security Advisories** (private) for this repository:
 1. Open https://github.com/wakbijok/dm-lite/security/advisories/new
 2. Include version/tag, OS, feature set (`dist` vs custom), and a minimal PoC
 
-If advisories are unavailable, email: **arifchehusin@gmail.com** with subject
-`dm-lite security`. Do not attach exploit chains to public issues.
+If advisories are unavailable, open a public issue that only asks for a private
+contact channel, with no details of the finding. Do not attach exploit chains to
+public issues.
 
 ## Response
 

@@ -1,6 +1,6 @@
 [package]
 name = "dm-lite"
-version = "0.3.6"
+version = "0.3.8"
 edition = "2021"
 authors = ["Muhammad Arif (wakbijok)"]
 description = "Memory for Hermes, Codex, Claude Code, OpenCode, Devin, and any MCP agent. daimon-memory v2: one-binary typed memory engine with hybrid recall"
@@ -35,9 +35,9 @@ ui = ["dep:axum", "dep:tokio"]
 # wizard: interactive `dmem setup` first-run flow (dialoguer).
 wizard = ["dep:dialoguer"]
 # self-update: `dmem upgrade` in-place from GitHub Releases.
-self-update = ["dep:semver", "dep:reqwest", "dep:minisign-verify", "dep:self-replace", "dep:tar", "dep:flate2"]
+self-update = ["dep:semver", "dep:reqwest", "dep:rustls", "dep:minisign-verify", "dep:self-replace", "dep:tar", "dep:flate2"]
 # client: remote-client mode - talk to a remote `dmem serve` over HTTPS (reqwest + rustls).
-client = ["dep:reqwest"]
+client = ["dep:reqwest", "dep:rustls"]
 # dist: the friend-facing distribution build (what the release workflow ships).
 dist = ["zvec", "candle", "server", "wizard", "self-update", "client", "ui"]
 
@@ -60,9 +60,11 @@ candle-transformers = { version = "0.8", optional = true }
 tokenizers = { version = "0.21", optional = true }
 hf-hub = { version = "0.4", optional = true }
 axum = { version = "0.7", optional = true }
-axum-server = { version = "0.7", features = ["tls-rustls"], optional = true }
+axum-server = { version = "0.7", features = ["tls-rustls-no-provider"], optional = true }
 rcgen = { version = "0.13", optional = true }
-rustls = { version = "0.23", features = ["ring"], optional = true }
+# TLS on aws-lc-rs, the one rustls provider with ML-KEM: X25519MLKEM768 first, classical groups
+# after it. axum-server and reqwest take the provider `tls::install_provider` sets (no ring).
+rustls = { version = "0.23.27", features = ["aws_lc_rs", "prefer-post-quantum"], optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"], optional = true }
 tower = { version = "0.5", features = ["util"], optional = true }
 dialoguer = { version = "0.11", optional = true }
@@ -71,9 +73,13 @@ self-replace = { version = "1", optional = true }
 tar = { version = "0.4", optional = true }
 flate2 = { version = "1", optional = true }
 semver = { version = "1", optional = true }
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json"], optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls-webpki-roots-no-provider", "json"], optional = true }
 getrandom = { version = "0.2", optional = true }
 sha2 = "0.10"
+
+[target.'cfg(unix)'.dependencies]
+# umask for `dmem serve` (files it creates are owner-only) and signals in its tests.
+libc = "0.2"
 
 [profile.release]
 opt-level = 2

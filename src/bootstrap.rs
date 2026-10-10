@@ -1,5 +1,6 @@
 //! `dm bootstrap` - detect agents and install dm's lifecycle hooks into their config,
-//! idempotently. Claude-Code-compatible hook format works for both Devin and Claude Code.
+//! idempotently. Claude-Code-compatible hook format works for both Devin and Claude Code, and
+//! for the Claude Cowork plugin (Cowork runs the Claude Code engine).
 
 use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
@@ -28,8 +29,13 @@ fn sh_quote(path: &str) -> String {
 
 /// One CC-compatible hook entry array for an event, calling `dm <subcmd>`.
 fn hook_entry(dm: &str, subcmd: &str, timeout: u64) -> Value {
+    hook_entry_matched(dm, subcmd, timeout, "")
+}
+
+/// As `hook_entry`, with an explicit matcher (for SessionStart: `startup|resume|clear|compact`).
+fn hook_entry_matched(dm: &str, subcmd: &str, timeout: u64, matcher: &str) -> Value {
     json!([{
-        "matcher": "",
+        "matcher": matcher,
         "hooks": [{ "type": "command", "command": format!("{} {}", sh_quote(dm), subcmd), "timeout": timeout }]
     }])
 }
@@ -676,6 +682,462 @@ fn desktop_merge(mut root: Value, dm: &str, remove: bool) -> Value {
     root
 }
 
+/// Name of the generated Claude Cowork plugin (kebab-case, as Cowork requires).
+pub const COWORK_PLUGIN_NAME: &str = "dmem-cowork";
+
+/// Where `dmem bootstrap --cowork` writes the plugin tree and its `.plugin` zip. Cowork installs
+/// user plugins only through its Settings -> Plugins upload, so this is a hand-over location, not
+/// a config dir; Cowork's own plugin store (rpm/plugin_<id>/) is never written to.
+pub fn cowork_root() -> Result<PathBuf> {
+    Ok(home()?.join(".daimon").join("cowork-plugin"))
+}
+
+/// Cowork plugin manifest. No `hooks` key: the plugin loader discovers `hooks/hooks.json` by its
+/// default location, matching the manifests Cowork ships itself. No `mcpServers` either: the
+/// tools come from the `mcpServers.dmem` entry in claude_desktop_config.json, and shipping a
+/// second copy inside the plugin would give the session a duplicate dmem tool set.
+fn cowork_manifest() -> Value {
+    json!({
+        "name": COWORK_PLUGIN_NAME,
+        "version": env!("CARGO_PKG_VERSION"),
+        "description": "Shared cross-tool memory for Claude Cowork, backed by dm-lite (dmem): persona + protocols on session start, deterministic hybrid recall on every prompt. Memory tools come from the dmem MCP server registered in claude_desktop_config.json (dmem bootstrap --claude-desktop).",
+        "author": { "name": "daimon" }
+    })
+}
+
+/// SessionStart sources the Cowork plugin reacts to. Cowork runs one engine query per user turn
+/// and resumes the session each time, so `resume` fires on every turn; its output is not attached
+/// to the resumed conversation (the persona from `startup` is already in it), so running the hook
+/// there is a wasted round-trip. `compact` stays: the persona must be re-injected after a compaction.
+const COWORK_SESSION_START_MATCHER: &str = "startup|clear|compact";
+
+/// Cowork runs the Claude Code engine, so plugin hooks share the settings.json hook shape and
+/// the default `dmem hook ...` output envelope. Same events and timeouts as `install_into`; no
+/// SessionEnd for the same reason (Claude Code forbids context injection there).
+fn cowork_hooks(dm: &str) -> Value {
+    json!({
+        "hooks": {
+            "SessionStart": hook_entry_matched(dm, "hook session_start", 10, COWORK_SESSION_START_MATCHER),
+            "UserPromptSubmit": hook_entry(dm, "hook user_prompt_submit", 8),
+        }
+    })
+}
+
+/// Write the plugin tree (`.claude-plugin/plugin.json` + `hooks/hooks.json`) at `plug`, recreated
+/// from scratch so no stale file survives. Returns the two file bodies for the zip writer.
+fn cowork_write_tree(plug: &Path, dm: &str) -> Result<(String, String)> {
+    if plug.exists() {
+        std::fs::remove_dir_all(plug).with_context(|| format!("clear {}", plug.display()))?;
+    }
+    std::fs::create_dir_all(plug.join(".claude-plugin"))?;
+    std::fs::create_dir_all(plug.join("hooks"))?;
+    let manifest = serde_json::to_string_pretty(&cowork_manifest())? + "\n";
+    let hooks = serde_json::to_string_pretty(&cowork_hooks(dm))? + "\n";
+    std::fs::write(plug.join(".claude-plugin/plugin.json"), &manifest)?;
+    std::fs::write(plug.join("hooks/hooks.json"), &hooks)?;
+    Ok((manifest, hooks))
+}
+
+/// Write the plugin tree under `root/dmem-cowork/` and pack it into `root/dmem-cowork.plugin`
+/// (a zip of the tree's contents, entries at the archive root) for the manual Settings -> Plugins
+/// upload. The zip is byte-deterministic (stored entries, fixed timestamp), so a re-run that
+/// changes nothing yields an identical file.
+fn cowork_write_plugin(root: &Path, dm: &str) -> Result<PathBuf> {
+    let (manifest, hooks) = cowork_write_tree(&root.join(COWORK_PLUGIN_NAME), dm)?;
+    let zip = root.join(format!("{COWORK_PLUGIN_NAME}.plugin"));
+    write_stored_zip(
+        &[(".claude-plugin/plugin.json", manifest.as_bytes()), ("hooks/hooks.json", hooks.as_bytes())],
+        &zip,
+    )?;
+    Ok(zip)
+}
+
+/// Delete the generated plugin tree and zip. Returns true if anything was there to remove.
+fn cowork_remove(root: &Path) -> Result<bool> {
+    let plug = root.join(COWORK_PLUGIN_NAME);
+    let zip = root.join(format!("{COWORK_PLUGIN_NAME}.plugin"));
+    let mut existed = false;
+    if plug.exists() {
+        std::fs::remove_dir_all(&plug).with_context(|| format!("remove {}", plug.display()))?;
+        existed = true;
+    }
+    if zip.exists() {
+        std::fs::remove_file(&zip).with_context(|| format!("remove {}", zip.display()))?;
+        existed = true;
+    }
+    Ok(existed)
+}
+
+/// CRC-32 (IEEE 802.3, reflected, poly 0xEDB88320) as the ZIP format requires. Bitwise form: the
+/// inputs are two small JSON files, so a lookup table would be more code than it saves.
+fn crc32(data: &[u8]) -> u32 {
+    let mut crc: u32 = 0xFFFF_FFFF;
+    for &b in data {
+        crc ^= b as u32;
+        for _ in 0..8 {
+            crc = if crc & 1 == 1 { (crc >> 1) ^ 0xEDB8_8320 } else { crc >> 1 };
+        }
+    }
+    !crc
+}
+
+/// Minimal ZIP writer: every entry stored (method 0), fixed DOS timestamp 1980-01-01 00:00, no
+/// data descriptors, no ZIP64, no extra fields. Enough for a plugin of a few small JSON files, and
+/// deliberately dependency-free (a compression crate would add a tree of transitive deps for
+/// zero benefit on a 1 KB payload) and portable (the tests must not need a system `zip` binary).
+/// Entry names are the archive-relative paths with `/` separators, exactly as given.
+fn write_stored_zip(entries: &[(&str, &[u8])], out: &Path) -> Result<()> {
+    fn u16le(v: &mut Vec<u8>, x: u16) {
+        v.extend_from_slice(&x.to_le_bytes());
+    }
+    fn u32le(v: &mut Vec<u8>, x: u32) {
+        v.extend_from_slice(&x.to_le_bytes());
+    }
+    const DOS_TIME: u16 = 0x0000; // 00:00:00
+    const DOS_DATE: u16 = 0x0021; // 1980-01-01
+    let mut body: Vec<u8> = Vec::new();
+    let mut central: Vec<u8> = Vec::new();
+    for (name, data) in entries {
+        let name_b = name.as_bytes();
+        let crc = crc32(data);
+        let size = u32::try_from(data.len()).map_err(|_| anyhow!("zip entry too large: {name}"))?;
+        let offset = u32::try_from(body.len()).map_err(|_| anyhow!("zip too large"))?;
+        // local file header
+        u32le(&mut body, 0x0403_4b50);
+        u16le(&mut body, 10); // version needed: 1.0 (stored)
+        u16le(&mut body, 0); // flags
+        u16le(&mut body, 0); // method: stored
+        u16le(&mut body, DOS_TIME);
+        u16le(&mut body, DOS_DATE);
+        u32le(&mut body, crc);
+        u32le(&mut body, size);
+        u32le(&mut body, size);
+        u16le(&mut body, name_b.len() as u16);
+        u16le(&mut body, 0); // extra len
+        body.extend_from_slice(name_b);
+        body.extend_from_slice(data);
+        // central directory header
+        u32le(&mut central, 0x0201_4b50);
+        u16le(&mut central, 20); // version made by: 2.0, MS-DOS attrs
+        u16le(&mut central, 10); // version needed
+        u16le(&mut central, 0); // flags
+        u16le(&mut central, 0); // method
+        u16le(&mut central, DOS_TIME);
+        u16le(&mut central, DOS_DATE);
+        u32le(&mut central, crc);
+        u32le(&mut central, size);
+        u32le(&mut central, size);
+        u16le(&mut central, name_b.len() as u16);
+        u16le(&mut central, 0); // extra len
+        u16le(&mut central, 0); // comment len
+        u16le(&mut central, 0); // disk number start
+        u16le(&mut central, 0); // internal attrs
+        u32le(&mut central, 0); // external attrs
+        u32le(&mut central, offset);
+        central.extend_from_slice(name_b);
+    }
+    let cd_offset = u32::try_from(body.len()).map_err(|_| anyhow!("zip too large"))?;
+    let cd_size = u32::try_from(central.len()).map_err(|_| anyhow!("zip too large"))?;
+    let n = u16::try_from(entries.len()).map_err(|_| anyhow!("too many zip entries"))?;
+    let mut eocd: Vec<u8> = Vec::new();
+    u32le(&mut eocd, 0x0605_4b50);
+    u16le(&mut eocd, 0); // this disk
+    u16le(&mut eocd, 0); // disk with central dir
+    u16le(&mut eocd, n);
+    u16le(&mut eocd, n);
+    u32le(&mut eocd, cd_size);
+    u32le(&mut eocd, cd_offset);
+    u16le(&mut eocd, 0); // comment len
+    body.extend_from_slice(&central);
+    body.extend_from_slice(&eocd);
+    std::fs::write(out, body).with_context(|| format!("write {}", out.display()))?;
+    Ok(())
+}
+
+/// Plugin id as Cowork's registry keys it: `<name>@<marketplace>`. The marketplace half is
+/// free-form for a locally installed plugin (only the `org-provisioned` suffix is reserved).
+pub const COWORK_PLUGIN_ID: &str = "dmem-cowork@dmem";
+
+/// Cowork workspaces on this machine: one directory per account/org under the app's
+/// local-agent-mode-sessions dir. Each holds the workspace's plugin registry and settings. A
+/// level-2 dir counts as a workspace when it carries any of Cowork's own markers, which keeps
+/// unrelated siblings (e.g. the bundled skills plugin cache) out.
+fn cowork_workspaces() -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Some(base) = dirs::config_dir().map(|d| d.join("Claude").join("local-agent-mode-sessions")) else { return out };
+    let Ok(accts) = std::fs::read_dir(&base) else { return out };
+    for acct in accts.flatten() {
+        if !acct.path().is_dir() || acct.file_name().to_string_lossy().starts_with('.') {
+            continue;
+        }
+        let Ok(orgs) = std::fs::read_dir(acct.path()) else { continue };
+        for org in orgs.flatten() {
+            let p = org.path();
+            if !p.is_dir() || org.file_name().to_string_lossy().starts_with('.') {
+                continue;
+            }
+            let marker = p.join("rpm").is_dir()
+                || p.join("agent").is_dir()
+                || p.join("spaces.json").is_file()
+                || p.join("cowork_settings.json").is_file();
+            if marker {
+                out.push(p);
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Read a JSON file the app owns. Ok(None) when absent, Err when present but not strict JSON:
+/// these are live app files (other plugins, other settings), so an unparseable copy is never
+/// replaced - the caller refuses and says so, as `install_into` does for settings.json.
+fn read_json_file(path: &Path) -> Result<Option<Value>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let raw = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    let v: Value = serde_json::from_str(&raw).with_context(|| format!("{} is not valid JSON", path.display()))?;
+    Ok(Some(v))
+}
+
+fn write_json_file(path: &Path, v: &Value) -> Result<()> {
+    if path.exists() {
+        let _ = std::fs::copy(path, PathBuf::from(format!("{}.dmbak", path.display())));
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, serde_json::to_string_pretty(v)? + "\n").with_context(|| format!("write {}", path.display()))
+}
+
+/// Pure merge for a workspace's `cowork_plugins/installed_plugins.json`. Same v2 schema Claude
+/// Code uses for `~/.claude/plugins/installed_plugins.json` (Cowork reads it with the same
+/// shape): `plugins.<id>` is an array of install entries. Ours is replaced wholesale (idempotent),
+/// keeping the original `installedAt`; every other plugin is preserved. `scope` must be `user`
+/// for Cowork to load it outside a project.
+fn cowork_registry_merge(mut root: Value, install_path: &str, remove: bool, now: &str) -> Value {
+    if !root.is_object() {
+        root = json!({});
+    }
+    let obj = root.as_object_mut().unwrap();
+    obj.entry("version").or_insert(json!(2));
+    let plugins = obj.entry("plugins").or_insert_with(|| json!({}));
+    if !plugins.is_object() {
+        *plugins = json!({});
+    }
+    let plugins = plugins.as_object_mut().unwrap();
+    let installed_at = plugins
+        .get(COWORK_PLUGIN_ID)
+        .and_then(|a| a.as_array())
+        .and_then(|a| a.first())
+        .and_then(|e| e.get("installedAt"))
+        .and_then(|s| s.as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| now.to_string());
+    plugins.remove(COWORK_PLUGIN_ID);
+    if !remove {
+        plugins.insert(
+            COWORK_PLUGIN_ID.to_string(),
+            json!([{
+                "scope": "user",
+                "installPath": install_path,
+                "version": env!("CARGO_PKG_VERSION"),
+                "installedAt": installed_at,
+                "lastUpdated": now,
+            }]),
+        );
+    }
+    root
+}
+
+/// Pure merge for a workspace's `cowork_settings.json`: flip `enabledPlugins.<id>` on (or drop it
+/// on remove), preserving every other key the app keeps there.
+fn cowork_settings_merge(mut root: Value, remove: bool) -> Value {
+    if !root.is_object() {
+        root = json!({});
+    }
+    let enabled = root.as_object_mut().unwrap().entry("enabledPlugins").or_insert_with(|| json!({}));
+    if !enabled.is_object() {
+        *enabled = json!({});
+    }
+    let enabled = enabled.as_object_mut().unwrap();
+    if remove {
+        enabled.remove(COWORK_PLUGIN_ID);
+    } else {
+        enabled.insert(COWORK_PLUGIN_ID.to_string(), json!(true));
+    }
+    root
+}
+
+/// Install (or remove) the plugin directly in one Cowork workspace: copy the tree into
+/// `<ws>/cowork_plugins/dmem-cowork/` (Cowork only loads plugins that live inside its plugins dir),
+/// register it in `cowork_plugins/installed_plugins.json`, and enable it in `cowork_settings.json`.
+/// Cowork's local-plugins reader runs at every session spawn and passes the result to the Claude
+/// Code engine as a plugin dir, hooks included. Returns false (nothing changed) when either app
+/// file is present but unparseable.
+fn cowork_local_install(ws: &Path, dm: &str, remove: bool) -> Result<bool> {
+    let plugins_dir = ws.join("cowork_plugins");
+    let plug = plugins_dir.join(COWORK_PLUGIN_NAME);
+    let registry = plugins_dir.join("installed_plugins.json");
+    let settings = ws.join("cowork_settings.json");
+    let (reg, set) = match (read_json_file(&registry), read_json_file(&settings)) {
+        (Ok(r), Ok(s)) => (r, s),
+        (Err(e), _) | (_, Err(e)) => {
+            println!("  skip Cowork workspace {} -> {e}; fix it and re-run (nothing was changed).", ws.display());
+            return Ok(false);
+        }
+    };
+    let now = rfc3339_utc();
+    if remove {
+        if plug.exists() {
+            std::fs::remove_dir_all(&plug).with_context(|| format!("remove {}", plug.display()))?;
+        }
+        // only rewrite files that exist; never create app files just to record an absence
+        if let Some(r) = reg {
+            write_json_file(&registry, &cowork_registry_merge(r, "", true, &now))?;
+        }
+        if let Some(s) = set {
+            write_json_file(&settings, &cowork_settings_merge(s, true))?;
+        }
+        return Ok(true);
+    }
+    std::fs::create_dir_all(&plugins_dir)?;
+    cowork_write_tree(&plug, dm)?;
+    let install_path = plug.to_string_lossy().to_string();
+    write_json_file(&registry, &cowork_registry_merge(reg.unwrap_or(json!({})), &install_path, false, &now))?;
+    write_json_file(&settings, &cowork_settings_merge(set.unwrap_or(json!({})), false))?;
+    Ok(true)
+}
+
+/// Claude Cowork (macOS): Cowork runs the Claude Code engine on the host with a per-session
+/// config dir, so the hooks `--claude` writes to ~/.claude/settings.json never load there, and
+/// the only way in is a plugin. We install one directly into every Cowork workspace found (hooks
+/// only; the MCP tools ride the claude_desktop_config.json entry, ensured here unless the caller
+/// already wrote it) and also emit a `.plugin` zip as the documented fallback (Claude Desktop ->
+/// Settings -> Plugins upload) for machines where no workspace exists yet.
+fn cowork_install(dm: &str, remove: bool, desktop_done: bool) -> Result<()> {
+    if !cfg!(target_os = "macos") {
+        println!("  skip Claude Cowork (macOS only)");
+        return Ok(());
+    }
+    let root = cowork_root()?;
+    if remove {
+        let mut n = 0;
+        for ws in cowork_workspaces() {
+            if cowork_local_install(&ws, dm, true)? {
+                n += 1;
+            }
+        }
+        if n > 0 {
+            println!("  unwired Claude Cowork in {n} workspace(s) (plugin dir, registry entry and enabled flag removed)");
+        }
+        if cowork_remove(&root)? {
+            println!("  removed the generated Claude Cowork plugin under {}", root.display());
+        }
+        if n == 0 {
+            println!("  Claude Cowork: nothing was installed locally");
+        }
+        println!("    if you uploaded '{COWORK_PLUGIN_NAME}' by hand, uninstall it in Claude Desktop -> Settings -> Plugins.");
+        println!("    mcpServers.dmem in claude_desktop_config.json is left in place (Desktop chat uses it); `--claude-desktop --remove` unwires that.");
+        return Ok(());
+    }
+    let app_present = dirs::config_dir().map(|d| d.join("Claude").exists()).unwrap_or(false);
+    if !app_present {
+        println!("  skip Claude Cowork (Claude Desktop not installed)");
+        return Ok(());
+    }
+    if !desktop_done {
+        claude_desktop_install(dm, false)?;
+    }
+    let zip = cowork_write_plugin(&root, dm)?;
+    let wss = cowork_workspaces();
+    let mut n = 0;
+    for ws in &wss {
+        if cowork_local_install(ws, dm, false)? {
+            println!("  wired Claude Cowork -> {} (plugin installed + enabled; SessionStart -> persona/recent, UserPromptSubmit -> recall)", ws.join("cowork_plugins").join(COWORK_PLUGIN_NAME).display());
+            n += 1;
+        }
+    }
+    if n > 0 {
+        println!("    start a NEW Cowork session to load it (an open session keeps its old plugin set).");
+        println!("    the hooks carry this binary's absolute path ({dm}); if it moves, re-run `dmem bootstrap --cowork`.");
+    } else {
+        if wss.is_empty() {
+            println!("  no Cowork workspace found yet (open Cowork once, then re-run `dmem bootstrap --cowork`),");
+        }
+        println!("  fallback: Claude Desktop -> Settings -> Plugins -> upload {}", zip.display());
+    }
+    Ok(())
+}
+
+/// Best-effort: does any Cowork workspace list our plugin among the ones uploaded through the app
+/// (server-synced store)? Read-only. None when no manifest could be read at all.
+fn cowork_uploaded_in_app() -> Option<bool> {
+    let mut saw_manifest = false;
+    for ws in cowork_workspaces() {
+        let Ok(raw) = std::fs::read_to_string(ws.join("rpm").join("manifest.json")) else { continue };
+        saw_manifest = true;
+        let Ok(v) = serde_json::from_str::<Value>(&raw) else { continue };
+        let hit = v.get("plugins")
+            .and_then(|p| p.as_array())
+            .map(|arr| arr.iter().any(|p| p.get("name").and_then(|n| n.as_str()) == Some(COWORK_PLUGIN_NAME)))
+            .unwrap_or(false);
+        if hit {
+            return Some(true);
+        }
+    }
+    if saw_manifest { Some(false) } else { None }
+}
+
+/// One-line wiring report for `dmem status`: in how many Cowork workspaces the plugin is installed
+/// (registered + enabled + tree present), whether any hooks.json still points at this binary,
+/// and whether a hand-uploaded copy exists as well.
+pub fn cowork_status() -> String {
+    if !cfg!(target_os = "macos") {
+        return "n/a (macOS only)".to_string();
+    }
+    let wss = cowork_workspaces();
+    if wss.is_empty() {
+        return "no Cowork workspace found (open Cowork once, then `dmem bootstrap --cowork`)".to_string();
+    }
+    let dm = dm_bin().unwrap_or_default();
+    let mut installed = 0;
+    let mut stale = false;
+    for ws in &wss {
+        let registered = read_json_file(&ws.join("cowork_plugins").join("installed_plugins.json"))
+            .ok()
+            .flatten()
+            .and_then(|v| v.get("plugins")?.get(COWORK_PLUGIN_ID).cloned())
+            .is_some();
+        let enabled = read_json_file(&ws.join("cowork_settings.json"))
+            .ok()
+            .flatten()
+            .and_then(|v| v.get("enabledPlugins")?.get(COWORK_PLUGIN_ID)?.as_bool())
+            .unwrap_or(false);
+        let hooks = ws.join("cowork_plugins").join(COWORK_PLUGIN_NAME).join("hooks").join("hooks.json");
+        let Ok(raw) = std::fs::read_to_string(&hooks) else { continue };
+        if registered && enabled {
+            installed += 1;
+            if !dm.is_empty() && !raw.contains(&dm) {
+                stale = true;
+            }
+        }
+    }
+    let uploaded = match cowork_uploaded_in_app() {
+        Some(true) => "; also uploaded via Settings -> Plugins",
+        _ => "",
+    };
+    if installed == 0 {
+        return format!("not wired in {} workspace(s) (run `dmem bootstrap --cowork`){uploaded}", wss.len());
+    }
+    format!(
+        "wired in {installed}/{} workspace(s){}{uploaded}",
+        wss.len(),
+        if stale { "; STALE binary path, re-run `dmem bootstrap --cowork`" } else { "" }
+    )
+}
+
 /// The OpenCode plugin source written by `dmem bootstrap --opencode`. `__DMEM__` is replaced
 /// with a JSON-escaped absolute path to this binary (a valid JS string literal, so paths with
 /// spaces/quotes/backslashes survive). OpenCode loads single-file plugins from the global config
@@ -953,8 +1415,8 @@ fn grok_install(dm: &str, remove: bool) -> Result<()> {
     Ok(())
 }
 
-pub fn run(devin: bool, claude: bool, codex: bool, hermes: bool, opencode: bool, grok: bool, claude_desktop: bool) -> Result<()> {
-    run_mode(devin, claude, codex, hermes, opencode, grok, claude_desktop, false)
+pub fn run(devin: bool, claude: bool, codex: bool, hermes: bool, opencode: bool, grok: bool, claude_desktop: bool, cowork: bool) -> Result<()> {
+    run_mode(devin, claude, codex, hermes, opencode, grok, claude_desktop, cowork, false)
 }
 
 /// Wire or (with `remove`) unwire dmem into the selected agents. Devin + Claude Code use the
@@ -962,8 +1424,9 @@ pub fn run(devin: bool, claude: bool, codex: bool, hermes: bool, opencode: bool,
 /// MCP+plugin installer; Hermes uses a `~/.hermes/config.yaml` MCP+shell-hook installer; OpenCode
 /// gets a TypeScript plugin + `mcp.dmem` entry in ~/.config/opencode; Grok gets an MCP entry via
 /// `grok mcp add` (its v0 hooks cannot inject context, so no hook plugin); Claude Desktop
-/// (hook-less) gets an MCP entry in claude_desktop_config.json.
-pub fn run_mode(devin: bool, claude: bool, codex: bool, hermes: bool, opencode: bool, grok: bool, claude_desktop: bool, remove: bool) -> Result<()> {
+/// (hook-less) gets an MCP entry in claude_desktop_config.json; Claude Cowork (macOS) gets that
+/// same MCP entry plus a generated hook plugin (.plugin zip) for manual upload in the app.
+pub fn run_mode(devin: bool, claude: bool, codex: bool, hermes: bool, opencode: bool, grok: bool, claude_desktop: bool, cowork: bool, remove: bool) -> Result<()> {
     let dm = dm_bin()?;
     let h = home()?;
     let mut did_any = false;
@@ -1029,8 +1492,13 @@ pub fn run_mode(devin: bool, claude: bool, codex: bool, hermes: bool, opencode: 
         did_any = true;
     }
 
+    if cowork {
+        cowork_install(&dm, remove, claude_desktop)?;
+        did_any = true;
+    }
+
     if !did_any {
-        println!("Nothing changed. Pass --devin / --claude / --codex / --hermes / --opencode / --grok / --claude-desktop (or --all), and ensure the agent is installed.");
+        println!("Nothing changed. Pass --devin / --claude / --codex / --hermes / --opencode / --grok / --claude-desktop / --cowork (or --all), and ensure the agent is installed.");
         return Ok(());
     }
     println!();
@@ -1038,7 +1506,7 @@ pub fn run_mode(devin: bool, claude: bool, codex: bool, hermes: bool, opencode: 
         println!("Done. dmem hooks removed (the agent's other hooks/plugins are untouched).");
     } else {
         println!("Done. dmem is wired in (SessionStart -> persona/recent, UserPromptSubmit -> recall + save nudge).");
-        println!("Undo any time with:  dmem bootstrap --remove --devin / --claude / --codex / --hermes / --opencode / --grok / --claude-desktop");
+        println!("Undo any time with:  dmem bootstrap --remove --devin / --claude / --codex / --hermes / --opencode / --grok / --claude-desktop / --cowork");
     }
     Ok(())
 }
@@ -1137,7 +1605,7 @@ mod tests {
         let base = serde_json::json!({
             "$schema": "https://opencode.ai/config.json",
             "mcp": { "other": { "type": "local", "command": ["x"], "enabled": true } },
-            "plugin": ["file:///home/u/.config/opencode/plugins/attyx-status.js", "opencode-claude-auth@latest"],
+            "plugin": ["file:///home/u/.config/opencode/plugins/status-line.js", "example-auth-plugin@latest"],
             "shell": "zsh"
         });
         let url = "file:///home/u/.config/opencode/plugins/dmem.ts";
@@ -1335,5 +1803,249 @@ mod tests {
         let hooks = codex_hooks("/Users/some one/.local/bin/dmem");
         let cmd = hooks["hooks"]["SessionStart"][0]["hooks"][0]["command"].as_str().unwrap();
         assert_eq!(cmd, "'/Users/some one/.local/bin/dmem' hook session_start");
+    }
+
+    #[test]
+    fn cowork_hooks_match_claude_code_shape() {
+        let hooks = cowork_hooks("/opt/dmem");
+        let ss = &hooks["hooks"]["SessionStart"][0];
+        // Cowork resumes per turn; skip `resume` (output not attached), keep startup/clear/compact
+        assert_eq!(ss["matcher"], COWORK_SESSION_START_MATCHER);
+        for src in ["startup", "clear", "compact"] {
+            assert!(COWORK_SESSION_START_MATCHER.split('|').any(|m| m == src), "{src} must be matched");
+        }
+        assert!(!COWORK_SESSION_START_MATCHER.split('|').any(|m| m == "resume"));
+        assert_eq!(ss["hooks"][0]["type"], "command");
+        assert_eq!(ss["hooks"][0]["command"], "/opt/dmem hook session_start");
+        assert_eq!(ss["hooks"][0]["timeout"], 10);
+        let ups = &hooks["hooks"]["UserPromptSubmit"][0];
+        assert_eq!(ups["matcher"], "");
+        assert_eq!(ups["hooks"][0]["type"], "command");
+        assert_eq!(ups["hooks"][0]["command"], "/opt/dmem hook user_prompt_submit");
+        assert_eq!(ups["hooks"][0]["timeout"], 8);
+        // Claude Code forbids context injection on SessionEnd, and additionalContextLimit is a
+        // Codex-only key: neither belongs in a plugin the Claude Code engine loads.
+        assert!(hooks["hooks"].get("SessionEnd").is_none());
+        assert!(ss["hooks"][0].get("additionalContextLimit").is_none());
+        assert_eq!(hooks["hooks"].as_object().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn cowork_hooks_shell_quote_the_binary_path() {
+        let hooks = cowork_hooks("/Users/some one/.local/bin/dmem");
+        let cmd = hooks["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"].as_str().unwrap();
+        assert_eq!(cmd, "'/Users/some one/.local/bin/dmem' hook user_prompt_submit");
+    }
+
+    #[test]
+    fn cowork_manifest_is_kebab_and_tracks_crate_version() {
+        let m = cowork_manifest();
+        assert_eq!(m["name"], COWORK_PLUGIN_NAME);
+        assert!(COWORK_PLUGIN_NAME.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'));
+        assert_eq!(m["version"], env!("CARGO_PKG_VERSION"));
+        assert!(m["author"]["name"].is_string());
+        // default hooks/ discovery, and no bundled MCP server (would duplicate the desktop entry)
+        assert!(m.get("hooks").is_none());
+        assert!(m.get("mcpServers").is_none());
+    }
+
+    #[test]
+    fn cowork_plugin_tree_is_self_consistent() {
+        let root = scratch("cowork-tree");
+        let zip = cowork_write_plugin(&root, "/opt/dmem").unwrap();
+        let plug = root.join(COWORK_PLUGIN_NAME);
+        let manifest = read_json(&plug.join(".claude-plugin/plugin.json"));
+        assert_eq!(manifest["name"], COWORK_PLUGIN_NAME);
+        let hooks = read_json(&plug.join("hooks/hooks.json"));
+        assert_eq!(hooks["hooks"]["SessionStart"][0]["hooks"][0]["command"], "/opt/dmem hook session_start");
+        assert!(!plug.join(".mcp.json").exists(), "plugin must not bundle a second dmem MCP server");
+        assert_eq!(zip, root.join("dmem-cowork.plugin"));
+        assert!(zip.is_file());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cowork_write_is_idempotent_deterministic_and_clears_stale_files() {
+        let root = scratch("cowork-idem");
+        let zip = cowork_write_plugin(&root, "/opt/dmem").unwrap();
+        let first = std::fs::read(&zip).unwrap();
+        let stray = root.join(COWORK_PLUGIN_NAME).join("hooks").join("old.json");
+        std::fs::write(&stray, "{}").unwrap();
+        cowork_write_plugin(&root, "/opt/dmem").unwrap();
+        let second = std::fs::read(&zip).unwrap();
+        assert_eq!(first, second, "re-run must produce byte-identical zip");
+        assert!(!stray.exists(), "tree is rebuilt from scratch; stray files do not survive");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cowork_remove_deletes_dir_and_zip() {
+        let root = scratch("cowork-rm");
+        assert!(!cowork_remove(&root).unwrap(), "nothing to remove yet");
+        let zip = cowork_write_plugin(&root, "/opt/dmem").unwrap();
+        assert!(cowork_remove(&root).unwrap());
+        assert!(!zip.exists());
+        assert!(!root.join(COWORK_PLUGIN_NAME).exists());
+        assert!(root.exists(), "the hand-over dir itself is left in place");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn crc32_matches_the_ieee_check_values() {
+        assert_eq!(crc32(b""), 0);
+        assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
+    }
+
+    fn le16(b: &[u8], at: usize) -> u16 {
+        u16::from_le_bytes([b[at], b[at + 1]])
+    }
+    fn le32(b: &[u8], at: usize) -> u32 {
+        u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]])
+    }
+
+    #[test]
+    fn stored_zip_structure_is_valid() {
+        let root = scratch("zip");
+        let out = root.join("t.zip");
+        let a: &[u8] = b"{\"a\":1}\n";
+        let b: &[u8] = b"hooks!";
+        write_stored_zip(&[("x/a.json", a), ("b.txt", b)], &out).unwrap();
+        let z = std::fs::read(&out).unwrap();
+        // EOCD is the last 22 bytes (no comment)
+        let eocd = z.len() - 22;
+        assert_eq!(le32(&z, eocd), 0x0605_4b50);
+        assert_eq!(le16(&z, eocd + 8), 2, "entries on this disk");
+        assert_eq!(le16(&z, eocd + 10), 2, "entries total");
+        let cd_size = le32(&z, eocd + 12) as usize;
+        let cd_off = le32(&z, eocd + 16) as usize;
+        assert_eq!(cd_off + cd_size, eocd, "central dir runs right up to the EOCD");
+        // first local header at 0, stored, crc + sizes + name
+        assert_eq!(le32(&z, 0), 0x0403_4b50);
+        assert_eq!(le16(&z, 8), 0, "method stored");
+        assert_eq!(le32(&z, 14), crc32(a));
+        assert_eq!(le32(&z, 18) as usize, a.len());
+        assert_eq!(le32(&z, 22) as usize, a.len());
+        let n1 = le16(&z, 26) as usize;
+        assert_eq!(&z[30..30 + n1], b"x/a.json");
+        assert_eq!(&z[30 + n1..30 + n1 + a.len()], a);
+        // second local header follows immediately
+        let off2 = 30 + n1 + a.len();
+        assert_eq!(le32(&z, off2), 0x0403_4b50);
+        assert_eq!(le32(&z, off2 + 14), crc32(b));
+        // central directory: two headers whose offsets point at the local headers
+        assert_eq!(le32(&z, cd_off), 0x0201_4b50);
+        assert_eq!(le32(&z, cd_off + 42), 0, "first entry offset");
+        let cn1 = le16(&z, cd_off + 28) as usize;
+        assert_eq!(&z[cd_off + 46..cd_off + 46 + cn1], b"x/a.json");
+        let cd2 = cd_off + 46 + cn1;
+        assert_eq!(le32(&z, cd2), 0x0201_4b50);
+        assert_eq!(le32(&z, cd2 + 42) as usize, off2, "second entry offset");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Cross-check against the system unzip where one exists (macOS/Linux dev boxes); skipped
+    /// silently elsewhere so CI runners without it still pass.
+    #[test]
+    fn stored_zip_passes_system_unzip_when_available() {
+        if std::process::Command::new("unzip").arg("-v").output().is_err() {
+            return;
+        }
+        let root = scratch("cowork-unzip");
+        let zip = cowork_write_plugin(&root, "/opt/dmem").unwrap();
+        let out = std::process::Command::new("unzip").args(["-t", zip.to_str().unwrap()]).output().unwrap();
+        assert!(out.status.success(), "unzip -t failed: {}", String::from_utf8_lossy(&out.stdout));
+        let listing = String::from_utf8_lossy(&out.stdout);
+        assert!(listing.contains(".claude-plugin/plugin.json"));
+        assert!(listing.contains("hooks/hooks.json"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cowork_registry_merge_adds_user_scoped_entry_keeps_others_and_installed_at() {
+        let existing = json!({"version": 2, "plugins": {"other@mkt": [{"scope": "user", "installPath": "/x"}]}});
+        let v = cowork_registry_merge(existing, "/ws/cowork_plugins/dmem-cowork", false, "2026-09-09T00:00:00Z");
+        assert_eq!(v["version"], 2);
+        assert_eq!(v["plugins"]["other@mkt"][0]["installPath"], "/x", "other plugins preserved");
+        let e = &v["plugins"][COWORK_PLUGIN_ID][0];
+        assert_eq!(e["scope"], "user", "Cowork loads non-project plugins only with scope user");
+        assert_eq!(e["installPath"], "/ws/cowork_plugins/dmem-cowork");
+        assert_eq!(e["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(e["installedAt"], "2026-09-09T00:00:00Z");
+        assert_eq!(e["lastUpdated"], "2026-09-09T00:00:00Z");
+        // re-run later: installedAt sticks, lastUpdated moves, still exactly one entry
+        let v2 = cowork_registry_merge(v, "/ws/cowork_plugins/dmem-cowork", false, "2026-09-10T00:00:00Z");
+        assert_eq!(v2["plugins"][COWORK_PLUGIN_ID].as_array().unwrap().len(), 1);
+        assert_eq!(v2["plugins"][COWORK_PLUGIN_ID][0]["installedAt"], "2026-09-09T00:00:00Z");
+        assert_eq!(v2["plugins"][COWORK_PLUGIN_ID][0]["lastUpdated"], "2026-09-10T00:00:00Z");
+        // remove drops only ours
+        let v3 = cowork_registry_merge(v2, "", true, "2026-09-11T00:00:00Z");
+        assert!(v3["plugins"].get(COWORK_PLUGIN_ID).is_none());
+        assert!(v3["plugins"].get("other@mkt").is_some());
+        // malformed input is replaced defensively
+        let v4 = cowork_registry_merge(json!("garbage"), "/p", false, "t");
+        assert_eq!(v4["version"], 2);
+        assert!(v4["plugins"][COWORK_PLUGIN_ID].is_array());
+    }
+
+    #[test]
+    fn cowork_settings_merge_toggles_only_our_flag() {
+        let existing = json!({"someAppKey": {"a": 1}, "enabledPlugins": {"other@mkt": true}});
+        let v = cowork_settings_merge(existing, false);
+        assert_eq!(v["someAppKey"]["a"], 1);
+        assert_eq!(v["enabledPlugins"]["other@mkt"], true);
+        assert_eq!(v["enabledPlugins"][COWORK_PLUGIN_ID], true);
+        let v2 = cowork_settings_merge(v, true);
+        assert!(v2["enabledPlugins"].get(COWORK_PLUGIN_ID).is_none());
+        assert_eq!(v2["enabledPlugins"]["other@mkt"], true);
+        assert_eq!(v2["someAppKey"]["a"], 1);
+        assert_eq!(cowork_settings_merge(json!(null), false)["enabledPlugins"][COWORK_PLUGIN_ID], true);
+    }
+
+    #[test]
+    fn cowork_local_install_writes_tree_registry_and_settings_then_removes_cleanly() {
+        let ws = scratch("cowork-ws");
+        std::fs::write(ws.join("cowork_settings.json"), r#"{"keep":true}"#).unwrap();
+        assert!(cowork_local_install(&ws, "/opt/dmem", false).unwrap());
+        let plug = ws.join("cowork_plugins").join(COWORK_PLUGIN_NAME);
+        assert!(plug.join(".claude-plugin/plugin.json").is_file());
+        let hooks = read_json(&plug.join("hooks/hooks.json"));
+        assert_eq!(hooks["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"], "/opt/dmem hook user_prompt_submit");
+        let reg = read_json(&ws.join("cowork_plugins/installed_plugins.json"));
+        let e = &reg["plugins"][COWORK_PLUGIN_ID][0];
+        assert_eq!(e["installPath"], plug.to_string_lossy().as_ref(), "install path is inside cowork_plugins/");
+        assert!(e["installPath"].as_str().unwrap().starts_with(ws.join("cowork_plugins").to_string_lossy().as_ref()));
+        let set = read_json(&ws.join("cowork_settings.json"));
+        assert_eq!(set["keep"], true, "app's own settings keys preserved");
+        assert_eq!(set["enabledPlugins"][COWORK_PLUGIN_ID], true);
+        assert!(ws.join("cowork_settings.json.dmbak").is_file(), "existing app file backed up");
+        // idempotent
+        assert!(cowork_local_install(&ws, "/opt/dmem", false).unwrap());
+        assert_eq!(read_json(&ws.join("cowork_plugins/installed_plugins.json"))["plugins"][COWORK_PLUGIN_ID].as_array().unwrap().len(), 1);
+        // remove
+        assert!(cowork_local_install(&ws, "/opt/dmem", true).unwrap());
+        assert!(!plug.exists());
+        assert!(read_json(&ws.join("cowork_plugins/installed_plugins.json"))["plugins"].get(COWORK_PLUGIN_ID).is_none());
+        assert!(read_json(&ws.join("cowork_settings.json"))["enabledPlugins"].get(COWORK_PLUGIN_ID).is_none());
+        assert_eq!(read_json(&ws.join("cowork_settings.json"))["keep"], true);
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn cowork_local_install_refuses_unparseable_app_files() {
+        let ws = scratch("cowork-badjson");
+        std::fs::write(ws.join("cowork_settings.json"), "{not json").unwrap();
+        assert!(!cowork_local_install(&ws, "/opt/dmem", false).unwrap(), "must report nothing changed");
+        assert!(!ws.join("cowork_plugins").exists(), "no tree written when refusing");
+        assert_eq!(std::fs::read_to_string(ws.join("cowork_settings.json")).unwrap(), "{not json", "app file untouched");
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn cowork_remove_on_a_workspace_never_creates_app_files() {
+        let ws = scratch("cowork-rm-ws");
+        assert!(cowork_local_install(&ws, "/opt/dmem", true).unwrap());
+        assert!(!ws.join("cowork_settings.json").exists());
+        assert!(!ws.join("cowork_plugins").exists());
+        let _ = std::fs::remove_dir_all(&ws);
     }
 }

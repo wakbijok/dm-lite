@@ -163,6 +163,13 @@ pub fn run() -> Result<()> {
         }
         _ => "Claude Desktop (not installed)".to_string(),
     };
+    // Claude Cowork rides the same app: MCP entry above plus a generated hook plugin that the user
+    // uploads in the app (Settings -> Plugins), so it is only offered where the app is present on macOS.
+    let cowork_label = if cfg!(target_os = "macos") && cd_present {
+        "Claude Cowork (generates a .plugin to upload in Settings -> Plugins)".to_string()
+    } else {
+        "Claude Cowork (macOS + Claude Desktop only)".to_string()
+    };
     let items = [
         json_label(devin_present, &devin_cfg, "Devin CLI"),
         json_label(claude_present, &claude_cfg, "Claude Code"),
@@ -171,11 +178,12 @@ pub fn run() -> Result<()> {
         plain_label(opencode_present, &opencode_cfg, "OpenCode"),
         plain_label(grok_present, &grok_cfg, "Grok CLI"),
         cd_label,
+        cowork_label,
     ];
     let chosen = MultiSelect::with_theme(&theme)
         .with_prompt("Wire dmem into which agents? (nothing is pre-selected; space toggles, enter confirms)")
         .items(&items)
-        .defaults(&[false, false, false, false, false, false, false])
+        .defaults(&[false, false, false, false, false, false, false, false])
         .interact()?;
     let devin = chosen.contains(&0);
     let claude = chosen.contains(&1);
@@ -184,8 +192,9 @@ pub fn run() -> Result<()> {
     let opencode = chosen.contains(&4);
     let grok = chosen.contains(&5);
     let claude_desktop = chosen.contains(&6);
-    if devin || claude || codex || hermes || opencode || grok || claude_desktop {
-        crate::bootstrap::run(devin, claude, codex, hermes, opencode, grok, claude_desktop)?;
+    let cowork = chosen.contains(&7);
+    if devin || claude || codex || hermes || opencode || grok || claude_desktop || cowork {
+        crate::bootstrap::run(devin, claude, codex, hermes, opencode, grok, claude_desktop, cowork)?;
     } else {
         println!("(skipped agent wiring - undo any wiring later with `dmem bootstrap --remove`)");
     }

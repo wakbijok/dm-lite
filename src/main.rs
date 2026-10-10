@@ -2,35 +2,7 @@
 //! `[server]` block points the binary at a `dmem serve` (local loopback or remote); without one
 //! it falls back to the deprecated embedded mode (a single local tenant).
 
-mod bootstrap;
-#[cfg(feature = "client")]
-mod client;
-#[cfg(feature = "client")]
-mod migrate;
-mod config;
-mod embedder;
-mod entry;
-mod hooks;
-mod mcp;
-mod render;
-mod sqlite;
-mod store;
-mod tools;
-mod skills;
-#[cfg(feature = "server")]
-mod iam;
-#[cfg(feature = "server")]
-mod server;
-#[cfg(feature = "server")]
-mod service;
-#[cfg(feature = "wizard")]
-mod setup;
-#[cfg(feature = "self-update")]
-mod upgrade;
-#[cfg(feature = "zvec")]
-mod zvec_index;
-#[cfg(feature = "ui")]
-mod ui;
+use dm_lite::*;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -51,6 +23,14 @@ struct Cli {
     /// config; the token still comes from DM_TOKEN or the config). For CI and scripted ops.
     #[arg(long, global = true)]
     endpoint: Option<String>,
+    /// Write scope for this invocation's writes (overrides DM_WRITE_SCOPE). A remote client
+    /// sends it as X-DM-Write-Scope, the embedded engine stamps it; reads are unchanged.
+    /// `--scope ''` is a deliberate global write (an empty DM_WRITE_SCOPE is not). A tenant with
+    /// the explicit-write-scope policy refuses writes by a full-tenant token that name no
+    /// scope. Refused against a server older than 0.3.7, which would ignore it, and for a plain
+    /// scope-bound token, which always writes its own scope.
+    #[arg(long, global = true, value_name = "SCOPE")]
+    scope: Option<String>,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -62,7 +42,7 @@ enum Cmd {
     #[cfg(feature = "wizard")]
     Setup,
     /// Wire (or with --remove, unwire) dmem into your agents (hooks for Devin/Claude Code/Codex/
-    /// Hermes/Grok; an MCP entry for hook-less Claude Desktop).
+    /// Hermes/Grok; an MCP entry for hook-less Claude Desktop; a hook plugin for Claude Cowork).
     Bootstrap {
         #[arg(long)]
         devin: bool,
@@ -81,6 +61,10 @@ enum Cmd {
         /// Claude Desktop (MCP only; no hooks). Adds an mcpServers.dmem entry.
         #[arg(long = "claude-desktop")]
         claude_desktop: bool,
+        /// Claude Cowork (macOS). Installs a hook plugin into every Cowork workspace (persona +
+        /// per-prompt recall), ensures the mcpServers.dmem entry, and writes a .plugin zip as fallback.
+        #[arg(long)]
+        cowork: bool,
         #[arg(long)]
         all: bool,
         /// remove dm's hooks instead of adding them
@@ -428,6 +412,14 @@ enum AdminCmd {
     },
     /// List tenants and live token counts.
     List,
+    /// Show or set a tenant's write-scope policy. With --require-explicit-write-scope true,
+    /// every write by a full-tenant token must name its scope (`dmem --scope <s>`, or the
+    /// X-DM-Write-Scope header; '' = global); writes that name none are refused.
+    Policy {
+        tenant: String,
+        #[arg(long = "require-explicit-write-scope", value_name = "true|false")]
+        require_explicit_write_scope: Option<bool>,
+    },
     /// Revoke a token (by value) or all of a tenant's tokens.
     Revoke { target: String },
     /// Suspend a tenant and revoke its tokens.
@@ -472,6 +464,12 @@ fn main() {
 
 fn run() -> Result<()> {
     let cli = Cli::parse();
+    // Record --scope before any Memory is opened (config::write_scope reads it, for the remote
+    // client and the embedded engine alike, ahead of DM_WRITE_SCOPE). Recorded even when
+    // empty: `--scope ''` is a deliberate global write, where an empty DM_WRITE_SCOPE is unset.
+    if let Some(ws) = &cli.scope {
+        config::set_cli_write_scope(ws.clone());
+    }
     // Fold the global --endpoint flag into DM_ENDPOINT before any config/server resolution, so the
     // flag transparently overrides the env and the [server] config (see config::server_link).
     if let Some(ep) = &cli.endpoint {
@@ -486,8 +484,8 @@ fn run() -> Result<()> {
     match cli.cmd {
         #[cfg(feature = "wizard")]
         Cmd::Setup => setup::run(),
-        Cmd::Bootstrap { devin, claude, codex, hermes, opencode, grok, claude_desktop, all, remove } => {
-            bootstrap::run_mode(devin || all, claude || all, codex || all, hermes || all, opencode || all, grok || all, claude_desktop || all, remove)
+        Cmd::Bootstrap { devin, claude, codex, hermes, opencode, grok, claude_desktop, cowork, all, remove } => {
+            bootstrap::run_mode(devin || all, claude || all, codex || all, hermes || all, opencode || all, grok || all, claude_desktop || all, cowork || all, remove)
         }
         Cmd::Hook { event, hermes, raw } => match event {
             HookCmd::SessionStart => hooks::session_start(hermes, raw),
@@ -850,15 +848,25 @@ fn run() -> Result<()> {
                     if let Some(arr) = rc.admin_list()?.as_array() {
                         for row in arr {
                             let agents = row.get("agents").and_then(|x| x.as_str()).unwrap_or("");
+                            let explicit = row.get("require_explicit_write_scope").and_then(|x| x.as_bool()).unwrap_or(false);
                             println!(
-                                "- {:<20} {:<10} {} token(s){}",
+                                "- {:<20} {:<10} {} token(s){}{}",
                                 row.get("tenant").and_then(|x| x.as_str()).unwrap_or("?"),
                                 row.get("status").and_then(|x| x.as_str()).unwrap_or("?"),
                                 row.get("tokens").and_then(|x| x.as_i64()).unwrap_or(0),
-                                if agents.is_empty() { String::new() } else { format!("  agents: {agents}") }
+                                if agents.is_empty() { String::new() } else { format!("  agents: {agents}") },
+                                if explicit { "  explicit write scope" } else { "" }
                             );
                         }
                     }
+                }
+                AdminCmd::Policy { tenant, require_explicit_write_scope } => {
+                    let on = rc.admin_policy(&tenant, require_explicit_write_scope)?;
+                    println!(
+                        "tenant '{}': require_explicit_write_scope = {on}{}",
+                        config::canonical_tenant(&tenant),
+                        if on { " (full-tenant writes must name their scope: dmem --scope <s>, '' = global)" } else { "" }
+                    );
                 }
                 AdminCmd::Revoke { target } => println!("revoked {} token(s)", rc.admin_revoke(&target)?),
                 AdminCmd::Rm { tenant } => {
@@ -927,6 +935,7 @@ fn status() -> Result<()> {
         println!("mode   : remote client");
         println!("server : {}", link.url);
         println!("recall : {}", m.recall_mode());
+        print_wiring();
         return Ok(());
     }
     let tenant = config::tenant();
@@ -942,6 +951,13 @@ fn status() -> Result<()> {
     for (k, n) in counts {
         println!("  {:<18} {}", k, n);
     }
+    print_wiring();
+    Ok(())
+}
+
+/// Per-agent wiring lines for `dmem status`. Shared by the remote-client and embedded branches
+/// so the agent report never depends on where the store lives.
+fn print_wiring() {
     if let Some(h) = dirs::home_dir() {
         println!("devin  : {}", wired(&h.join(".config/devin/config.json"), "dmem hook"));
         println!("claude : {}", wired(&h.join(".claude/settings.json"), "dmem hook"));
@@ -955,14 +971,17 @@ fn status() -> Result<()> {
             None => println!("opencode: not found"),
         }
     }
-    Ok(())
+    if let Some(cd) = dirs::config_dir().map(|d| d.join("Claude").join("claude_desktop_config.json")) {
+        println!("claude-desktop: {}", wired(&cd, "\"dmem\""));
+    }
+    println!("cowork : {}", bootstrap::cowork_status());
 }
 
 /// Readiness diagnostics, especially for offline / air-gapped deploys. Reports the embedder that
 /// WOULD load, its HuggingFace cache dir and whether the model is already cached, CPU features, and
 /// any DM_/HF_ env overrides, WITHOUT loading the model (so it never triggers a download).
 fn doctor(json: bool) -> Result<()> {
-    let d = crate::embedder::active_embedder_diag();
+    let d = dm_lite::embedder::active_embedder_diag();
 
     #[cfg(feature = "client")]
     let server_url = config::server_link().map(|l| l.url.clone());
@@ -983,7 +1002,24 @@ fn doctor(json: bool) -> Result<()> {
 
     let cache_dir = d.cache_dir.as_ref().map(|p| p.display().to_string());
     let needs_network = embedder_used && d.neural && !d.cache_present;
-    let env: Vec<(&str, String)> = ["HF_HOME", "HUGGINGFACE_HUB_CACHE", "DM_CANDLE_MODEL", "DM_M2V_MODEL", "DM_CANDLE_F16", "DM_ENDPOINT", "DM_RECALL_FLOOR", "DM_RECALL_EXPAND"]
+    // What the embedded engine will do about its model (DM_REQUIRE_MODEL, HF_HUB_OFFLINE),
+    // predicted from the cache without loading anything.
+    let required = config::require_model();
+    let hub_offline = dm_lite::embedder::hf_hub_offline();
+    let fallback = if required { "refuses to run" } else { "runs degraded: placeholder embedder" };
+    let model_state = if !embedder_used {
+        "n/a (remote client: the server embeds)".to_string()
+    } else if d.neural && d.cache_present {
+        "ok (the model is cached)".to_string()
+    } else if d.neural && !hub_offline {
+        format!("the model downloads on first use (needs network); without it dmem {fallback}")
+    } else if required {
+        let why = if d.neural { "the model is not cached and HF_HUB_OFFLINE forbids a download" } else { "this build has no embedding model" };
+        format!("REFUSES to run: {why} (DM_REQUIRE_MODEL=0 opts out, for tests and development only)")
+    } else {
+        "degraded: placeholder embedder (DM_REQUIRE_MODEL=0)".to_string()
+    };
+    let env: Vec<(&str, String)> = ["HF_HOME", "HUGGINGFACE_HUB_CACHE", "HF_HUB_OFFLINE", "DM_REQUIRE_MODEL", "DM_CANDLE_MODEL", "DM_M2V_MODEL", "DM_CANDLE_F16", "DM_ENDPOINT", "DM_RECALL_FLOOR", "DM_RECALL_EXPAND"]
         .iter()
         .filter_map(|k| std::env::var(k).ok().map(|v| (*k, v)))
         .collect();
@@ -1001,6 +1037,9 @@ fn doctor(json: bool) -> Result<()> {
             "neural": d.neural,
             "model_cache": cache_dir,
             "model_cached": d.cache_present,
+            "model_required": required,
+            "hub_offline": hub_offline,
+            "model_state": model_state,
             "first_run_needs_network": needs_network,
             "avx2": avx2,
             "env": env.iter().map(|(k, v)| (k.to_string(), v.clone())).collect::<std::collections::BTreeMap<_, _>>(),
@@ -1033,6 +1072,8 @@ fn doctor(json: bool) -> Result<()> {
         println!("model_cache : {}", cache_dir.as_deref().unwrap_or("unknown"));
         let cached = if d.cache_present {
             "yes"
+        } else if embedder_used && hub_offline {
+            "NO (HF_HUB_OFFLINE is set: nothing downloads)"
         } else if embedder_used {
             "NO (first run downloads ~130 MB, needs network)"
         } else {
@@ -1048,6 +1089,11 @@ fn doctor(json: bool) -> Result<()> {
         };
         println!("offline_ok  : {offline}");
     }
+    if embedder_used {
+        let req = if required { "required (the default)" } else { "opted out (DM_REQUIRE_MODEL=0: tests and development only)" };
+        println!("model_req   : {req}");
+    }
+    println!("model_state : {model_state}");
     println!("avx2        : {avx2}");
     if env.is_empty() {
         println!("env         : (no DM_/HF_ overrides set)");
@@ -1058,4 +1104,19 @@ fn doctor(json: bool) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scope_flag_is_global_and_keeps_an_empty_value() {
+        let cli = Cli::try_parse_from(["dmem", "remember", "a note", "--scope", "room:x"]).unwrap();
+        assert_eq!(cli.scope.as_deref(), Some("room:x"), "accepted after the subcommand");
+        let cli = Cli::try_parse_from(["dmem", "--scope", "", "import", "notes/"]).unwrap();
+        assert_eq!(cli.scope.as_deref(), Some(""), "'' is a deliberate global write, not unset");
+        let cli = Cli::try_parse_from(["dmem", "remember", "a note"]).unwrap();
+        assert!(cli.scope.is_none());
+    }
 }

@@ -341,6 +341,37 @@ pub fn scope() -> Option<String> {
     std::env::var("DM_SCOPE").ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
 }
 
+/// The global `--scope` flag of this invocation, recorded by `main` before any Memory opens.
+static CLI_WRITE_SCOPE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Record this invocation's `--scope` (even ''). The first call wins.
+pub fn set_cli_write_scope(scope: String) {
+    let _ = CLI_WRITE_SCOPE.set(scope);
+}
+
+/// Write scope for this invocation's writes: the global `--scope` flag, else `DM_WRITE_SCOPE`.
+/// A remote client sends it as `X-DM-Write-Scope` on every request, and the embedded engine
+/// stamps it on writes; reads are unchanged either way. `Some("")` is a deliberate global
+/// write, and only `--scope ''` says that: an EMPTY (or blank) `DM_WRITE_SCOPE` counts as
+/// unset, because environment files often export variables empty (`DM_WRITE_SCOPE=${ROOM:-}`)
+/// and that must not quietly satisfy a tenant's explicit-write-scope policy with a global
+/// write. None = unset (the token's own default applies, and a tenant that requires an
+/// explicit write scope refuses the write).
+pub fn write_scope() -> Option<String> {
+    resolve_write_scope(CLI_WRITE_SCOPE.get().map(String::as_str), std::env::var("DM_WRITE_SCOPE").ok())
+}
+
+fn resolve_write_scope(cli: Option<&str>, env: Option<String>) -> Option<String> {
+    match cli {
+        Some(c) => Some(c.trim().to_string()),
+        None => parse_write_scope(env),
+    }
+}
+
+fn parse_write_scope(v: Option<String>) -> Option<String> {
+    v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
 /// Import manifest (sha256 incremental ingest): maps an imported
 /// file's absolute path to the sha256 of its content at last import, so a re-import of an
 /// unchanged corpus skips the parse + network + embedding work per file. Lives CLIENT-SIDE
@@ -400,9 +431,102 @@ fn parse_save_nudge(v: Option<&str>) -> bool {
     )
 }
 
+/// `DM_REQUIRE_MODEL`: the embedding model is required, by default. When it cannot load (not
+/// cached, no network, `HF_HUB_OFFLINE` without the cache) `dmem serve` does not start and a
+/// local tenant does not open, instead of running on the keyword-equivalent placeholder, which
+/// degrades every recall. `DM_REQUIRE_MODEL=0` (`false`, `no`) allows the placeholder, with a
+/// warning: for tests and development only.
+pub fn require_model() -> bool {
+    parse_require_model(std::env::var("DM_REQUIRE_MODEL").ok().as_deref())
+}
+
+/// Required unless explicitly opted out: only `0`, `false` and `no` turn it off; unset, empty and
+/// any other value (`1`, `off`, a typo) keep the model required.
+fn parse_require_model(v: Option<&str>) -> bool {
+    !matches!(v.map(|s| s.trim().to_ascii_lowercase()).as_deref(), Some("0" | "false" | "no"))
+}
+
+/// `DM_REQUIRE_VECTORS`: a tenant whose vector index cannot open fails to open (its requests
+/// fail) instead of silently serving keyword-only recall.
+pub fn require_vectors() -> bool {
+    parse_require_flag(std::env::var("DM_REQUIRE_VECTORS").ok().as_deref())
+}
+
+/// `DM_EMBED_CONCURRENCY`: how many record bodies `dmem serve` embeds at once, across all
+/// tenants. A long body is up to 64 model windows and each forward pass allocates tens of MB,
+/// so a burst of saves must queue for the model instead of all running together. Default:
+/// half the CPUs, between 1 and 2.
+pub fn embed_concurrency() -> usize {
+    let cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    parse_concurrency("DM_EMBED_CONCURRENCY", std::env::var("DM_EMBED_CONCURRENCY").ok().as_deref(), (cpus / 2).clamp(1, 2))
+}
+
+/// `DM_EMBED_QUERY_CONCURRENCY`: how many recall queries `dmem serve` embeds at once. Queries
+/// have their own permits, so a recall never queues behind long saves. Default 2.
+pub fn embed_query_concurrency() -> usize {
+    parse_concurrency("DM_EMBED_QUERY_CONCURRENCY", std::env::var("DM_EMBED_QUERY_CONCURRENCY").ok().as_deref(), 2)
+}
+
+/// A permit count from 1 to 64; unset or empty is `default`, anything else warns and uses it.
+fn parse_concurrency(name: &str, v: Option<&str>, default: usize) -> usize {
+    match v.map(str::trim).filter(|s| !s.is_empty()) {
+        None => default,
+        Some(s) => match s.parse::<usize>() {
+            Ok(n) if (1..=64).contains(&n) => n,
+            _ => {
+                eprintln!("dmem: {name}={s:?} is not 1-64; using {default}");
+                default
+            }
+        },
+    }
+}
+
+/// A fail-closed switch: unset or empty is off, and so are the explicit offs (`0`, `off`,
+/// `false`, `no`); any other value turns it on, so a typo errs on the safe side.
+fn parse_require_flag(v: Option<&str>) -> bool {
+    match v.map(|s| s.trim().to_ascii_lowercase()) {
+        None => false,
+        Some(s) => !s.is_empty() && !matches!(s.as_str(), "0" | "off" | "false" | "no"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn embed_concurrency_is_1_to_64_with_a_default() {
+        assert_eq!(parse_concurrency("X", None, 2), 2);
+        assert_eq!(parse_concurrency("X", Some(" "), 1), 1);
+        assert_eq!(parse_concurrency("X", Some(" 4 "), 2), 4);
+        assert_eq!(parse_concurrency("X", Some("64"), 2), 64);
+        for bad in ["0", "65", "-1", "two", "1.5"] {
+            assert_eq!(parse_concurrency("X", Some(bad), 2), 2, "{bad}");
+        }
+        assert!((1..=2).contains(&embed_concurrency()) || std::env::var("DM_EMBED_CONCURRENCY").is_ok());
+    }
+
+    #[test]
+    fn require_flags_fail_closed_on_any_value_but_an_explicit_off() {
+        assert!(!parse_require_flag(None));
+        for off in ["", " ", "0", "off", "false", "no", "OFF", " No "] {
+            assert!(!parse_require_flag(Some(off)), "{off:?} is off");
+        }
+        for on in ["1", "true", "yes", "on", "required", "treu"] {
+            assert!(parse_require_flag(Some(on)), "{on:?} is on");
+        }
+    }
+
+    #[test]
+    fn the_model_is_required_unless_explicitly_opted_out() {
+        assert!(parse_require_model(None), "unset: required");
+        for on in ["", " ", "1", "true", "yes", "on", "off", "required", "treu", "00"] {
+            assert!(parse_require_model(Some(on)), "{on:?} keeps the model required");
+        }
+        for off in ["0", "false", "no", "FALSE", " No ", "0\n"] {
+            assert!(!parse_require_model(Some(off)), "{off:?} opts out");
+        }
+    }
 
     #[test]
     fn save_nudge_default_off_env_opt_in() {
@@ -413,6 +537,19 @@ mod tests {
         for off in ["0", "off", "false", "no", "", "garbage"] {
             assert!(!parse_save_nudge(Some(off)), "{off:?} should stay off");
         }
+    }
+
+    #[test]
+    fn only_the_flag_names_a_global_write_an_empty_env_is_unset() {
+        assert_eq!(parse_write_scope(None), None, "unset: the token's default");
+        assert_eq!(parse_write_scope(Some(String::new())), None, "an empty DM_WRITE_SCOPE is unset, not global");
+        assert_eq!(parse_write_scope(Some("  ".into())), None, "blank too");
+        assert_eq!(parse_write_scope(Some(" room:x ".into())), Some("room:x".into()), "trimmed");
+        // --scope wins over the environment, and '' from the flag IS a deliberate global write
+        assert_eq!(resolve_write_scope(Some(""), Some("room:x".into())), Some(String::new()));
+        assert_eq!(resolve_write_scope(Some(" room:y "), None), Some("room:y".into()));
+        assert_eq!(resolve_write_scope(None, Some("room:x".into())), Some("room:x".into()));
+        assert_eq!(resolve_write_scope(None, Some(String::new())), None);
     }
 
     #[test]

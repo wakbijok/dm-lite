@@ -1,6 +1,7 @@
-//! Hook handlers invoked by the host agent (Devin, Claude Code, Codex, Hermes, OpenCode) on
-//! lifecycle events. By default they emit a Claude-Code-compatible additionalContext payload on
-//! stdout, which Devin, Claude Code, and Codex (same hook shape) inject into the model context.
+//! Hook handlers invoked by the host agent (Devin, Claude Code, Claude Cowork, Codex, Hermes,
+//! OpenCode) on lifecycle events. By default they emit a Claude-Code-compatible additionalContext
+//! payload on stdout, which Devin, Claude Code, Cowork (same engine, via the generated plugin),
+//! and Codex (same hook shape) inject into the model context.
 //! With `--hermes` they emit Hermes's `{"context": ...}` shape and read Hermes's hook-input
 //! fields instead - Hermes has no context-injecting SessionStart, so persona rides the first
 //! pre_llm_call (see `user_prompt_submit`). With `--raw` they emit the text verbatim (no JSON

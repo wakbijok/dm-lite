@@ -182,15 +182,27 @@ impl CandleEmbedder {
     pub fn new() -> anyhow::Result<Self> {
         use candle_nn::VarBuilder;
         use candle_transformers::models::bert::{BertModel, Config, DTYPE};
-        use hf_hub::api::sync::Api;
+        use hf_hub::api::sync::ApiBuilder;
         let repo = std::env::var("DM_CANDLE_MODEL").unwrap_or_else(|_| "BAAI/bge-small-en-v1.5".to_string());
         let custom_model = repo != "BAAI/bge-small-en-v1.5";
-        let r = Api::new()?.model(repo);
-        let config: Config = serde_json::from_str(&std::fs::read_to_string(r.get("config.json")?)?)?;
-        let tokenizer = tokenizers::Tokenizer::from_file(r.get("tokenizer.json")?)
+        // hf-hub's `Api::new()` reads only ~/.cache/huggingface/hub and never honours
+        // HF_HUB_OFFLINE, so the cache is resolved here (`hf_hub_cache_dir`) and handed over.
+        let hub = hf_hub_cache_dir().ok_or_else(|| anyhow::anyhow!("no model cache directory (no home directory; set HF_HOME)"))?;
+        let cache = hf_hub::Cache::new(hub.clone());
+        let api = if hf_hub_offline() { None } else { Some(ApiBuilder::from_cache(cache.clone()).build()?.model(repo.clone())) };
+        let cached = cache.model(repo.clone());
+        let get = |file: &str| -> anyhow::Result<std::path::PathBuf> {
+            match &api {
+                // the cache first, then a download into it
+                Some(a) => a.get(file).map_err(|e| anyhow::anyhow!("{file}: {e}")),
+                None => cached.get(file).ok_or_else(|| anyhow::anyhow!("{file} is not cached, and HF_HUB_OFFLINE forbids a download")),
+            }
+        };
+        let config: Config = serde_json::from_str(&std::fs::read_to_string(get("config.json")?)?)?;
+        let tokenizer = tokenizers::Tokenizer::from_file(get("tokenizer.json")?)
             .map_err(|e| anyhow::anyhow!("tokenizer: {e}"))?;
         let device = candle_core::Device::Cpu;
-        let weights = r.get("model.safetensors")?;
+        let weights = get("model.safetensors")?;
         // DM_CANDLE_F16=1 loads weights as f16 (half the model RAM). from_mmaped keeps the file's
         // f32 bytes zero-copy, so we load buffered and convert to the target dtype instead.
         let dtype = if std::env::var("DM_CANDLE_F16").is_ok() { candle_core::DType::F16 } else { DTYPE };
@@ -351,23 +363,57 @@ pub struct EmbedderDiag {
     pub cache_present: bool,
 }
 
-/// The HuggingFace hub cache dir (HUGGINGFACE_HUB_CACHE, else HF_HOME/hub, else
-/// ~/.cache/huggingface/hub, matching hf-hub's own resolution), and whether `model_id`'s snapshot
-/// is already cached there.
+/// The HuggingFace hub cache the model loads from and downloads into: `HUGGINGFACE_HUB_CACHE`,
+/// else `HF_HOME/hub`, else `~/.cache/huggingface/hub` (where dmem always looked before 0.3.8,
+/// whatever the variables said). An empty variable counts as unset.
+pub fn hf_hub_cache_dir() -> Option<std::path::PathBuf> {
+    let var = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
+    resolve_hub_cache(var("HUGGINGFACE_HUB_CACHE"), var("HF_HOME"), dirs::home_dir())
+}
+
+fn resolve_hub_cache(hub_cache: Option<String>, hf_home: Option<String>, home: Option<std::path::PathBuf>) -> Option<std::path::PathBuf> {
+    match (hub_cache, hf_home) {
+        (Some(c), _) => Some(c.into()),
+        (None, Some(h)) => Some(std::path::PathBuf::from(h).join("hub")),
+        (None, None) => home.map(|h| h.join(".cache").join("huggingface").join("hub")),
+    }
+}
+
+/// `HF_HUB_OFFLINE` (`1`, `true`, `yes`, `on`, as HuggingFace's own tools read it): the model
+/// loads from the cache only and nothing is downloaded.
+pub fn hf_hub_offline() -> bool {
+    parse_hf_offline(std::env::var("HF_HUB_OFFLINE").ok().as_deref())
+}
+
+fn parse_hf_offline(v: Option<&str>) -> bool {
+    matches!(v.map(|s| s.trim().to_ascii_lowercase()).as_deref(), Some("1" | "true" | "yes" | "on"))
+}
+
+/// Is `model_id` in the hub cache `hub` the way the loader reads it: `refs/main` names a
+/// snapshot holding every one of `files` (an empty list: any snapshot)?
+fn model_cached(hub: &std::path::Path, model_id: &str, files: &[&str]) -> bool {
+    let dir = hub.join(format!("models--{}", model_id.replace('/', "--")));
+    if files.is_empty() {
+        return dir.join("snapshots").is_dir();
+    }
+    let Ok(rev) = std::fs::read_to_string(dir.join("refs").join("main")) else { return false };
+    let snap = dir.join("snapshots").join(rev);
+    files.iter().all(|f| snap.join(f).exists())
+}
+
+/// The files the candle embedder loads from its model repo.
+const CANDLE_FILES: [&str; 3] = ["config.json", "tokenizer.json", "model.safetensors"];
+
+/// The hub cache dir and whether `model_id` (its `files`) is already cached there.
 #[cfg(any(feature = "fastembed", feature = "candle", feature = "model2vec"))]
-fn hf_model_cache(model_id: &str) -> (Option<std::path::PathBuf>, bool) {
-    let hub = if let Ok(c) = std::env::var("HUGGINGFACE_HUB_CACHE") {
-        std::path::PathBuf::from(c)
-    } else if let Ok(h) = std::env::var("HF_HOME") {
-        std::path::PathBuf::from(h).join("hub")
-    } else if let Some(h) = dirs::home_dir() {
-        h.join(".cache").join("huggingface").join("hub")
-    } else {
-        return (None, false);
-    };
-    let model_dir = hub.join(format!("models--{}", model_id.replace('/', "--")));
-    let present = model_dir.join("snapshots").is_dir();
-    (Some(hub), present)
+fn hf_model_cache(model_id: &str, files: &[&str]) -> (Option<std::path::PathBuf>, bool) {
+    match hf_hub_cache_dir() {
+        Some(hub) => {
+            let present = model_cached(&hub, model_id, files);
+            (Some(hub), present)
+        }
+        None => (None, false),
+    }
 }
 
 /// Diagnostics for the active embedder, computed without loading the model.
@@ -375,20 +421,20 @@ pub fn active_embedder_diag() -> EmbedderDiag {
     #[cfg(feature = "fastembed")]
     {
         let m = std::env::var("DM_CANDLE_MODEL").unwrap_or_else(|_| "BAAI/bge-small-en-v1.5".to_string());
-        let (dir, present) = hf_model_cache(&m);
+        let (dir, present) = hf_model_cache(&m, &[]);
         return EmbedderDiag { name: "fastembed-bge-small", model_id: Some(m), neural: true, cache_dir: dir, cache_present: present };
     }
     #[cfg(all(feature = "candle", not(feature = "fastembed")))]
     {
         let m = std::env::var("DM_CANDLE_MODEL").unwrap_or_else(|_| "BAAI/bge-small-en-v1.5".to_string());
         let name = if m == "BAAI/bge-small-en-v1.5" { "candle-bge-small" } else { "candle-custom" };
-        let (dir, present) = hf_model_cache(&m);
+        let (dir, present) = hf_model_cache(&m, &CANDLE_FILES);
         return EmbedderDiag { name, model_id: Some(m), neural: true, cache_dir: dir, cache_present: present };
     }
     #[cfg(all(feature = "model2vec", not(feature = "fastembed"), not(feature = "candle")))]
     {
         let m = std::env::var("DM_M2V_MODEL").unwrap_or_else(|_| "minishlab/potion-base-8M".to_string());
-        let (dir, present) = hf_model_cache(&m);
+        let (dir, present) = hf_model_cache(&m, &[]);
         return EmbedderDiag { name: "model2vec", model_id: Some(m), neural: true, cache_dir: dir, cache_present: present };
     }
     #[allow(unreachable_code)]
@@ -407,6 +453,50 @@ mod tests {
         let b = e.embed("we chose the lancedb vector substrate");
         let c = e.embed("totally unrelated cooking recipe");
         assert!(cos(&a, &b) > cos(&a, &c), "shared-word text should score higher");
+    }
+
+    // The model cache: HUGGINGFACE_HUB_CACHE, then HF_HOME/hub, then the old default under the
+    // home dir (unchanged for a site that sets neither).
+    #[test]
+    fn hub_cache_honours_the_hf_variables_in_order() {
+        let home = Some(std::path::PathBuf::from("/h"));
+        let s = |v: &str| Some(v.to_string());
+        assert_eq!(resolve_hub_cache(None, None, home.clone()), Some("/h/.cache/huggingface/hub".into()));
+        assert_eq!(resolve_hub_cache(None, s("/srv/hf"), home.clone()), Some("/srv/hf/hub".into()));
+        assert_eq!(resolve_hub_cache(s("/c/hub"), s("/srv/hf"), home.clone()), Some("/c/hub".into()));
+        assert_eq!(resolve_hub_cache(None, None, None), None);
+    }
+
+    #[test]
+    fn hf_hub_offline_reads_as_huggingface_does() {
+        for on in ["1", "true", "YES", " on "] {
+            assert!(parse_hf_offline(Some(on)), "{on:?}");
+        }
+        for off in ["", "0", "false", "no", "off", "2"] {
+            assert!(!parse_hf_offline(Some(off)), "{off:?}");
+        }
+        assert!(!parse_hf_offline(None));
+    }
+
+    // Present means what the loader finds: refs/main names a snapshot with every file.
+    #[test]
+    fn model_cached_needs_every_file_of_the_snapshot_refs_main_names() {
+        let hub = std::env::temp_dir().join(format!("dmhub-{}-{}", std::process::id(), crate::entry::now_ms()));
+        let repo = hub.join("models--o--m");
+        assert!(!model_cached(&hub, "o/m", &CANDLE_FILES), "no cache");
+        std::fs::create_dir_all(repo.join("snapshots/abc")).unwrap();
+        std::fs::create_dir_all(repo.join("refs")).unwrap();
+        assert!(!model_cached(&hub, "o/m", &CANDLE_FILES), "no refs/main");
+        std::fs::write(repo.join("refs/main"), "abc").unwrap();
+        for f in &CANDLE_FILES[..2] {
+            std::fs::write(repo.join("snapshots/abc").join(f), "x").unwrap();
+        }
+        assert!(!model_cached(&hub, "o/m", &CANDLE_FILES), "the weights are missing");
+        std::fs::write(repo.join("snapshots/abc/model.safetensors"), "x").unwrap();
+        assert!(model_cached(&hub, "o/m", &CANDLE_FILES));
+        std::fs::write(repo.join("refs/main"), "def").unwrap();
+        assert!(!model_cached(&hub, "o/m", &CANDLE_FILES), "refs/main names another snapshot");
+        std::fs::remove_dir_all(&hub).unwrap();
     }
 
     // Guards the REAL semantic path: bge-small must rank a semantically-related pair above

@@ -34,6 +34,22 @@ impl Identity {
 
 pub struct Iam {
     conn: Connection,
+    /// The database file (`<data>/iam.db` in production). A bootstrap admin token is written
+    /// beside it, and readiness checks it is still there.
+    path: PathBuf,
+}
+
+/// A tenant as `Iam::list` reports it.
+#[derive(Debug, Clone)]
+pub struct TenantRow {
+    pub tenant: String,
+    pub status: String,
+    /// Live (unrevoked) tokens.
+    pub tokens: i64,
+    /// Comma-joined distinct agent labels of the live tokens (empty = agent-less only).
+    pub agents: String,
+    /// Tenant policy: writes by full-tenant tokens must name their scope (`X-DM-Write-Scope`).
+    pub require_explicit_write_scope: bool,
 }
 
 fn to_hex(bytes: &[u8]) -> String {
@@ -69,7 +85,11 @@ impl Iam {
         if let Some(p) = path.parent() {
             std::fs::create_dir_all(p).ok();
         }
-        let conn = Connection::open(path)?;
+        let mut conn = Connection::open(path)?;
+        // Any transaction takes the write lock at BEGIN, as on the tenant stores (see
+        // `SqliteStore::open`). Every write here is a single autocommit statement today; this
+        // keeps a future multi-statement one from failing on a stale-snapshot upgrade.
+        conn.set_transaction_behavior(rusqlite::TransactionBehavior::Immediate);
         // iam.db holds token hashes and the tenant registry; owner-only (audit Medium #5).
         #[cfg(unix)]
         {
@@ -119,22 +139,118 @@ impl Iam {
                  ALTER TABLE tokens ADD COLUMN adapter INTEGER NOT NULL DEFAULT 0;",
             )?;
         }
-        Ok(Self { conn })
+        // Tenant write-scope policy (0.3.7), same idempotent pattern. Zero default: every
+        // existing tenant keeps its old behaviour until an admin turns the policy on. An older
+        // dmem opening this db ignores the column (its queries name their columns, and its
+        // tenant inserts take the default).
+        let has_policy: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('tenants') WHERE name='require_explicit_write_scope'",
+            [],
+            |r| r.get(0),
+        )?;
+        if has_policy == 0 {
+            conn.execute_batch(
+                "ALTER TABLE tenants ADD COLUMN require_explicit_write_scope INTEGER NOT NULL DEFAULT 0",
+            )?;
+        }
+        Ok(Self { conn, path: path.to_path_buf() })
+    }
+
+    /// Is the IAM database still there and readable? Readiness asks this: an open connection
+    /// keeps reading a file that was deleted or replaced under it, so the file must also still
+    /// be at its path.
+    pub fn healthy(&self) -> Result<()> {
+        if !self.path.exists() {
+            return Err(anyhow!("the IAM database file is missing from its path"));
+        }
+        self.conn.query_row("SELECT COUNT(*) FROM tenants", [], |r| r.get::<_, i64>(0))?;
+        Ok(())
+    }
+
+    /// Where a bootstrap admin token is written (`admin.token` beside `iam.db`).
+    pub fn admin_token_path(&self) -> Option<PathBuf> {
+        self.path.parent().map(|d| d.join("admin.token"))
+    }
+
+    /// Does `tenant` require every write by a full-tenant (scope-unbound) token to name its
+    /// scope in `X-DM-Write-Scope`? A tenant without a row here (an env-token-only tenant)
+    /// has no policy: false.
+    pub fn requires_explicit_write_scope(&self, tenant: &str) -> Result<bool> {
+        let t = crate::config::canonical_tenant(tenant);
+        let on: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT require_explicit_write_scope FROM tenants WHERE tenant=?1",
+                params![t],
+                |r| r.get(0),
+            )
+            .map(Some)
+            .or_else(|e| if e == rusqlite::Error::QueryReturnedNoRows { Ok(None) } else { Err(e) })?;
+        Ok(on.unwrap_or(0) != 0)
+    }
+
+    /// Turn a tenant's explicit-write-scope policy on or off. The tenant must already exist
+    /// here (a typo must not quietly register a new tenant); the change applies from the next
+    /// request, since the server reads the policy per request.
+    pub fn set_requires_explicit_write_scope(&self, tenant: &str, on: bool) -> Result<()> {
+        let t = crate::config::canonical_tenant(tenant);
+        let n = self.conn.execute(
+            "UPDATE tenants SET require_explicit_write_scope=?2 WHERE tenant=?1",
+            params![t, on as i64],
+        )?;
+        if n == 0 {
+            return Err(crate::tools::Refusal::new(format!("unknown tenant '{t}' (create it with `dmem admin add` first)")).into());
+        }
+        Ok(())
     }
 
     /// Ensure a root admin token exists. Returns Some(plaintext) only when a NEW bootstrap
     /// token was generated (so the caller can display/persist it once). `$DM_ADMIN_TOKEN`
     /// registers a fixed admin token instead.
+    ///
+    /// Whenever `DM_ADMIN_TOKEN` is present in the environment, no bootstrap token is ever
+    /// generated, printed or written, even when its value is empty or not UTF-8 (a Secret
+    /// mounted with a missing key, say): the operator chose to supply the admin token, and a
+    /// freshly minted one would land in the logs. Such a value registers nothing and says so.
+    ///
+    /// A non-empty value is THE env admin token: admin tokens registered from an earlier
+    /// `DM_ADMIN_TOKEN` value (rotated, say after a leak) are revoked, so the old value stops
+    /// working at the next start. Bootstrap and other admin tokens are left alone, and an empty
+    /// or unreadable value revokes nothing (it may be a mis-mounted Secret, not a rotation).
     pub fn ensure_admin(&self) -> Result<Option<String>> {
-        if let Ok(t) = std::env::var("DM_ADMIN_TOKEN") {
-            if !t.is_empty() {
-                self.conn.execute(
-                    "INSERT OR IGNORE INTO tokens(token_hash,tenant,is_admin,label,created_ms) \
-                     VALUES(?1,NULL,1,'env',?2)",
-                    params![sha256_hex(&t), crate::entry::now_ms()],
-                )?;
-                return Ok(None);
+        self.ensure_admin_from(std::env::var_os("DM_ADMIN_TOKEN"))
+    }
+
+    /// `ensure_admin` with the `DM_ADMIN_TOKEN` value passed in (None = not set).
+    pub(crate) fn ensure_admin_from(&self, env_token: Option<std::ffi::OsString>) -> Result<Option<String>> {
+        if let Some(raw) = env_token {
+            match raw.to_str() {
+                Some(t) if !t.is_empty() => {
+                    let hash = sha256_hex(t);
+                    let tx = self.conn.unchecked_transaction()?;
+                    tx.execute(
+                        "INSERT OR IGNORE INTO tokens(token_hash,tenant,is_admin,label,created_ms) \
+                         VALUES(?1,NULL,1,'env',?2)",
+                        params![hash, crate::entry::now_ms()],
+                    )?;
+                    let stale = tx.execute(
+                        "UPDATE tokens SET revoked=1 WHERE is_admin=1 AND label='env' AND revoked=0 AND token_hash<>?1",
+                        params![hash],
+                    )?;
+                    tx.commit()?;
+                    if stale > 0 {
+                        eprintln!(
+                            "dmem: revoked {stale} admin token(s) registered from an earlier DM_ADMIN_TOKEN value; \
+                             only the current value is the env admin token"
+                        );
+                    }
+                }
+                _ => eprintln!(
+                    "dmem: DM_ADMIN_TOKEN is set but empty (or not UTF-8): no admin token registered from it, \
+                     and no bootstrap token generated. Admin routes accept only admin tokens already in iam.db."
+                ),
             }
+            return Ok(None);
         }
         let n: i64 = self
             .conn
@@ -147,8 +263,7 @@ impl Iam {
             "INSERT INTO tokens(token_hash,tenant,is_admin,label,created_ms) VALUES(?1,NULL,1,'bootstrap',?2)",
             params![sha256_hex(&token), crate::entry::now_ms()],
         )?;
-        if let Ok(dir) = crate::config::data_dir() {
-            let p = dir.join("admin.token");
+        if let Some(p) = self.admin_token_path() {
             // 0600 from creation (atomic temp+rename); surface a failure instead of swallowing it
             // so a world-readable admin token never goes unnoticed.
             if let Err(e) = crate::config::write_secret(&p, &token) {
@@ -267,19 +382,26 @@ impl Iam {
         Ok((t, token))
     }
 
-    /// (tenant, status, live-token-count, distinct agent labels) per tenant. `agents` is the
-    /// comma-joined distinct agent labels of the tenant's live tokens (empty = agent-less only).
-    pub fn list(&self) -> Result<Vec<(String, String, i64, String)>> {
+    /// One row per tenant: status, live-token count, the comma-joined distinct agent labels of
+    /// its live tokens (empty = agent-less only), and its explicit-write-scope policy.
+    pub fn list(&self) -> Result<Vec<TenantRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT t.tenant, t.status, \
              (SELECT COUNT(*) FROM tokens k WHERE k.tenant=t.tenant AND k.revoked=0), \
              (SELECT COALESCE(GROUP_CONCAT(DISTINCT k2.agent), '') FROM tokens k2 \
-              WHERE k2.tenant=t.tenant AND k2.revoked=0 AND k2.agent IS NOT NULL) \
+              WHERE k2.tenant=t.tenant AND k2.revoked=0 AND k2.agent IS NOT NULL), \
+             t.require_explicit_write_scope \
              FROM tenants t ORDER BY t.tenant",
         )?;
         let rows = stmt
             .query_map([], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?, r.get::<_, String>(3)?))
+                Ok(TenantRow {
+                    tenant: r.get(0)?,
+                    status: r.get(1)?,
+                    tokens: r.get(2)?,
+                    agents: r.get(3)?,
+                    require_explicit_write_scope: r.get::<_, i64>(4)? != 0,
+                })
             })?
             .filter_map(|x| x.ok())
             .collect();
@@ -323,10 +445,63 @@ mod tests {
     #[test]
     fn admin_bootstrap_is_idempotent_and_resolves() {
         let iam = tmp();
-        let t1 = iam.ensure_admin().unwrap().expect("new admin token");
-        assert!(iam.ensure_admin().unwrap().is_none(), "second call does not re-issue");
+        let t1 = iam.ensure_admin_from(None).unwrap().expect("new admin token");
+        assert!(iam.ensure_admin_from(None).unwrap().is_none(), "second call does not re-issue");
         let id = iam.resolve(&t1).expect("admin token resolves");
         assert!(id.is_admin && id.tenant.is_none());
+        // written beside this iam.db (never into the process's data dir), owner-only
+        let p = iam.admin_token_path().unwrap();
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), t1);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+    }
+
+    // P0-6: with DM_ADMIN_TOKEN in the environment no bootstrap token is ever minted, printed or
+    // written, whatever its value; a non-empty value is the admin token.
+    #[test]
+    fn env_admin_token_never_mints_or_writes_a_bootstrap_token() {
+        let iam = tmp();
+        let env = "env-admin-0123456789abcdef";
+        assert!(iam.ensure_admin_from(Some(env.into())).unwrap().is_none());
+        assert!(iam.resolve(env).is_some_and(|id| id.is_admin && id.tenant.is_none()));
+        assert!(!iam.admin_token_path().unwrap().exists(), "no admin.token written");
+        // set but empty (a Secret key that is missing): still no bootstrap, and nothing registered
+        let iam = tmp();
+        assert!(iam.ensure_admin_from(Some("".into())).unwrap().is_none());
+        assert!(!iam.admin_token_path().unwrap().exists());
+        let admins: i64 = iam.conn.query_row("SELECT COUNT(*) FROM tokens WHERE is_admin=1", [], |r| r.get(0)).unwrap();
+        assert_eq!(admins, 0, "an empty DM_ADMIN_TOKEN registers nothing and mints nothing");
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            let iam = tmp();
+            assert!(iam.ensure_admin_from(Some(std::ffi::OsString::from_vec(vec![0xff, 0xfe]))).unwrap().is_none());
+            assert!(!iam.admin_token_path().unwrap().exists());
+        }
+    }
+
+    // Rotating DM_ADMIN_TOKEN (a leaked Secret, say) retires the old value at the next start:
+    // only the current env value stays an admin token. Other admin tokens (the bootstrap one)
+    // are untouched, and an empty value (a mis-mounted Secret) revokes nothing.
+    #[test]
+    fn rotating_the_env_admin_token_revokes_the_old_value() {
+        let iam = tmp();
+        let boot = iam.ensure_admin_from(None).unwrap().expect("bootstrap admin");
+        let (old, new) = ("env-admin-old-0123456789abcdef", "env-admin-new-0123456789abcdef");
+        iam.ensure_admin_from(Some(old.into())).unwrap();
+        assert!(iam.resolve(old).is_some_and(|id| id.is_admin));
+        iam.ensure_admin_from(Some("".into())).unwrap();
+        assert!(iam.resolve(old).is_some_and(|id| id.is_admin), "an empty value revokes nothing");
+        iam.ensure_admin_from(Some(new.into())).unwrap();
+        assert!(iam.resolve(new).is_some_and(|id| id.is_admin), "the new value is the admin token");
+        assert!(iam.resolve(old).is_none(), "the rotated-out value no longer resolves");
+        assert!(iam.resolve(&boot).is_some_and(|id| id.is_admin), "the bootstrap token is not an env token");
+        // idempotent: the same value again changes nothing
+        iam.ensure_admin_from(Some(new.into())).unwrap();
+        assert!(iam.resolve(new).is_some_and(|id| id.is_admin));
     }
 
     #[test]
@@ -354,10 +529,10 @@ mod tests {
         assert_eq!(iam.resolve(&tok).unwrap().agent.as_deref(), Some("assistant"), "first token unchanged");
         // list surfaces the agent labels for the tenant
         let rows = iam.list().unwrap();
-        let row = rows.iter().find(|r| r.0 == "workspace").expect("tenant listed");
-        assert!(row.3.contains("assistant") && row.3.contains("analyst"), "agents listed: {}", row.3);
+        let row = rows.iter().find(|r| r.tenant == "workspace").expect("tenant listed");
+        assert!(row.agents.contains("assistant") && row.agents.contains("analyst"), "agents listed: {}", row.agents);
         // admin tokens stay agent-less
-        let admin = iam.ensure_admin().unwrap().expect("new admin token");
+        let admin = iam.ensure_admin_from(None).unwrap().expect("new admin token");
         assert!(iam.resolve(&admin).unwrap().agent.is_none());
     }
 
@@ -396,9 +571,81 @@ mod tests {
         let id = iam.resolve(legacy_secret).expect("pre-agent token still resolves");
         assert_eq!(id.tenant.as_deref(), Some("legacy"));
         assert!(id.agent.is_none(), "pre-agent token reads back agent-less");
+        assert!(!iam.requires_explicit_write_scope("legacy").unwrap(), "pre-policy tenant: policy off");
         drop(iam);
         let iam2 = Iam::open_at(&path).expect("second open is a no-op (idempotent)");
         assert!(iam2.resolve(legacy_secret).is_some());
+    }
+
+    #[test]
+    fn explicit_write_scope_policy_defaults_off_and_toggles_per_tenant() {
+        let iam = tmp();
+        let (_t, _tok) = iam.create_tenant("workspace", "", "", None).unwrap();
+        iam.create_tenant("other", "", "", None).unwrap();
+        assert!(!iam.requires_explicit_write_scope("workspace").unwrap(), "off by default");
+        iam.set_requires_explicit_write_scope("WorkSpace", true).unwrap();
+        assert!(iam.requires_explicit_write_scope("workspace").unwrap(), "canonical tenant name");
+        assert!(!iam.requires_explicit_write_scope("other").unwrap(), "per tenant");
+        assert!(!iam.requires_explicit_write_scope("env-only").unwrap(), "no row: no policy");
+        let rows = iam.list().unwrap();
+        let flag = |t: &str| rows.iter().find(|r| r.tenant == t).unwrap().require_explicit_write_scope;
+        assert!(flag("workspace") && !flag("other"), "list reports the policy");
+        // an unknown tenant is refused, never silently registered
+        let e = iam.set_requires_explicit_write_scope("typo", true).expect_err("unknown tenant");
+        assert!(e.downcast_ref::<crate::tools::Refusal>().is_some(), "{e:#}");
+        assert!(iam.list().unwrap().iter().all(|r| r.tenant != "typo"));
+        // re-issuing a token (create_tenant re-activates) keeps the policy
+        iam.create_tenant("workspace", "", "second", None).unwrap();
+        assert!(iam.requires_explicit_write_scope("workspace").unwrap());
+        iam.set_requires_explicit_write_scope("workspace", false).unwrap();
+        assert!(!iam.requires_explicit_write_scope("workspace").unwrap());
+    }
+
+    #[test]
+    fn opens_a_0_3_6_iam_db_and_adds_the_policy_column() {
+        // The 0.3.6 schema: agent + scope columns on tokens, no policy column on tenants.
+        let n = C.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("dmiam-036-{}-{}-{}", std::process::id(), crate::entry::now_ms(), n));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("iam.db");
+        let (full_secret, scoped_secret) = ("dmem_full_036_token", "dmem_scoped_036_token");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE tenants(tenant TEXT PRIMARY KEY, display TEXT NOT NULL DEFAULT '', \
+                     status TEXT NOT NULL DEFAULT 'active', created_ms INTEGER NOT NULL);
+                 CREATE TABLE tokens(token_hash TEXT PRIMARY KEY, tenant TEXT, \
+                     is_admin INTEGER NOT NULL DEFAULT 0, label TEXT NOT NULL DEFAULT '', \
+                     created_ms INTEGER NOT NULL, last_used_ms INTEGER, \
+                     revoked INTEGER NOT NULL DEFAULT 0, agent TEXT, scope_read TEXT, \
+                     scope_write TEXT, adapter INTEGER NOT NULL DEFAULT 0);
+                 INSERT INTO tenants(tenant,display,status,created_ms) VALUES('workspace','','active',1);",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO tokens(token_hash,tenant,is_admin,label,created_ms) VALUES(?1,'workspace',0,'op',1)",
+                params![sha256_hex(full_secret)],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO tokens(token_hash,tenant,is_admin,label,created_ms,scope_read,scope_write,adapter) \
+                 VALUES(?1,'workspace',0,'bridge',1,NULL,NULL,1)",
+                params![sha256_hex(scoped_secret)],
+            )
+            .unwrap();
+        }
+        let iam = Iam::open_at(&path).expect("open migrates the 0.3.6 schema");
+        assert!(iam.resolve(full_secret).expect("full token resolves").scope_unbound());
+        assert!(iam.resolve(scoped_secret).expect("adapter token resolves").adapter);
+        assert!(!iam.requires_explicit_write_scope("workspace").unwrap(), "existing tenant: policy off");
+        iam.set_requires_explicit_write_scope("workspace", true).unwrap();
+        drop(iam);
+        let iam = Iam::open_at(&path).expect("second open is a no-op");
+        assert!(iam.requires_explicit_write_scope("workspace").unwrap(), "the policy persists");
+        // an older dmem's tenant insert (no policy column named) still works on the new schema
+        let conn = Connection::open(&path).unwrap();
+        conn.execute("INSERT INTO tenants(tenant,display,status,created_ms) VALUES('late','','active',2)", []).unwrap();
+        assert!(!iam.requires_explicit_write_scope("late").unwrap());
     }
 
     #[test]
@@ -423,12 +670,12 @@ mod tests {
         assert!(id.scope_unbound(), "plain member token is full-tenant");
 
         let scoped = iam
-            .mint_scoped_token("acme", "fadzil", None, &["user:fadzil".to_string()], Some("user:fadzil"), false)
+            .mint_scoped_token("acme", "alice", None, &["user:alice".to_string()], Some("user:alice"), false)
             .unwrap();
         let id = iam.resolve(&scoped).unwrap();
         assert!(!id.scope_unbound());
-        assert_eq!(id.scope_read.as_deref(), Some(&["user:fadzil".to_string()][..]));
-        assert_eq!(id.scope_write.as_deref(), Some("user:fadzil"));
+        assert_eq!(id.scope_read.as_deref(), Some(&["user:alice".to_string()][..]));
+        assert_eq!(id.scope_write.as_deref(), Some("user:alice"));
         assert!(!id.adapter);
 
         let readonly = iam.mint_scoped_token("acme", "ro", None, &["room:x".to_string()], None, false).unwrap();

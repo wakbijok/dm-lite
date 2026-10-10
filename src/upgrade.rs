@@ -93,6 +93,15 @@ mod tests {
             minisign_verify::PublicKey::from_base64(k).expect("compiled-in release key is valid");
         }
     }
+
+    // The download client offers the post-quantum hybrid first, as every dmem TLS client does.
+    #[test]
+    fn download_client_offers_the_pq_hybrid_first() {
+        let groups = crate::tls::tests::offered_groups(|url| {
+            let _ = super::http().unwrap().get(url).send();
+        });
+        assert_eq!(groups.first(), Some(&rustls::NamedGroup::X25519MLKEM768), "{groups:?}");
+    }
 }
 
 /// The release-asset target triple for this build.
@@ -111,7 +120,7 @@ fn target() -> &'static str {
 }
 
 fn http() -> Result<reqwest::blocking::Client> {
-    Ok(reqwest::blocking::Client::builder()
+    Ok(crate::tls::http_builder()
         .user_agent(concat!("dmem/", env!("CARGO_PKG_VERSION")))
         .timeout(std::time::Duration::from_secs(300))
         .build()?)

@@ -23,6 +23,9 @@ pub enum Kind {
     Reminder,
     Memory,
     Skill,
+    /// A slice of a document (daimon-rag knowledge plane): namespace = file path,
+    /// title = section, body = text. Never authored by an agent; a sync worker writes it.
+    Chunk,
     // Domain-entity kinds (the knowledge-graph layer): the "things" the records are about.
     Org,
     Engagement,
@@ -50,6 +53,7 @@ impl Kind {
             Kind::Reminder => "reminder",
             Kind::Memory => "memory",
             Kind::Skill => "skill",
+            Kind::Chunk => "chunk",
             Kind::Org => "org",
             Kind::Engagement => "engagement",
             Kind::Product => "product",
@@ -78,6 +82,7 @@ impl Kind {
             "reminder" => Kind::Reminder,
             "memory" => Kind::Memory,
             "skill" => Kind::Skill,
+            "chunk" => Kind::Chunk,
             "org" => Kind::Org,
             "engagement" => Kind::Engagement,
             "product" => Kind::Product,
@@ -190,6 +195,15 @@ pub fn split_agents_tree(namespace: &str) -> Option<&str> {
     Some(rest.split('/').next().unwrap_or(rest))
 }
 
+/// Can `scope` name a write scope (the `X-DM-Write-Scope` header, `--scope`)? Printable ASCII
+/// (space through `~`) and no comma, after trimming; '' (global) qualifies. The header carries
+/// one scope, but reader scope sets travel comma-separated (`X-DM-Scopes`), so a comma in a
+/// write scope would stamp rows no adapter reader could ever name. Anything else is refused
+/// on both sides - never dropped, since a dropped scope means the token's default one.
+pub fn valid_write_scope(scope: &str) -> bool {
+    scope.bytes().all(|b| (0x20..0x7f).contains(&b) && b != b',')
+}
+
 pub fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -258,6 +272,7 @@ pub fn default_importance(kind: Kind) -> i64 {
         Kind::Persona | Kind::Protocol => 95,
         Kind::ProjectConvention => 70,
         Kind::Skill => 75,
+        Kind::Chunk => 40,
         _ => 60,
     }
 }
@@ -265,6 +280,16 @@ pub fn default_importance(kind: Kind) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn valid_write_scope_is_printable_ascii_without_commas() {
+        for ok in ["", "room:abc123", "user:bob", "user:Jane Doe", "room:a-b_c.d@e", "~!"] {
+            assert!(valid_write_scope(ok), "{ok:?}");
+        }
+        for bad in ["room:caf\u{e9}", "room:a,room:b", "room\tx", "room\nx", "a\u{7f}", "\u{0}"] {
+            assert!(!valid_write_scope(bad), "{bad:?}");
+        }
+    }
 
     #[test]
     fn slug_kebabs_and_caps() {

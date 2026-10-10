@@ -13,7 +13,7 @@ use anyhow::Result;
 use serde_json::{json, Value};
 use std::io::{BufRead, Write};
 
-fn tool_schemas() -> Value {
+pub(crate) fn tool_schemas() -> Value {
     json!([
         {
             "name": "recall",
@@ -167,6 +167,70 @@ fn server_info() -> Value {
     json!({"name": "dmem", "version": env!("CARGO_PKG_VERSION")})
 }
 
+/// The `entity` tool's attributes, as (key, value text) pairs.
+fn entity_attrs(args: &Value) -> Vec<(String, String)> {
+    args.get("attrs")
+        .and_then(|v| v.as_object())
+        .map(|o| {
+            o.iter()
+                .map(|(k, v)| (k.clone(), v.as_str().map(|x| x.to_string()).unwrap_or_else(|| v.to_string())))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The texts one JSON-RPC request will embed (see `tools::EmbedPlan`): the body a save tool
+/// stores, or the query a recall runs, built exactly as `call_tool` and `get_prompt` build
+/// them, so the server can embed them before it takes the tenant lock. Anything else (or a
+/// malformed request) plans nothing; a text missing here is still embedded, under the lock.
+#[cfg_attr(not(feature = "server"), allow(dead_code))]
+pub(crate) fn embed_plan(req: &Value) -> crate::tools::EmbedPlan {
+    use crate::tools::EmbedPlan;
+    let params = req.get("params").cloned().unwrap_or_else(|| json!({}));
+    let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
+    let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
+    match req.get("method").and_then(|m| m.as_str()).unwrap_or("") {
+        "tools/call" => match name {
+            // an as-of slice is keyword-only; the test is `call_tool`'s own (an integer
+            // `as_of` or `valid_at`), so a null or non-integer value still plans the query
+            "recall"
+                if args.get("as_of").and_then(|v| v.as_i64()).is_none()
+                    && args.get("valid_at").and_then(|v| v.as_i64()).is_none() =>
+            {
+                EmbedPlan::query(s(&args, "query"))
+            }
+            "remember" => EmbedPlan::doc(s(&args, "text")),
+            "log_decision" => EmbedPlan::doc(crate::tools::decision_body(
+                s(&args, "title"),
+                s(&args, "context"),
+                s(&args, "decision"),
+                s(&args, "rationale"),
+            )),
+            "log_lesson" => EmbedPlan::doc(crate::tools::lesson_body(s(&args, "title"), s(&args, "lesson"))),
+            "log_incident" => {
+                EmbedPlan::doc(crate::tools::incident_body(s(&args, "title"), s(&args, "impact"), s(&args, "resolution")))
+            }
+            "add_reminder" => EmbedPlan::doc(crate::tools::reminder_body(s(&args, "title"), s(&args, "text"))),
+            "entity" => match crate::entry::Kind::from_str(s(&args, "kind")).filter(|k| k.is_entity()) {
+                Some(kind) if !s(&args, "name").is_empty() => {
+                    EmbedPlan::doc(crate::tools::entity_body(kind, s(&args, "name"), &entity_attrs(&args), s(&args, "desc")))
+                }
+                _ => EmbedPlan::default(),
+            },
+            _ => EmbedPlan::default(),
+        },
+        "prompts/get" if name == "recall" => {
+            let q = args.get("query").and_then(|v| v.as_str()).unwrap_or("").trim();
+            if q.is_empty() {
+                EmbedPlan::default()
+            } else {
+                EmbedPlan::query(q)
+            }
+        }
+        _ => EmbedPlan::default(),
+    }
+}
+
 /// Run a tool; return the text content (or an error string).
 fn call_tool(mem: &Memory, name: &str, args: &Value) -> std::result::Result<String, String> {
     match name {
@@ -287,15 +351,7 @@ fn call_tool(mem: &Memory, name: &str, args: &Value) -> std::result::Result<Stri
             if name.is_empty() {
                 return Err("entity requires a non-empty name".into());
             }
-            let attrs: Vec<(String, String)> = args
-                .get("attrs")
-                .and_then(|v| v.as_object())
-                .map(|o| {
-                    o.iter()
-                        .map(|(k, v)| (k.clone(), v.as_str().map(|x| x.to_string()).unwrap_or_else(|| v.to_string())))
-                        .collect()
-                })
-                .unwrap_or_default();
+            let attrs = entity_attrs(args);
             let ns = if s(args, "namespace").is_empty() { "resources/entities" } else { s(args, "namespace") };
             let body = crate::tools::entity_body(kind, name, &attrs, s(args, "desc"));
             let uri = mem.import_record(kind, ns, name, &body).map_err(|e| e.to_string())?;
@@ -306,7 +362,9 @@ fn call_tool(mem: &Memory, name: &str, args: &Value) -> std::result::Result<Stri
 }
 
 // JSON-RPC 2.0 error codes we emit (a subset of the standard set).
-const PARSE_ERROR: i64 = -32700;
+pub(crate) const PARSE_ERROR: i64 = -32700;
+#[cfg_attr(not(feature = "server"), allow(dead_code))]
+pub(crate) const INVALID_REQUEST: i64 = -32600;
 const METHOD_NOT_FOUND: i64 = -32601;
 const INVALID_PARAMS: i64 = -32602;
 const INTERNAL_ERROR: i64 = -32603;
@@ -388,10 +446,17 @@ fn get_prompt(mem: &Memory, params: &Value) -> std::result::Result<Value, (i64, 
     }))
 }
 
+/// A JSON-RPC error response for a failure BEFORE a request id is known (unparseable or
+/// non-object input), so the id is null per JSON-RPC. Shared by every transport.
+pub(crate) fn protocol_error(code: i64, message: &str) -> Value {
+    json!({"jsonrpc": "2.0", "id": Value::Null, "error": {"code": code, "message": message}})
+}
+
 /// Build the JSON-RPC response for one request. `None` means "no response" (a notification: any
 /// request without an `id`). An `id`-bearing request ALWAYS gets a reply (result or error), so a
-/// client never blocks waiting on a dropped request.
-fn handle(mem: &Memory, instructions: &Option<String>, req: &Value) -> Option<Value> {
+/// client never blocks waiting on a dropped request. Transport-agnostic: the stdio loop and the
+/// HTTP route both dispatch through here.
+pub(crate) fn handle(mem: &Memory, instructions: &Option<String>, req: &Value) -> Option<Value> {
     let id = req.get("id").cloned()?; // no id -> notification -> stay silent
     let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
     let params = req.get("params").cloned().unwrap_or_else(|| json!({}));
@@ -437,8 +502,7 @@ pub fn serve() -> Result<()> {
             Err(_) => {
                 // Unparseable line: reply with a parse error (null id, per JSON-RPC) instead of
                 // going silent, so a client never blocks on a dropped request.
-                let msg = json!({"jsonrpc": "2.0", "id": Value::Null, "error": {"code": PARSE_ERROR, "message": "parse error"}});
-                writeln!(out, "{}", msg)?;
+                writeln!(out, "{}", protocol_error(PARSE_ERROR, "parse error"))?;
                 out.flush()?;
                 continue;
             }
@@ -613,5 +677,30 @@ mod tests {
         // a real entity kind is accepted
         let ok = handle(&mem, &None, &json!({"id":2,"method":"tools/call","params":{"name":"entity","arguments":{"kind":"org","name":"Contoso Hardware"}}})).unwrap();
         assert_eq!(ok["result"]["isError"], false);
+    }
+
+    // P0-5: the texts a request embeds, as the server plans them before the tenant lock. An
+    // as-of recall is keyword-only and plans nothing; so does anything that embeds nothing.
+    #[test]
+    fn embed_plan_names_the_texts_a_call_embeds() {
+        let call = |name: &str, args: Value| json!({"id": 1, "method": "tools/call", "params": {"name": name, "arguments": args}});
+        assert_eq!(embed_plan(&call("recall", json!({"query": "q1"}))).queries, vec!["q1"]);
+        assert!(embed_plan(&call("recall", json!({"query": "q1", "as_of": 5}))).is_empty());
+        assert!(embed_plan(&call("recall", json!({"query": "q1", "valid_at": 5}))).is_empty());
+        // a null or non-integer as_of is no as-of slice to `call_tool`: the query is embedded
+        for not_an_as_of in [json!({"query": "q1", "as_of": null}), json!({"query": "q1", "valid_at": "yesterday"})] {
+            assert_eq!(embed_plan(&call("recall", not_an_as_of.clone())).queries, vec!["q1"], "{not_an_as_of}");
+        }
+        assert_eq!(embed_plan(&call("remember", json!({"text": "t"}))).docs, vec!["t"]);
+        assert_eq!(
+            embed_plan(&call("log_lesson", json!({"title": "a", "lesson": "b"}))).docs,
+            vec![crate::tools::lesson_body("a", "b")]
+        );
+        assert!(embed_plan(&call("entity", json!({"kind": "decision", "name": "x"}))).is_empty(), "not an entity kind");
+        assert!(embed_plan(&call("forget", json!({"uri": "u"}))).is_empty());
+        assert!(embed_plan(&json!({"id": 1, "method": "tools/list"})).is_empty());
+        let prompt = json!({"id": 1, "method": "prompts/get", "params": {"name": "recall", "arguments": {"query": " q2 "}}});
+        assert_eq!(embed_plan(&prompt).queries, vec!["q2"]);
+        assert!(embed_plan(&json!("not an object")).is_empty());
     }
 }

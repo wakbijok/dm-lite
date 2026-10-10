@@ -50,7 +50,17 @@ pub trait MemoryStore {
 
     /// Retract a uri: close its current version(s) in system time so it drops out of recall,
     /// keeping the lineage (append-only, never hard-deleted). Returns how many were closed.
-    fn forget(&self, uri: &str) -> Result<usize>;
+    /// Every scope's live rows (the full-tenant writer's view): `forget_in(uri, None)`.
+    fn forget(&self, uri: &str) -> Result<usize> {
+        self.forget_in(uri, None)
+    }
+
+    /// Scope-exact retraction. `None` = every scope (full-tenant writer); `Some(ws)` closes
+    /// ONLY the live rows of `uri` whose scope is `ws` - another scope holding the same uri is
+    /// another audience's record and is never touched. The return counts the rows closed in
+    /// that selection only. The graph cascade (the uri's edges) runs only when, after the
+    /// close, no live row of the uri remains in ANY scope.
+    fn forget_in(&self, uri: &str, scope: Option<&str>) -> Result<usize>;
 
     /// System-time of the most recent write of ANY version (`MAX(system_from_ms)`), or None for
     /// an empty store. This is "when did I last save", used by the save-discipline nudge cadence;
@@ -61,13 +71,27 @@ pub trait MemoryStore {
     /// onward, keeping the historical `[valid_from, valid_to_ms)` slice queryable via as-of. This
     /// is a VALID-time end, distinct from `forget` (which retracts from current belief in SYSTEM
     /// time, as if we never should have recorded it). Returns how many segments were affected.
-    fn invalidate(&self, uri: &str, valid_to_ms: i64) -> Result<usize>;
+    /// Every scope's live rows (the full-tenant writer's view): `invalidate_in(.., None)`.
+    fn invalidate(&self, uri: &str, valid_to_ms: i64) -> Result<usize> {
+        self.invalidate_in(uri, valid_to_ms, None)
+    }
+
+    /// Scope-exact invalidation, with the same selection rule as `forget_in`: `None` = every
+    /// scope, `Some(ws)` = only the live segments in `ws`. Returns the segments affected in
+    /// that selection only. A cut at/before a segment's start drops it with no remainder; when
+    /// the call leaves the uri with no live row in any scope, its edges cascade exactly as
+    /// after `forget_in`, in the same transaction.
+    fn invalidate_in(&self, uri: &str, valid_to_ms: i64, scope: Option<&str>) -> Result<usize>;
 
     // --- graph layer (edges between records) ---
-    // Edges are NON-cascading by design: forget/invalidate do not remove a record's edges, so an
-    // edge can outlive its endpoint. Reads handle this gracefully (recall_expanded hydrates only
-    // current records via get(); the viewer drops edges whose endpoints are absent). Remove an
-    // edge explicitly with unlink.
+    // A uri's edges go with its LAST live row: `forget_in` and `invalidate_in` cascade them
+    // once no live row of the uri remains in any scope (a scoped retraction that leaves another
+    // scope's row live keeps them, and so does an invalidation that leaves a live remainder -
+    // that node still exists). Edges can still outlive an endpoint (links made to
+    // a never-existed uri, rot from before the cascade existed); reads handle this gracefully
+    // (recall_expanded hydrates only current records via get(); the viewer drops edges whose
+    // endpoints are absent) and `prune_dangling_edges` clears it. Remove an edge explicitly
+    // with unlink.
 
     /// Add a typed directed edge `from_uri -[rel]-> to_uri`. Idempotent (a duplicate edge is a
     /// no-op). Edges are curated relations, not bitemporal facts: re-deriving them is safe.
@@ -163,8 +187,10 @@ pub trait MemoryStore {
 
     /// May the current reader see this uri at all? (Scope primitive.) This is the
     /// TRAVERSAL-level gate: graph expansion must not walk THROUGH an invisible node -
-    /// rider `via` provenance would leak its title otherwise. Default: everything visible
-    /// (stores without scope support behave exactly as before).
+    /// rider `via` provenance would leak its title otherwise. A uri with no live row is judged
+    /// by its newest row ever (a retracted record's uri stays as hidden as the record was);
+    /// only a uri with no row at all is visible. Default: everything visible (stores without
+    /// scope support behave exactly as before).
     fn scope_visible(&self, uri: &str) -> Result<bool> {
         let _ = uri;
         Ok(true)
@@ -173,9 +199,10 @@ pub trait MemoryStore {
     /// Graph hygiene: delete every edge with at least one dead endpoint. Returns how many
     /// edges were pruned. An endpoint is DEAD when its uri has no system-open version at all
     /// (forgotten, or never existed); an INVALIDATED record (valid-time closed, system-time
-    /// open) is still a live node of the belief history and keeps its edges. `forget`
-    /// cascades its own edges going forward; this is the batch pass that clears rot
-    /// accumulated before that, plus manual links to targets that never existed. Recall
+    /// open) is still a live node of the belief history and keeps its edges. `forget_in` and
+    /// `invalidate_in` cascade a uri's edges when its last live row goes; this is the batch
+    /// pass that clears rot accumulated before that, plus manual links to targets that never
+    /// existed. Recall
     /// stays tolerant of dangling edges regardless (dead riders are skipped without
     /// consuming the cap) - pruning stops them from also bridging BFS expansion.
     fn prune_dangling_edges(&self) -> Result<usize>;

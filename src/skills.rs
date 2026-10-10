@@ -13,7 +13,9 @@
 
 use crate::config;
 use crate::entry::{Entry, Kind};
-use crate::tools::{LocalMemory, Memory};
+use crate::sqlite::SqliteStore;
+use crate::store::MemoryStore;
+use crate::tools::Memory;
 use anyhow::{anyhow, Result};
 use std::path::Path;
 
@@ -161,17 +163,15 @@ pub fn import(dir: &str) -> Result<()> {
 /// `dmem skills sync` - reads the local tenant store (a safe concurrent read) and projects every
 /// skill record to `~/.claude/skills/<name>/SKILL.md`.
 pub fn sync() -> Result<()> {
-    let mem = LocalMemory::open_tenant(&config::tenant())?;
     let root = config::claude_skills_dir()?;
-    let n = sync_to(&mem.skills_all(100_000)?, &root)?;
+    let n = sync_to(&local_skills()?, &root)?;
     println!("synced {n} skill(s) -> {}", root.display());
     Ok(())
 }
 
 /// `dmem skills list`
 pub fn list() -> Result<()> {
-    let mem = LocalMemory::open_tenant(&config::tenant())?;
-    let rows = list_rows(&mem.skills_all(100_000)?);
+    let rows = list_rows(&local_skills()?);
     if rows.is_empty() {
         println!("no skills imported yet (dmem skills import <dir>)");
     }
@@ -181,11 +181,23 @@ pub fn list() -> Result<()> {
     Ok(())
 }
 
+/// Every skill record in the local tenant's store, read straight from its database: the read
+/// embeds nothing, so it loads no embedding model (a remote client reading the loopback
+/// server's store must never need one). `DM_SCOPE` narrows it as it does the engine.
+fn local_skills() -> Result<Vec<Entry>> {
+    let mut store = SqliteStore::open(&config::db_path(&config::tenant())?)?;
+    if let Some(s) = config::scope() {
+        store.set_read_scopes(Some(vec![s]));
+    }
+    store.by_kind("skill", 100_000)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::entry::now_ms;
     use crate::sqlite::SqliteStore;
+    use crate::tools::LocalMemory;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
