@@ -3,6 +3,89 @@
 Notable changes to dm-lite (`dmem`). Releases up to and including 0.3.6 are
 described on [GitHub Releases](https://github.com/wakbijok/dm-lite/releases).
 
+## 0.4.0 - 2026-10-20
+
+The last feature release of dm-lite: the held branches are merged
+(the managed-install upgrade fence and release packaging, the WorkBuddy and
+CodeBuddy bootstrap target, and whole-record recall). From here dm-lite takes
+fixes.
+
+### Added
+
+- **`scripts/package-release.sh`**: makes the release archive from a binary that is
+  already built. The archive is flat, with exactly `LICENSE`, `NOTICE`, `README.md`,
+  `THIRD-PARTY-aws-lc.txt`, `THIRD_PARTY_LICENSES.md`, `dmem` and `libzvec_c_api.so`, and
+  it has the same bytes from any checkout path, umask, time zone or input file times
+  (sorted members, owner 0, fixed modes, the commit's time). It refuses a dirty tree, a
+  version with no changelog section, a binary with a RUNPATH other than `$ORIGIN` or with a
+  build path under `/home`, `/Users` or `/root` inside it (the 0.3.8 binary has both), a
+  binary that is not the `dist` build or not this version, an AWS-LC text that is not the
+  locked `aws-lc-sys`'s licence file, a stale `THIRD_PARTY_LICENSES.md`, and an archive that
+  exists. It never builds, signs, tags or uploads; it prints the `rsign` command, whose
+  trusted comment is `file:<archive>`, a tab, `version:X.Y.Z` (never a space: `dmem upgrade`
+  splits on tabs). `scripts/test-package-release.sh` tests it with stand-in ELF files.
+- **`THIRD-PARTY-aws-lc.txt`** is now tracked (the licence file of the locked
+  `aws-lc-sys`), and `release.yml` copies it into every archive, as NOTICE says. The
+  0.3.8 archive carried it only because it was packaged by hand.
+- **`THIRD_PARTY_LICENSES.md`**, the licence text of every Rust crate compiled into the
+  `dist` build for the four release targets, is made by cargo-about from `about.toml` and
+  `about.md.hbs` (`scripts/package-release.sh --write-notice`), and the script refuses to
+  package when the committed file is not what cargo-about generates. The file is not
+  committed yet: it has to be generated once on a host that has every crate of
+  `Cargo.lock` in its cargo cache.
+
+- **`docs/releasing.md`** is the release runbook that matches the scripts: the two lanes
+  (hand and workflow) and which one is in use, the gate (`cargo test --features dist`), what a
+  host without network needs (every locked `.crate` file in the cargo cache, and
+  `ZVEC_LIB_DIR` with `ZVEC_AUTO_BUILD=0` for the native library), the build command that
+  keeps build paths out of the binary, packaging, signing, verifying, and a written GitLab
+  upload step.
+- **The release signature carries `file:<archive>`, a tab, `version:X.Y.Z`** as its trusted
+  comment when made by `scripts/package-release.sh`'s command or `contrib/sign-release.py`
+  (which now also takes `--packaged DIR`, the output directory of the packaging script, in
+  place of a workflow artifact). `dmem upgrade` verifies it as before; a test signs a fixture
+  with exactly that comment and passes it through the verifier, and shows that the
+  space-separated form the hub's own tooling writes would be refused.
+
+- **`dmem bootstrap --workbuddy`** wires every Tencent WorkBuddy and CodeBuddy home
+  present (`~/.workbuddy-ai`, which current WorkBuddy builds use, then `~/.workbuddy` and
+  `~/.codebuddy`). `settings.json` gets the SessionStart persona and UserPromptSubmit
+  recall hooks, and `memory.autoMemoryEnabled` is set to `false` in the same atomic write,
+  so the runtime's own `MEMORY.md` auto-memory does not build a second store beside dmem;
+  `--remove` restores the stock default. `.mcp.json` gets the `dmem` MCP server. WorkBuddy
+  app homes also get a local plugin marketplace with a `dmem@dmem` plugin that declares the
+  server, because the app starts its sessions with `strictMcpConfig` and ignores the
+  user-scope `.mcp.json`; other marketplaces in `known_marketplaces.json` are kept, and a
+  file that is not strict JSON is refused (with a `.dmbak` copy). WorkBuddy homes also get
+  the persona and protocols in a marked dmem-managed block in `SOUL.md`, with pointers in
+  `IDENTITY.md` and `USER.md`; text outside the marked blocks is kept. The setup wizard lists
+  the target.
+- **`dmem recall --full`** prints each record's body whole (the CLI printed titles
+  only), and the MCP `recall` tool takes `full: true` for the same.
+
+### Changed
+
+- **`dmem upgrade` refuses on a managed install.** A host installer owns the version
+  set it installs, so on its hosts `dmem upgrade` stops before it makes any request,
+  prints that the install is managed, names `daimon-expert upgrade`, and exits 3
+  (other failures still exit 1). An install is managed when the file
+  `.daimon-managed` is in the directory of the real binary (the path after symlinks
+  are resolved; the installer writes it root-owned), or when `DM_MANAGED` is `1`,
+  `true`, `yes` or `on` (any case) in the command's own environment. The marker is
+  the fence that holds: a service unit's `Environment=` does not reach an operator's
+  shell. The fence fails closed: a program path that cannot be found or resolved, or
+  a marker lookup that fails with anything but "not found", is a refusal. `--yes`
+  only skips the question after a verified download, so it does not get past it.
+  Only a build with `dmem upgrade` (the `self-update` feature, so `dist`) has the
+  fence. See docs/managed-install.md.
+
+- **Recall shows whole records.** Every recall surface (the per-prompt hook, the MCP
+  `recall` tool and the `recall` prompt) clipped each body at 240 characters, which cut a
+  decision before its context and a lesson before its fix. The block now has a budget of
+  6000 characters shared between its hits, at least 240 and at most 2000 per record: a few
+  hits render whole, and a wide result set is clipped no harder than before.
+  `DM_RECALL_BODY_CHARS` sets the per-record limit on every surface (`0` never clips).
+
 ## 0.3.8 - 2026-09-30
 
 Server stability before a replicated deployment: every change below but the

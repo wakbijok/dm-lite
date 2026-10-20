@@ -23,7 +23,8 @@ pub(crate) fn tool_schemas() -> Value {
                 "limit":{"type":"integer","description":"max results (default 6, capped at 1000)"},
                 "as_of":{"type":"integer","description":"system-time epoch-ms: recall the store as it was BELIEVED at this instant"},
                 "valid_at":{"type":"integer","description":"valid-time epoch-ms: recall what was TRUE at this instant (defaults to as_of)"},
-                "expand":{"type":"integer","description":"graph: also pull each hit's neighborhood within this many hops (default 1 - linked records ride along automatically; 0 = content matches only; ignored when as_of/valid_at is set)"}
+                "expand":{"type":"integer","description":"graph: also pull each hit's neighborhood within this many hops (default 1 - linked records ride along automatically; 0 = content matches only; ignored when as_of/valid_at is set)"},
+                "full":{"type":"boolean","description":"render each record's body whole instead of clipping it to the per-prompt block budget (default false)"}
             },"required":["query"]}
         },
         {
@@ -244,22 +245,25 @@ fn call_tool(mem: &Memory, name: &str, args: &Value) -> std::result::Result<Stri
             // essentially never opt into optional integer params, so an opt-in default left
             // the graph unused on the whole tool surface.
             let expand = args.get("expand").and_then(|v| v.as_u64()).unwrap_or(1) as usize;
+            // Full bodies are opt-in: the default keeps the block inside its per-prompt budget,
+            // but the budget is spent on the result set as a whole, so small sets are not clipped.
+            let full = args.get("full").and_then(|v| v.as_bool()).unwrap_or(false);
             let block = if as_of.is_some() || valid_at.is_some() {
                 // bitemporal slice: default the missing axis to the other (then to now)
                 let now = crate::entry::now_ms();
                 let sys = as_of.unwrap_or(now);
                 let val = valid_at.or(as_of).unwrap_or(now);
                 let hits = mem.recall_as_of(s(args, "query"), limit, sys, val).map_err(|e| e.to_string())?;
-                render::render_recall(&hits)
+                if full { render::render_recall_full(&hits) } else { render::render_recall(&hits) }
             } else if expand > 0 {
                 // graph-augmented: seeds by content, then their bounded-hop neighborhood (cap 5),
                 // riders scored by seed_weight * decay^hop with via/hop provenance + the result
                 // set's internal edges rendered as a relations section
                 let g = mem.recall_expanded_graph(s(args, "query"), limit, expand.min(5)).map_err(|e| e.to_string())?;
-                render::render_recall_graph(&g)
+                if full { render::render_recall_graph_full(&g) } else { render::render_recall_graph(&g) }
             } else {
                 let hits = mem.recall(s(args, "query"), limit).map_err(|e| e.to_string())?;
-                render::render_recall(&hits)
+                if full { render::render_recall_full(&hits) } else { render::render_recall(&hits) }
             };
             Ok(if block.is_empty() { "(no matches)".into() } else { block })
         }

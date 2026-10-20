@@ -3,19 +3,26 @@
 
     contrib/sign-release.py v0.3.6            # check, sign, verify, upload
     contrib/sign-release.py v0.3.6 --no-upload
+    contrib/sign-release.py v0.3.9 --packaged DIR   # archives made by scripts/package-release.sh
 
 Run it from a dm-lite clone on the machine that holds the release key. It:
   1. refuses to go on unless ALL of these hold:
      - the GitHub tag's code is identical to the upstream (GitLab) tag of the same
        name in this clone;
-     - a successful run of the release workflow built that exact commit, and every
-       archive on the release is byte-identical to that run's build artifact (so a
-       file uploaded or swapped by hand, or built from another commit, is caught);
+     - every archive on the release is byte-identical to its trusted build, so a file
+       uploaded or swapped by hand, or built from another commit, is caught. The trusted
+       build is a successful run of the release workflow that built that exact commit
+       (its build artifact), or, with --packaged DIR, the output directory of
+       scripts/package-release.sh on this machine for that commit (its COMMIT and
+       SHA256SUMS files, and the archives themselves, unchanged since it wrote them);
      - that tag's src/upgrade.rs trusts the key you are signing with;
   2. shows each archive with its sha256, asks you to confirm, then asks for the key
      passphrase ONCE;
-  3. signs every archive with rsign, verifies each signature with the public key,
-     and uploads the .minisig files to the release.
+  3. signs every archive with rsign, with the trusted comment `file:<archive>`, a TAB,
+     `version:X.Y.Z` (what scripts/package-release.sh prints for a hand signature; `dmem
+     upgrade` needs the file field and splits the comment on tabs), verifies each
+     signature with the public key and the comment, and uploads the .minisig files to
+     the release.
 
 The passphrase is typed into rsign through a private pseudo-terminal with echo off.
 It is never written to disk, argv, or a child's environment, and it is forgotten
@@ -46,6 +53,16 @@ TAG_RE = re.compile(r"v\d{1,4}\.\d{1,4}\.\d{1,4}(-rc\.\d{1,4})?")
 KEY_DIR = os.path.expanduser("~/.config/dmem-release")
 SIGN_TIMEOUT = 120  # scrypt key derivation takes a few seconds per archive
 CHILD_ENV = {"PATH": "/usr/local/bin:/usr/bin:/bin", "LANG": "C"}
+# The signed trusted comment. A TAB between the fields: `dmem upgrade` splits the comment on
+# tabs and needs a field equal to file:<archive>. The hub's own tooling writes a space, which
+# dmem's verifier refuses. scripts/package-release.sh prints the same comment (a test checks
+# that the two agree).
+COMMENT_FORMAT = "file:{name}\tversion:{version}"
+
+
+def trusted_comment(name, tag):
+    """The trusted comment for archive `name` of release `tag` (vX.Y.Z)."""
+    return COMMENT_FORMAT.format(name=name, version=tag.removeprefix("v"))
 
 
 def die(msg):
@@ -67,14 +84,15 @@ def pubkey_line(pub):
     return key_id, lines[-1]
 
 
-def sign(rsign, key, work, name, secret):
-    """Run rsign on a private pty and answer its single password prompt."""
+def sign(rsign, key, work, name, secret, comment):
+    """Run rsign on a private pty and answer its single password prompt. `comment` is the
+    trusted comment the signature carries."""
     pid, fd = pty.fork()
     if pid == 0:
         try:
             # Relative name, so the trusted comment reads file:<archive>, not a temp path.
             os.chdir(work)
-            os.execve(rsign, [rsign, "sign", "-s", key, "-x", name + ".minisig", name], CHILD_ENV)
+            os.execve(rsign, [rsign, "sign", "-s", key, "-x", name + ".minisig", "-t", comment, name], CHILD_ENV)
         finally:
             os._exit(127)  # never fall through into the parent's code
     # Echo off before anything is typed: rsign disables echo only after printing its
@@ -156,6 +174,40 @@ def workflow_build(repo, tag, commit, work):
     return run_id, digests
 
 
+def packaged_build(directory, commit):
+    """(label, {file: sha256}) of what scripts/package-release.sh wrote into `directory` for
+    `commit`: its COMMIT file must name that commit, and every archive in the directory must
+    be unchanged since the script listed it in SHA256SUMS. A directory that does not satisfy
+    that is not a trusted build."""
+    commit_file = os.path.join(directory, "COMMIT")
+    sums_file = os.path.join(directory, "SHA256SUMS")
+    for f in (commit_file, sums_file):
+        if not os.path.isfile(f):
+            die(f"{f} is missing: --packaged takes the output directory of scripts/package-release.sh")
+    with open(commit_file) as fh:
+        packaged = fh.read().strip()
+    if packaged != commit:
+        die(f"{directory} was packaged at {packaged[:10] or '?'}, not at {commit[:10]}")
+    listed = {}
+    with open(sums_file) as fh:
+        for line in fh:
+            m = re.fullmatch(r"([0-9a-f]{64}) [ *](\S+)\n?", line)
+            if m:
+                listed[m.group(2)] = m.group(1)
+    digests = {}
+    for name in sorted(os.listdir(directory)):
+        if not re.fullmatch(r"dmem-v[^/]+\.(tar\.gz|zip)", name):
+            continue
+        with open(os.path.join(directory, name), "rb") as fh:
+            digest = hashlib.sha256(fh.read()).hexdigest()
+        if listed.get(name) != digest:
+            die(f"{name} in {directory} is not what SHA256SUMS lists: changed since it was packaged")
+        digests[name] = digest
+    if not digests:
+        die(f"no dmem-v* archive in {directory}")
+    return f"packaged by scripts/package-release.sh ({directory})", digests
+
+
 def main():
     ap = argparse.ArgumentParser(description="Sign a dm-lite GitHub release (human step).")
     ap.add_argument("tag")
@@ -165,6 +217,9 @@ def main():
     ap.add_argument("--pub", default=os.path.join(KEY_DIR, "dm-lite-release-2.pub"))
     ap.add_argument("--no-upload", action="store_true", help="sign and verify only; keep the files")
     ap.add_argument("--clobber", action="store_true", help="replace .minisig files already on the release")
+    ap.add_argument("--packaged", metavar="DIR",
+                    help="trust the archives scripts/package-release.sh wrote into DIR for this tag's commit, "
+                         "not a release workflow run's build artifact")
     a = ap.parse_args()
 
     if not TAG_RE.fullmatch(a.tag):
@@ -203,7 +258,12 @@ def main():
 
         commit = gh_api(f"repos/{a.repo}/commits/{a.tag}")["sha"]
         same_code, code_msg = tree_check(a.tag, a.remote, commit)
-        run_id, built = workflow_build(a.repo, a.tag, commit, work)
+        if a.packaged:
+            build_label, built = packaged_build(os.path.abspath(a.packaged), commit)
+            trusted_build = "packaged build"
+        else:
+            run_id, built = workflow_build(a.repo, a.tag, commit, work)
+            build_label, trusted_build = f"release workflow run {run_id}", "workflow build"
 
         print(f"\nRelease {a.repo} {a.tag} (commit {commit[:10]}): {len(rows)} archive(s)")
         bad = []
@@ -212,15 +272,15 @@ def main():
             if not match:
                 bad.append(name)
             print(f"  {name}  {size} bytes  sha256 {digest}  by {who}  "
-                  + ("= workflow build" if match else "<- DOES NOT MATCH the workflow build"))
-        print(f"Build:  release workflow run {run_id}")
+                  + (f"= {trusted_build}" if match else f"<- DOES NOT MATCH the {trusted_build}"))
+        print(f"Build:  {build_label}")
         print(f"Code:   {code_msg}")
         print(f"Key:    {key_id} ({a.pub})")
         print(f"Trust:  this tag's src/upgrade.rs {'trusts' if trusted else 'does NOT trust'} that key")
         if not same_code:
             die("the GitHub tag's code is not the upstream tag's code; not signing")
         if bad:
-            die(f"{len(bad)} archive(s) differ from what the release workflow built; not signing")
+            die(f"{len(bad)} archive(s) differ from the {trusted_build}; not signing")
         if not trusted:
             die("this tag's src/upgrade.rs does not trust the key; upgraders would reject the signatures")
         if have_sigs and not a.clobber and not a.no_upload:
@@ -231,11 +291,14 @@ def main():
         secret = getpass.getpass(f"Passphrase for key {key_id}: ")
         try:
             for name, *_ in rows:
-                sign(rsign, a.key, work, name, secret)
+                comment = trusted_comment(name, a.tag)
+                sign(rsign, a.key, work, name, secret, comment)
                 v = subprocess.run([rsign, "verify", "-p", a.pub, "-x", name + ".minisig", name],
                                    cwd=work, env=CHILD_ENV, capture_output=True, text=True, timeout=60)
                 if v.returncode != 0:
                     die(f"{name}: signature did not verify: {(v.stdout + v.stderr).strip()[-300:]}")
+                if f"Trusted comment: {comment}" not in v.stdout:
+                    die(f"{name}: the signature does not carry the trusted comment {comment!r}")
                 print(f"  signed + verified  {name}")
         finally:
             del secret

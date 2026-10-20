@@ -69,6 +69,13 @@ jobs:
           # Apache-2.0 4(d): NOTICE travels with every archive (it also carries the
           # attribution for the bundled zvec library and the Apache Arrow built into it)
           cp NOTICE "$out/"
+          # NOTICE promises the AWS-LC licence text in every archive (aws-lc-sys is compiled
+          # in on every target). No `|| true`: a missing file must fail the build.
+          cp THIRD-PARTY-aws-lc.txt "$out/"
+          # The licence text of every Rust crate compiled in, made by `cargo about` from
+          # about.toml (scripts/package-release.sh --write-notice) and committed; the
+          # packaging script refuses a stale one. Same rule: a missing file fails the build.
+          cp THIRD_PARTY_LICENSES.md "$out/"
           ls -la "$out"
 
       - name: Archive

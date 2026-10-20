@@ -9,6 +9,9 @@
 //! Signing (release runbook): `contrib/sign-release.py <tag>` on the release machine. It
 //! checks the release, asks for the key passphrase once, signs and verifies every asset,
 //! and uploads the `.minisig` files. The secret key never leaves that machine.
+//!
+//! On an install that a host installer manages, `dmem upgrade` refuses before it does anything
+//! else (see `fence` and docs/managed-install.md).
 
 use anyhow::{anyhow, bail, Context, Result};
 use std::io::Read;
@@ -94,6 +97,51 @@ mod tests {
         }
     }
 
+    // The signatures the release tooling makes. FIXTURE is signed under ARCHIVE's name with
+    // SCRIPT_KEY, a throwaway key (not a release key), once with the trusted comment
+    // scripts/package-release.sh prints and contrib/sign-release.py signs (the file field, a
+    // TAB, the version) and once with the hub tooling's literal form (the same two fields
+    // joined by a space).
+    const ARCHIVE: &str = "dmem-v9.9.9-x86_64-unknown-linux-gnu.tar.gz";
+    const SCRIPT_KEY: &str = "RWTYBiEnUuUzrjd5xtjr/pNhy08mGdjo2fLiDAv7Rs8+uqNjkB9dlcX1";
+    const SIG_TAB: &str = "untrusted comment: signature from rsign secret key\n\
+        RUTYBiEnUuUzriv1YLtLGOuQZqNZyYkcQl7YGjKjAiSOjoiEEYcrNG0KnwjrgcCSQWaRIFZL03sGOkJfD/Y7aL+R3AMt9HH1RQQ=\n\
+        trusted comment: file:dmem-v9.9.9-x86_64-unknown-linux-gnu.tar.gz\tversion:9.9.9\n\
+        opDLJA4HtH6GCdYqIr02vCAvUp4f+O9Hs+73HUgKUpq8ypc82mJfhxvUU1UIGtcJonD0y8H7ZGsasgDbfQp3Dg==\n";
+    const SIG_SPACE: &str = "untrusted comment: signature from rsign secret key\n\
+        RUTYBiEnUuUzrrX+HonsAVxkW/tb9Gh/2F4AW6NOqeEQA05Mw3i1bZfGl/w4/TNr8HSCJKfuWn9rmrUgR0WH8YJyvcTNz4q2vgs=\n\
+        trusted comment: file:dmem-v9.9.9-x86_64-unknown-linux-gnu.tar.gz version:9.9.9\n\
+        sYIhS1uXOHpbEoRrEFjIZwUs3mh8DIxaDlGf/48BW/cu8u3I0zFPH3btsBK0iqCd4EgKZZA3xdD9ZQYnlUZ1Cw==\n";
+
+    // A release signed with the comment the release tooling writes passes dmem's own verifier.
+    #[test]
+    fn the_comment_the_release_tooling_signs_verifies() {
+        verify_release_sig(&[SCRIPT_KEY], FIXTURE, SIG_TAB, ARCHIVE).expect("the tab-separated comment is accepted");
+        let sig = minisign_verify::Signature::decode(SIG_TAB).unwrap();
+        assert_eq!(sig.trusted_comment(), format!("file:{ARCHIVE}\tversion:9.9.9"));
+        // it still ties the signature to one archive, so one version
+        assert!(verify_release_sig(&[SCRIPT_KEY], FIXTURE, SIG_TAB, "dmem-v9.9.8-x86_64-unknown-linux-gnu.tar.gz").is_err(), "another version's name");
+        assert!(verify_release_sig(&[SCRIPT_KEY], b"tampered", SIG_TAB, ARCHIVE).is_err(), "tampered archive");
+        assert!(verify_release_sig(&[FIXTURE_KEY], FIXTURE, SIG_TAB, ARCHIVE).is_err(), "another key");
+    }
+
+    // Why the tooling must not print the hub's form: it is a genuine signature by the right
+    // key over the right bytes, and dmem refuses it, because it splits the comment on tabs.
+    #[test]
+    fn the_hubs_space_separated_comment_is_refused() {
+        let err = verify_release_sig(&[SCRIPT_KEY], FIXTURE, SIG_SPACE, ARCHIVE).unwrap_err().to_string();
+        assert!(err.contains("signature is for a different file"), "{err}");
+    }
+
+    // The tooling, the runbook and these fixtures name one comment: if one is changed, this
+    // fails until the others and the fixtures follow.
+    #[test]
+    fn the_tooling_and_the_runbook_write_the_comment_the_fixtures_carry() {
+        assert!(include_str!("../scripts/package-release.sh").contains("COMMENT_FORMAT='file:%s\\tversion:%s'"));
+        assert!(include_str!("../contrib/sign-release.py").contains(r#"COMMENT_FORMAT = "file:{name}\tversion:{version}""#));
+        assert!(include_str!("../docs/releasing.md").contains(r"file:dmem-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz\tversion:X.Y.Z"));
+    }
+
     // The download client offers the post-quantum hybrid first, as every dmem TLS client does.
     #[test]
     fn download_client_offers_the_pq_hybrid_first() {
@@ -137,6 +185,8 @@ fn download(client: &reqwest::blocking::Client, url: &str) -> Result<Vec<u8>> {
 }
 
 pub fn run(pre: bool, yes: bool) -> Result<()> {
+    // First, before any request, prompt or file: a managed install is upgraded by its installer.
+    crate::fence::check()?;
     let channel = if pre { "pre-release" } else { "stable" };
     let current = semver::Version::parse(env!("CARGO_PKG_VERSION"))
         .map_err(|e| anyhow!("parse current version: {e}"))?;

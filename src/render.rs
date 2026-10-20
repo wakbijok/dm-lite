@@ -13,9 +13,48 @@ fn one_line(text: &str, max: usize) -> String {
     }
 }
 
+/// Char budget for the whole per-prompt recall block. This block rides every prompt, so it is
+/// still bounded - but the budget is now spent on the SET, not on a fixed per-record cap: a
+/// handful of hits renders each body whole. The fixed 240-char cap clipped mid-sentence and
+/// swallowed exactly the detail recall was called for (a decision's Context, a lesson's fix).
+const RECALL_BLOCK_BUDGET: usize = 6000;
+/// Never clip tighter than the old fixed cap, so a large result set is no worse than before.
+const RECALL_BODY_FLOOR: usize = 240;
+/// ...and never render more than this per record, however small the set.
+const RECALL_BODY_CEIL: usize = 2000;
+/// Escape hatch: pins the per-record cap for every surface (0 = never clip).
+const RECALL_BODY_CHARS_ENV: &str = "DM_RECALL_BODY_CHARS";
+
+/// Per-record body allowance for a result set of `records` hits: the block budget shared out
+/// evenly, clamped to [floor, ceil]. The env override wins when set; 0 means no clipping.
+fn body_allowance(records: usize) -> usize {
+    if let Ok(raw) = std::env::var(RECALL_BODY_CHARS_ENV) {
+        if let Ok(v) = raw.trim().parse::<usize>() {
+            return if v == 0 { usize::MAX } else { v };
+        }
+    }
+    (RECALL_BLOCK_BUDGET / records.max(1)).clamp(RECALL_BODY_FLOOR, RECALL_BODY_CEIL)
+}
+
+/// Collapse to one line and clip at `max`, marking a clip with "...". `usize::MAX` renders whole.
+fn clip_body(text: &str, max: usize) -> String {
+    let collapsed: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() > max {
+        collapsed.chars().take(max).collect::<String>() + "..."
+    } else {
+        collapsed
+    }
+}
+
 /// The per-prompt recall block.
 pub fn render_recall(entries: &[Entry]) -> String {
     render_recall_split(entries, &[])
+}
+
+/// Same block, bodies never clipped: used when the caller explicitly asks for the whole record
+/// (`dmem recall --full`, MCP `full: true`). Budget-free by definition - the caller opted in.
+pub fn render_recall_full(entries: &[Entry]) -> String {
+    render_recall_split_capped(entries, &[], usize::MAX)
 }
 
 /// Recall block with the graph's contribution visible: seeds are content matches; entries
@@ -23,6 +62,10 @@ pub fn render_recall(entries: &[Entry]) -> String {
 /// Without the marker the graph layer is indistinguishable from plain recall - nobody can
 /// tell it ever fires.
 pub fn render_recall_split(seeds: &[Entry], neighbors: &[Entry]) -> String {
+    render_recall_split_capped(seeds, neighbors, body_allowance(seeds.len() + neighbors.len()))
+}
+
+fn render_recall_split_capped(seeds: &[Entry], neighbors: &[Entry], cap: usize) -> String {
     if seeds.is_empty() && neighbors.is_empty() {
         return String::new();
     }
@@ -34,7 +77,7 @@ pub fn render_recall_split(seeds: &[Entry], neighbors: &[Entry]) -> String {
             "- ({}) {}: {} [{}]\n",
             e.kind.as_str(),
             e.title,
-            one_line(&e.body, 240),
+            clip_body(&e.body, cap),
             e.uri
         ));
     }
@@ -43,7 +86,7 @@ pub fn render_recall_split(seeds: &[Entry], neighbors: &[Entry]) -> String {
             "- ({}, linked) {}: {} [{}]\n",
             e.kind.as_str(),
             e.title,
-            one_line(&e.body, 240),
+            clip_body(&e.body, cap),
             e.uri
         ));
     }
@@ -57,6 +100,15 @@ pub fn render_recall_split(seeds: &[Entry], neighbors: &[Entry]) -> String {
 /// relate without another lookup. Falls back to the plain `linked` marker when provenance is
 /// absent (pre-provenance server). Kept lean on purpose - this block rides every prompt.
 pub fn render_recall_graph(g: &RecallGraph) -> String {
+    render_recall_graph_capped(g, body_allowance(g.seeds.len() + g.riders.len()))
+}
+
+/// Graph block with bodies never clipped (the `full` opt-in on the recall tool/CLI).
+pub fn render_recall_graph_full(g: &RecallGraph) -> String {
+    render_recall_graph_capped(g, usize::MAX)
+}
+
+pub fn render_recall_graph_capped(g: &RecallGraph, cap: usize) -> String {
     const RELATION_LINES_CAP: usize = 12;
     if g.seeds.is_empty() && g.riders.is_empty() {
         return String::new();
@@ -76,7 +128,7 @@ pub fn render_recall_graph(g: &RecallGraph) -> String {
             "- ({}) {}: {} [{}]\n",
             e.kind.as_str(),
             e.title,
-            one_line(&e.body, 240),
+            clip_body(&e.body, cap),
             e.uri
         ));
     }
@@ -96,7 +148,7 @@ pub fn render_recall_graph(g: &RecallGraph) -> String {
             r.entry.kind.as_str(),
             marker,
             r.entry.title,
-            one_line(&r.entry.body, 240),
+            clip_body(&r.entry.body, cap),
             r.entry.uri
         ));
     }
@@ -272,6 +324,38 @@ mod tests {
     #[test]
     fn render_recall_empty_is_empty() {
         assert!(render_recall(&[]).is_empty());
+    }
+
+    #[test]
+    fn recall_renders_bodies_whole_when_the_set_is_small() {
+        let body = "a body short enough to render whole";
+        let out = render_recall(&[entry(Kind::Decision, "D", body)]);
+        assert!(out.contains(body), "a body under the budget is rendered whole");
+        assert!(!out.contains("..."), "no clip marker when nothing was clipped");
+    }
+
+    #[test]
+    fn recall_full_never_clips() {
+        let long = "x".repeat(5000);
+        let out = render_recall_full(&[entry(Kind::Decision, "D", &long)]);
+        assert!(out.contains(&long), "full mode renders the body verbatim");
+        assert!(!out.contains("..."), "no clip marker in full mode");
+    }
+
+    #[test]
+    fn recall_clips_a_large_set_to_its_block_budget() {
+        let long = "y".repeat(5000);
+        let seeds: Vec<Entry> = (0..10).map(|i| entry(Kind::Memory, &format!("m{i}"), &long)).collect();
+        let out = render_recall(&seeds);
+        let rendered: usize = out
+            .lines()
+            .filter(|l| l.starts_with("- (memory)"))
+            .map(|l| l.chars().count())
+            .sum();
+        assert!(
+            rendered <= RECALL_BLOCK_BUDGET + 1000,
+            "10 hits share the block budget instead of each taking the old fixed cap: {rendered} chars"
+        );
     }
 
     #[test]

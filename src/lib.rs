@@ -11,6 +11,8 @@ pub mod migrate;
 pub mod config;
 pub mod embedder;
 pub mod entry;
+#[cfg(feature = "self-update")]
+pub mod fence;
 pub mod hooks;
 pub mod mcp;
 pub mod metrics;

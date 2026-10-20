@@ -16,7 +16,9 @@ post-quantum hybrid key exchange. AWS-LC is a fork of BoringSSL, itself a fork
 of OpenSSL: new AWS-LC code is licensed Apache-2.0 OR ISC, and code from
 BoringSSL and OpenSSL keeps its original ISC, Apache-2.0 or OpenSSL/SSLeay
 licence. The release archives carry its full licence text as
-THIRD-PARTY-aws-lc.txt.
+THIRD-PARTY-aws-lc.txt. They also carry THIRD_PARTY_LICENSES.md, the licence text
+of each Rust crate compiled into dmem; the file says which build and targets it
+covers.
 
 The prebuilt release archives ship the zvec native library (libzvec_c_api,
 https://github.com/alibaba/zvec) next to the dmem binary. It is not part of

@@ -1,0 +1,94 @@
+# cargo-about configuration: the third-party licence texts that travel in a release
+# archive (THIRD_PARTY_LICENSES.md).
+#
+# Scope. The Rust crates compiled into `dmem` built with `--features dist`, for the four
+# release targets listed in `targets` below, without dev- and build-dependencies. A crate
+# that only some targets compile in (a Windows or Apple one) is listed for all of them, so
+# the one file is complete for every archive. It is not "every crate in Cargo.lock": the
+# lock file also holds crates for features `dist` does not turn on.
+#
+# Generate it, on a host that has every crate of the lock file in its cargo cache
+# (cargo-about 0.9.2 reads each crate's manifest and licence files):
+#
+#   scripts/package-release.sh --write-notice
+#
+# which runs
+#
+#   cargo about generate --frozen --fail -c about.toml \
+#       --no-default-features --features dist \
+#       -o THIRD_PARTY_LICENSES.md about.md.hbs
+#
+# `scripts/package-release.sh` runs the same command when it packages and refuses to
+# package when the committed file differs from what it generates, so a stale notice fails
+# the release. `--fail` makes cargo-about stop when it cannot read, synthesise or clarify a
+# licence expression for a crate in scope: a crate with no licence data never passes
+# silently. When a crate's own licence file cannot be matched to its licence, the text
+# listed is the licence's standard text.
+#
+# A new crate whose licence cargo-about cannot place makes `--fail` stop. Fix it here, with
+# a clarification that names the licence file and its checksum (the checksum pins the exact
+# text), and review the change; never loosen `accepted` just to get past it.
+
+# The licences this project accepts, in the order cargo-about should pick one for a crate
+# offered under a choice (Apache-2.0 first, as for this project). A crate under only
+# licences outside this list stops the run.
+accepted = [
+    "Apache-2.0",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "CDLA-Permissive-2.0",
+    "MPL-2.0",
+]
+
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+]
+ignore-build-dependencies = true
+ignore-dev-dependencies = true
+# dm-lite itself is listed with the crates it is compiled with, under its own Apache-2.0.
+
+# ring does not carry one standard licence file; cargo-about has a built-in treatment of it.
+workarounds = ["ring"]
+
+# Clarifications, only where cargo-about cannot match a crate's licence file to its licence.
+# The checksums pin the exact text; a new crate version with a different file makes
+# cargo-about fail (--fail) until the change is reviewed.
+
+# AWS-LC: one LICENSE file in the crate holds every notice (AWS, BoringSSL, OpenSSL, SSLeay,
+# fiat-crypto, s2n-bignum, jitterentropy) and the full Apache-2.0, ISC, MIT and BSD-3-Clause
+# texts, so the whole file is kept as one text, listed under ISC. The expression is the
+# crate's own. (The archive also carries the licence file of the crate's aws-lc directory
+# as THIRD-PARTY-aws-lc.txt, which NOTICE refers to.)
+[aws-lc-sys.clarify]
+license = "ISC AND (Apache-2.0 OR ISC) AND Apache-2.0 AND MIT AND BSD-3-Clause AND (Apache-2.0 OR ISC OR MIT) AND (Apache-2.0 OR ISC OR MIT-0)"
+
+[[aws-lc-sys.clarify.files]]
+path = "LICENSE"
+license = "ISC"
+checksum = "728536b4160e051f86d7c9c388f704866b3d512cd7df97ac3516c65279523c4e"
+
+# aws-lc-rs: its LICENSE file is the Apache-2.0 text followed by the ISC text with the AWS
+# copyright line.
+[aws-lc-rs.clarify]
+license = "ISC AND (Apache-2.0 OR ISC)"
+
+[[aws-lc-rs.clarify.files]]
+path = "LICENSE"
+license = "Apache-2.0"
+start = "Apache License"
+end = "END OF TERMS AND CONDITIONS"
+checksum = "4bf96504d6e83ce5c6fc7167f1795d9ceaa68e70ab86bc5d08ab93184262bbbe"
+
+[[aws-lc-rs.clarify.files]]
+path = "LICENSE"
+license = "ISC"
+start = "Copyright Amazon.com, Inc. or its affiliates."
+end = "OR PERFORMANCE OF THIS SOFTWARE."
+checksum = "3cc9b9267235c6c73f950b3189f33b3f6d3a6daf6fa07763843edd7a9a8b6b2e"

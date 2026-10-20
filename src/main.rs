@@ -42,7 +42,7 @@ enum Cmd {
     #[cfg(feature = "wizard")]
     Setup,
     /// Wire (or with --remove, unwire) dmem into your agents (hooks for Devin/Claude Code/Codex/
-    /// Hermes/Grok; an MCP entry for hook-less Claude Desktop; a hook plugin for Claude Cowork).
+    /// Hermes/Grok/WorkBuddy; an MCP entry for hook-less Claude Desktop; a hook plugin for Claude Cowork).
     Bootstrap {
         #[arg(long)]
         devin: bool,
@@ -58,6 +58,10 @@ enum Cmd {
         /// Grok CLI (MCP entry only: Grok v0 hooks cannot inject context, so recall is tool-driven).
         #[arg(long)]
         grok: bool,
+        /// Tencent WorkBuddy / CodeBuddy (CC-shape hooks + .mcp.json + persona projection into
+        /// SOUL.md/IDENTITY.md/USER.md; disables its native auto-memory so dmem stays the SoT).
+        #[arg(long)]
+        workbuddy: bool,
         /// Claude Desktop (MCP only; no hooks). Adds an mcpServers.dmem entry.
         #[arg(long = "claude-desktop")]
         claude_desktop: bool,
@@ -151,6 +155,10 @@ enum Cmd {
         /// --as-of/--valid-at is set).
         #[arg(long, default_value_t = 1)]
         expand: usize,
+        /// Print each hit's body whole (no clipping). The default leans on the block budget used
+        /// by the per-prompt hook; recall for a human should not lose the detail mid-sentence.
+        #[arg(long)]
+        full: bool,
     },
     /// Show recent high-importance memory.
     Recent {
@@ -457,6 +465,12 @@ enum HookCmd {
 
 fn main() {
     if let Err(e) = run() {
+        // A fenced `dmem upgrade` is a refusal, not a failure: exit 3, as `daimon-hub update` does.
+        #[cfg(feature = "self-update")]
+        if let Some(refused) = e.downcast_ref::<fence::Refused>() {
+            eprintln!("dmem upgrade refused: {refused}");
+            std::process::exit(fence::EXIT_REFUSED);
+        }
         eprintln!("dm: {:#}", e);
         std::process::exit(1);
     }
@@ -484,8 +498,8 @@ fn run() -> Result<()> {
     match cli.cmd {
         #[cfg(feature = "wizard")]
         Cmd::Setup => setup::run(),
-        Cmd::Bootstrap { devin, claude, codex, hermes, opencode, grok, claude_desktop, cowork, all, remove } => {
-            bootstrap::run_mode(devin || all, claude || all, codex || all, hermes || all, opencode || all, grok || all, claude_desktop || all, cowork || all, remove)
+        Cmd::Bootstrap { devin, claude, codex, hermes, opencode, grok, workbuddy, claude_desktop, cowork, all, remove } => {
+            bootstrap::run_mode(devin || all, claude || all, codex || all, hermes || all, opencode || all, grok || all, workbuddy || all, claude_desktop || all, cowork || all, remove)
         }
         Cmd::Hook { event, hermes, raw } => match event {
             HookCmd::SessionStart => hooks::session_start(hermes, raw),
@@ -524,7 +538,7 @@ fn run() -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Recall { query, limit, as_of, valid_at, expand } => {
+        Cmd::Recall { query, limit, as_of, valid_at, expand, full } => {
             let q = query.join(" ");
             let m = Memory::open()?;
             let graph = if as_of.is_some() || valid_at.is_some() {
@@ -542,6 +556,9 @@ fn run() -> Result<()> {
             } else {
                 for e in &graph.seeds {
                     println!("- ({}) {}  [{}]", e.kind.as_str(), e.title, e.uri);
+                    if full {
+                        println!("    {}", e.body.replace('\n', "\n    "));
+                    }
                 }
                 for r in &graph.riders {
                     if r.via.is_empty() {
@@ -556,6 +573,9 @@ fn run() -> Result<()> {
                             r.entry.title,
                             r.entry.uri
                         );
+                    }
+                    if full {
+                        println!("    {}", r.entry.body.replace('\n', "\n    "));
                     }
                 }
                 for e in &graph.links {

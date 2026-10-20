@@ -74,6 +74,26 @@ fn install_into(config_path: &Path, dm: &str, remove: bool) -> Result<bool> {
     if config_path.exists() {
         let _ = std::fs::copy(config_path, PathBuf::from(format!("{}.dmbak", config_path.display())));
     }
+    merge_dm_hooks(&mut root, dm, remove);
+
+    if let Some(parent) = config_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut out = serde_json::to_string_pretty(&root)?;
+    out.push('\n');
+    std::fs::write(config_path, out).with_context(|| format!("write {}", config_path.display()))?;
+    Ok(true)
+}
+
+/// The CC-shape hook merge itself, on an in-memory root: drop any prior dm entries (matched by
+/// the dm binary path), then (unless `remove`) add ours. Shared by `install_into` and the
+/// WorkBuddy settings writer, whose file also carries a non-hook key and must be edited in ONE
+/// read-modify-write (two sequential writes would leave `.dmbak` holding an intermediate state,
+/// not the pre-run one).
+fn merge_dm_hooks(root: &mut Value, dm: &str, remove: bool) {
+    if !root.is_object() {
+        *root = json!({});
+    }
     let hooks = root
         .as_object_mut()
         .unwrap()
@@ -123,14 +143,6 @@ fn install_into(config_path: &Path, dm: &str, remove: bool) -> Result<bool> {
             hooks_obj.insert((*event).to_string(), Value::Array(kept));
         }
     }
-
-    if let Some(parent) = config_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let mut out = serde_json::to_string_pretty(&root)?;
-    out.push('\n');
-    std::fs::write(config_path, out).with_context(|| format!("write {}", config_path.display()))?;
-    Ok(true)
 }
 
 /// Ensure `doc[key]` is a table (create an empty one if it is missing or a non-table).
@@ -405,12 +417,31 @@ const SOUL_LEAD: &str = "You ARE the persona defined below, and the protocols be
 /// user's own SOUL.md edits) is preserved. SOUL.md is reloaded by Hermes each message (no restart).
 fn hermes_sync_soul(remove: bool) -> Result<()> {
     let soul = hermes_dir()?.join("SOUL.md");
-    let existing = std::fs::read_to_string(&soul).unwrap_or_default();
-    // Drop any prior dmem-managed block, keep everything else verbatim.
-    let outside = match (existing.find(SOUL_BEGIN), existing.find(SOUL_END)) {
+    let block = if remove { None } else { Some(persona_block(SOUL_LEAD)?) };
+    upsert_managed_block(&soul, SOUL_BEGIN, SOUL_END, block.as_deref())
+}
+
+/// Render the live dmem persona + protocols under a host-specific lead-in. Errors when there is
+/// nothing to project so callers can report it instead of writing an empty managed block.
+fn persona_block(lead: &str) -> Result<String> {
+    let m = crate::tools::Memory::open().map_err(|e| anyhow!("open memory: {e:#}"))?;
+    let persona = m.persona().map_err(|e| anyhow!("read persona: {e:#}"))?;
+    if persona.is_empty() {
+        return Err(anyhow!("no persona/protocol records to project (seed them first, e.g. `dmem setup`)"));
+    }
+    Ok(format!("{lead}\n\n{}", crate::render::render_soul(&persona)))
+}
+
+/// Replace (or with `block: None`, drop) the marker-fenced dmem-managed section of a markdown
+/// file, preserving everything outside the markers verbatim. Idempotent: any prior block between
+/// the same markers is removed first. A file that would become empty is written empty (not
+/// deleted): hosts that re-seed a missing file must not resurrect their stock content over ours.
+fn upsert_managed_block(path: &Path, begin: &str, end: &str, block: Option<&str>) -> Result<()> {
+    let existing = std::fs::read_to_string(path).unwrap_or_default();
+    let outside = match (existing.find(begin), existing.find(end)) {
         (Some(b), Some(e)) if e > b => {
             let before = existing[..b].trim_end();
-            let after = existing[e + SOUL_END.len()..].trim_start_matches('\n');
+            let after = existing[e + end.len()..].trim_start_matches('\n');
             if after.is_empty() {
                 before.to_string()
             } else {
@@ -419,25 +450,22 @@ fn hermes_sync_soul(remove: bool) -> Result<()> {
         }
         _ => existing.trim_end().to_string(),
     };
-    let new_content = if remove {
-        if outside.is_empty() { String::new() } else { format!("{outside}\n") }
-    } else {
-        let m = crate::tools::Memory::open().map_err(|e| anyhow!("open memory: {e:#}"))?;
-        let persona = m.persona().map_err(|e| anyhow!("read persona: {e:#}"))?;
-        if persona.is_empty() {
-            return Err(anyhow!("no persona/protocol records to project (seed them first, e.g. `dmem setup`)"));
+    let new_content = match block {
+        None => {
+            if outside.is_empty() { String::new() } else { format!("{outside}\n") }
         }
-        let block = crate::render::render_soul(&persona);
-        if outside.is_empty() {
-            format!("{SOUL_BEGIN}\n{SOUL_LEAD}\n\n{block}\n{SOUL_END}\n")
-        } else {
-            format!("{outside}\n\n{SOUL_BEGIN}\n{SOUL_LEAD}\n\n{block}\n{SOUL_END}\n")
+        Some(block) => {
+            if outside.is_empty() {
+                format!("{begin}\n{block}\n{end}\n")
+            } else {
+                format!("{outside}\n\n{begin}\n{block}\n{end}\n")
+            }
         }
     };
-    if let Some(p) = soul.parent() {
+    if let Some(p) = path.parent() {
         std::fs::create_dir_all(p)?;
     }
-    std::fs::write(&soul, new_content).with_context(|| format!("write {}", soul.display()))?;
+    std::fs::write(path, new_content).with_context(|| format!("write {}", path.display()))?;
     Ok(())
 }
 
@@ -1415,18 +1443,306 @@ fn grok_install(dm: &str, remove: bool) -> Result<()> {
     Ok(())
 }
 
-pub fn run(devin: bool, claude: bool, codex: bool, hermes: bool, opencode: bool, grok: bool, claude_desktop: bool, cowork: bool) -> Result<()> {
-    run_mode(devin, claude, codex, hermes, opencode, grok, claude_desktop, cowork, false)
+/// Markers fencing the dmem-managed block in WorkBuddy's identity files. Same fence mechanism as
+/// Hermes's SOUL.md, its own BEGIN text so the refresh hint names the right flag.
+const WB_BEGIN: &str = "<!-- BEGIN dmem-managed: persona + protocols (source of truth = your daimon memory; refresh with `dmem bootstrap --workbuddy`) -->";
+
+/// Lead-in for WorkBuddy's SOUL.md block. WorkBuddy injects SOUL.md into context EVERY turn and
+/// its stock templates invite the agent to edit the identity files and build MEMORY.md stores -
+/// exactly the drift this projection exists to prevent, so the lead names the dmem tools (CC-style
+/// `mcp__dmem__*` here, vs Hermes's `mcp_dmem_*`) and forbids persisting through the files.
+const WB_SOUL_LEAD: &str = "You ARE the persona defined below, and the protocols below are your binding operating rules, not style notes. The Memory Save Discipline governs WHEN and HOW you persist memory; the Behavioral Discipline governs how you work. Durable memory lives ONLY in daimon memory (dmem): persist with the dmem MCP tools (this harness exposes them as mcp__dmem__recall, mcp__dmem__remember, mcp__dmem__log_decision, mcp__dmem__log_lesson, mcp__dmem__log_incident, mcp__dmem__add_reminder, mcp__dmem__forget) exactly as the Memory Save Discipline directs - never by editing SOUL.md/IDENTITY.md/USER.md and never by writing MEMORY.md memory files.";
+
+const WB_IDENTITY_NOTE: &str = "Identity source of truth is daimon memory (dmem) - see the dmem-managed block in SOUL.md. Keep this file a thin pointer: do not accumulate identity changes here; update the dmem persona records instead.";
+
+const WB_USER_NOTE: &str = "The user profile lives in daimon memory (dmem). Recall it with mcp__dmem__recall; persist new durable user facts with the dmem tools (remember / log_*) - do not build a profile in this file.";
+
+/// Config homes for the CodeBuddy agent runtime. Tencent's WorkBuddy app embeds it with
+/// `CODEBUDDY_CONFIG_DIR` pointed at its app home - `~/.workbuddy-ai` on current builds,
+/// `~/.workbuddy` on earlier ones (a 2026-07 auto-update renamed it, leaving the old dir
+/// behind; verified via the app's sandbox `--app_home` and which dir holds live settings) -
+/// while a standalone CodeBuddy CLI/IDE install uses the default `~/.codebuddy`. All speak
+/// the Claude Code protocol (settings.json hooks with hookSpecificOutput.additionalContext,
+/// user-scope `.mcp.json`), so one flag wires every home that exists.
+fn workbuddy_homes() -> Result<Vec<(&'static str, PathBuf)>> {
+    let h = home()?;
+    Ok([
+        ("WorkBuddy", h.join(".workbuddy-ai")),
+        ("WorkBuddy (pre-rename home)", h.join(".workbuddy")),
+        ("CodeBuddy CLI", h.join(".codebuddy")),
+    ]
+    .into_iter()
+    .filter(|(_, d)| d.exists())
+    .collect())
+}
+
+/// WorkBuddy settings.json: dm hooks + native auto-memory OFF (+ for app homes, enabling the
+/// dmem MCP plugin), in ONE read-modify-write (so `.dmbak` holds the true pre-run state).
+/// autoMemoryEnabled=false while dmem is wired - the built-in MEMORY.md auto-memory/extraction
+/// would build a second, drifting store next to dmem (it also gates memoryExtraction, which
+/// requires it). On remove the keys are dropped, returning WorkBuddy to its stock defaults.
+/// Returns false when the file is not strict JSON.
+fn workbuddy_settings_install(path: &Path, dm: &str, enable_plugin: bool, remove: bool) -> Result<bool> {
+    let mut root: Value = if path.exists() {
+        let raw = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+        match serde_json::from_str(&raw) {
+            Ok(v) => v,
+            Err(_) => return Ok(false),
+        }
+    } else {
+        json!({})
+    };
+    if !root.is_object() {
+        root = json!({});
+    }
+    if path.exists() {
+        let _ = std::fs::copy(path, PathBuf::from(format!("{}.dmbak", path.display())));
+    }
+    merge_dm_hooks(&mut root, dm, remove);
+    let obj = root.as_object_mut().unwrap();
+    if remove {
+        if let Some(mem) = obj.get_mut("memory").and_then(|m| m.as_object_mut()) {
+            mem.remove("autoMemoryEnabled");
+        }
+        if obj.get("memory").and_then(|m| m.as_object()).map(|m| m.is_empty()).unwrap_or(false) {
+            obj.remove("memory");
+        }
+    } else {
+        let mem = obj.entry("memory").or_insert_with(|| json!({}));
+        if !mem.is_object() {
+            *mem = json!({});
+        }
+        mem.as_object_mut().unwrap().insert("autoMemoryEnabled".to_string(), json!(false));
+    }
+    // App homes load MCP servers through PLUGINS, not the user .mcp.json (sessions are created
+    // with strictMcpConfig), so the dmem plugin written next door must be switched on here.
+    if remove || !enable_plugin {
+        if let Some(ep) = obj.get_mut("enabledPlugins").and_then(|m| m.as_object_mut()) {
+            ep.remove("dmem@dmem");
+        }
+        if obj.get("enabledPlugins").and_then(|m| m.as_object()).map(|m| m.is_empty()).unwrap_or(false) {
+            obj.remove("enabledPlugins");
+        }
+    } else {
+        let ep = obj.entry("enabledPlugins").or_insert_with(|| json!({}));
+        if !ep.is_object() {
+            *ep = json!({});
+        }
+        ep.as_object_mut().unwrap().insert("dmem@dmem".to_string(), json!(true));
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut out = serde_json::to_string_pretty(&root)?;
+    out.push('\n');
+    std::fs::write(path, out).with_context(|| format!("write {}", path.display()))?;
+    Ok(true)
+}
+
+/// User-scope MCP file inside a CodeBuddy config home. The runtime resolves the first existing
+/// of `.mcp.json` / `mcp.json` there (falling back to the OS-home `~/.mcp.json`), defaulting to
+/// `.mcp.json` when none exist - so edit the file it would pick and create the dot-file default.
+/// Root shape is the standard `{"mcpServers": {...}}` map, hence `desktop_merge`. Returns the
+/// edited path, or None when the existing file is not strict JSON (refused, untouched).
+fn workbuddy_mcp_install(dir: &Path, dm: &str, remove: bool) -> Result<Option<PathBuf>> {
+    let path = [dir.join(".mcp.json"), dir.join("mcp.json")]
+        .into_iter()
+        .find(|p| p.exists())
+        .unwrap_or_else(|| dir.join(".mcp.json"));
+    let existing: Value = if path.exists() {
+        let raw = std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+        match serde_json::from_str(&raw) {
+            Ok(v) => v,
+            Err(_) => return Ok(None),
+        }
+    } else {
+        json!({})
+    };
+    if path.exists() {
+        let _ = std::fs::copy(&path, PathBuf::from(format!("{}.dmbak", path.display())));
+    }
+    let root = desktop_merge(existing, dm, remove);
+    let mut out = serde_json::to_string_pretty(&root)?;
+    out.push('\n');
+    std::fs::write(&path, out).with_context(|| format!("write {}", path.display()))?;
+    Ok(Some(path))
+}
+
+/// Write the dmem local marketplace + plugin for a WorkBuddy app home. The app creates agent
+/// sessions with strictMcpConfig, which drops the user-scope `.mcp.json` servers - but servers
+/// declared by an ENABLED PLUGIN still connect (scope=plugin), so the app path to the dmem save
+/// tools is a plugin whose manifest carries `mcpServers` inline. Layout mirrors the app's own
+/// local marketplaces (e.g. the session-created `experts` one): a directory marketplace with
+/// `.codebuddy-plugin/marketplace.json` and `plugins/dmem/.codebuddy-plugin/plugin.json`.
+fn workbuddy_write_plugin(mp_dir: &Path, dm: &str) -> Result<()> {
+    let plug = mp_dir.join("plugins/dmem");
+    std::fs::create_dir_all(mp_dir.join(".codebuddy-plugin"))?;
+    std::fs::create_dir_all(plug.join(".codebuddy-plugin"))?;
+    let market = json!({ "name": "dmem", "plugins": [ { "name": "dmem", "source": "./plugins/dmem" } ] });
+    std::fs::write(mp_dir.join(".codebuddy-plugin/marketplace.json"), serde_json::to_string_pretty(&market)? + "\n")?;
+    let manifest = json!({
+        "name": "dmem",
+        "version": env!("CARGO_PKG_VERSION"),
+        "description": "Shared cross-tool memory save tools, backed by dm-lite (dmem): recall, remember, log_decision/lesson/incident, add_reminder, forget. Persona + per-prompt recall ride the settings.json hooks; this plugin carries the MCP server.",
+        "license": "MIT",
+        "mcpServers": { "dmem": { "command": dm, "args": ["mcp"] } }
+    });
+    std::fs::write(plug.join(".codebuddy-plugin/plugin.json"), serde_json::to_string_pretty(&manifest)? + "\n")?;
+    Ok(())
+}
+
+/// Register (or with `remove`, drop) the dmem marketplace in the app home's
+/// `plugins/known_marketplaces.json` - the same directory-type record the app writes for its
+/// own local marketplaces. Read-modify-write with the usual strict-JSON refusal + `.dmbak`
+/// backup; every other marketplace entry is preserved. Returns false when refused.
+fn workbuddy_register_marketplace(home_dir: &Path, mp_dir: &Path, remove: bool) -> Result<bool> {
+    let path = home_dir.join("plugins/known_marketplaces.json");
+    let mut root: Value = if path.exists() {
+        let raw = std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+        match serde_json::from_str(&raw) {
+            Ok(v) => v,
+            Err(_) => return Ok(false),
+        }
+    } else {
+        json!({})
+    };
+    if !root.is_object() {
+        root = json!({});
+    }
+    if path.exists() {
+        let _ = std::fs::copy(&path, PathBuf::from(format!("{}.dmbak", path.display())));
+    }
+    let obj = root.as_object_mut().unwrap();
+    obj.remove("dmem");
+    if !remove {
+        let mp = mp_dir.to_string_lossy();
+        obj.insert(
+            "dmem".to_string(),
+            json!({
+                "type": "directory",
+                "source": { "source": "directory", "path": mp },
+                "installLocation": mp,
+                "description": "dm-lite (dmem) shared memory - local marketplace written by `dmem bootstrap --workbuddy`",
+                "autoUpdate": false,
+                "lastUpdated": rfc3339_utc()
+            }),
+        );
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut out = serde_json::to_string_pretty(&root)?;
+    out.push('\n');
+    std::fs::write(&path, out).with_context(|| format!("write {}", path.display()))?;
+    Ok(true)
+}
+
+/// Project the dmem persona into WorkBuddy's identity files. Only the WorkBuddy app layer injects
+/// SOUL.md/IDENTITY.md/USER.md into context (every turn); a plain CodeBuddy CLI home has no such
+/// files, so touch only what exists - the CLI still gets persona via the SessionStart hook.
+/// SOUL.md gets the full persona/protocol block; IDENTITY.md and USER.md (whose stock content
+/// invites the agent to grow them) get a short source-of-truth pointer. User content outside the
+/// markers is preserved.
+fn workbuddy_sync_persona(dir: &Path, remove: bool) -> Result<String> {
+    let soul = dir.join("SOUL.md");
+    if !soul.exists() {
+        return Ok("no SOUL.md in this home (plain CLI) - persona rides the SessionStart hook".to_string());
+    }
+    let block = if remove { None } else { Some(persona_block(WB_SOUL_LEAD)?) };
+    upsert_managed_block(&soul, WB_BEGIN, SOUL_END, block.as_deref())?;
+    for (file, note) in [("IDENTITY.md", WB_IDENTITY_NOTE), ("USER.md", WB_USER_NOTE)] {
+        let p = dir.join(file);
+        if p.exists() {
+            upsert_managed_block(&p, WB_BEGIN, SOUL_END, if remove { None } else { Some(note) })?;
+        }
+    }
+    Ok(if remove {
+        "removed the dmem-managed blocks from SOUL.md / IDENTITY.md / USER.md".to_string()
+    } else {
+        "persona + protocols -> SOUL.md (injected every turn); IDENTITY.md/USER.md now point at dmem as source of truth".to_string()
+    })
+}
+
+/// WorkBuddy / CodeBuddy: wire dmem hooks + native-auto-memory-off into settings.json, the MCP
+/// save tools into the user-scope `.mcp.json`, and project persona/protocols into the identity
+/// files (WorkBuddy homes only). Applied to every CodeBuddy config home present.
+fn workbuddy_install(dm: &str, remove: bool) -> Result<()> {
+    let homes = workbuddy_homes()?;
+    if homes.is_empty() {
+        println!("  skip WorkBuddy/CodeBuddy (no ~/.workbuddy or ~/.codebuddy)");
+        return Ok(());
+    }
+    for (name, dir) in homes {
+        // An app home injects the identity files and creates sessions with strictMcpConfig,
+        // so it additionally needs the dmem MCP plugin; a plain CLI home reads `.mcp.json`.
+        let is_app = dir.file_name().map(|f| f.to_string_lossy().starts_with(".workbuddy")).unwrap_or(false);
+        let mp_dir = dir.join("plugins/marketplaces/dmem");
+        let plugin_ok = if is_app {
+            if !remove {
+                workbuddy_write_plugin(&mp_dir, dm)?;
+            }
+            let registered = workbuddy_register_marketplace(&dir, &mp_dir, remove)?;
+            if remove {
+                let _ = std::fs::remove_dir_all(&mp_dir);
+            }
+            registered
+        } else {
+            false
+        };
+        let settings = dir.join("settings.json");
+        if !workbuddy_settings_install(&settings, dm, is_app && plugin_ok && !remove, remove)? {
+            println!("  skip {name} -> {} is not valid JSON; fix it and re-run (nothing was changed).", settings.display());
+            continue;
+        }
+        let mcp = workbuddy_mcp_install(&dir, dm, remove)?;
+        let persona_status = match workbuddy_sync_persona(&dir, remove) {
+            Ok(s) => s,
+            Err(e) => format!("persona projection skipped ({e:#})"),
+        };
+        if remove {
+            println!("  unwired {name} -> {} (hooks removed; native auto-memory back to its stock default)", settings.display());
+            match mcp {
+                Some(p) => println!("    removed mcpServers.dmem from {}", p.display()),
+                None => println!("    MCP file is not strict JSON - remove its mcpServers.dmem entry manually."),
+            }
+            if is_app {
+                println!("    removed the dmem plugin marketplace + its known_marketplaces.json entry");
+            }
+            println!("    {persona_status}");
+        } else {
+            println!("  wired {name} -> {} (hooks: persona on SessionStart, recall + save nudge per prompt; native auto-memory OFF)", settings.display());
+            match mcp {
+                Some(p) => println!("    MCP save tools -> {}", p.display()),
+                None => println!("    MCP file is not strict JSON - add {{\"mcpServers\":{{\"dmem\":{{\"command\":{},\"args\":[\"mcp\"]}}}}}} manually.", serde_json::to_string(dm)?),
+            }
+            if is_app {
+                if plugin_ok {
+                    println!("    dmem MCP plugin -> {} (enabled as dmem@dmem; app sessions use strictMcpConfig and load MCP via plugins, not .mcp.json)", mp_dir.display());
+                } else {
+                    println!("    WARN: plugins/known_marketplaces.json is not strict JSON - app sessions will NOT see the dmem tools until the dmem marketplace is registered there manually.");
+                }
+            }
+            println!("    {persona_status}");
+            println!("    restart {name} so it reloads settings, hooks, plugins and MCP servers.");
+        }
+    }
+    Ok(())
+}
+
+pub fn run(devin: bool, claude: bool, codex: bool, hermes: bool, opencode: bool, grok: bool, workbuddy: bool, claude_desktop: bool, cowork: bool) -> Result<()> {
+    run_mode(devin, claude, codex, hermes, opencode, grok, workbuddy, claude_desktop, cowork, false)
 }
 
 /// Wire or (with `remove`) unwire dmem into the selected agents. Devin + Claude Code use the
 /// generic Claude-compatible settings.json hook merge; Codex uses a bespoke `~/.codex/config.toml`
 /// MCP+plugin installer; Hermes uses a `~/.hermes/config.yaml` MCP+shell-hook installer; OpenCode
 /// gets a TypeScript plugin + `mcp.dmem` entry in ~/.config/opencode; Grok gets an MCP entry via
-/// `grok mcp add` (its v0 hooks cannot inject context, so no hook plugin); Claude Desktop
-/// (hook-less) gets an MCP entry in claude_desktop_config.json; Claude Cowork (macOS) gets that
-/// same MCP entry plus a generated hook plugin (.plugin zip) for manual upload in the app.
-pub fn run_mode(devin: bool, claude: bool, codex: bool, hermes: bool, opencode: bool, grok: bool, claude_desktop: bool, cowork: bool, remove: bool) -> Result<()> {
+/// `grok mcp add` (its v0 hooks cannot inject context, so no hook plugin); WorkBuddy/CodeBuddy
+/// gets CC-shape hooks + `.mcp.json` + persona projection with native auto-memory disabled;
+/// Claude Desktop (hook-less) gets an MCP entry in claude_desktop_config.json; Claude Cowork
+/// (macOS) gets that same MCP entry plus a generated hook plugin (.plugin zip) for manual upload
+/// in the app.
+pub fn run_mode(devin: bool, claude: bool, codex: bool, hermes: bool, opencode: bool, grok: bool, workbuddy: bool, claude_desktop: bool, cowork: bool, remove: bool) -> Result<()> {
     let dm = dm_bin()?;
     let h = home()?;
     let mut did_any = false;
@@ -1487,6 +1803,11 @@ pub fn run_mode(devin: bool, claude: bool, codex: bool, hermes: bool, opencode: 
         did_any = true;
     }
 
+    if workbuddy {
+        workbuddy_install(&dm, remove)?;
+        did_any = true;
+    }
+
     if claude_desktop {
         claude_desktop_install(&dm, remove)?;
         did_any = true;
@@ -1498,7 +1819,7 @@ pub fn run_mode(devin: bool, claude: bool, codex: bool, hermes: bool, opencode: 
     }
 
     if !did_any {
-        println!("Nothing changed. Pass --devin / --claude / --codex / --hermes / --opencode / --grok / --claude-desktop / --cowork (or --all), and ensure the agent is installed.");
+        println!("Nothing changed. Pass --devin / --claude / --codex / --hermes / --opencode / --grok / --workbuddy / --claude-desktop / --cowork (or --all), and ensure the agent is installed.");
         return Ok(());
     }
     println!();
@@ -1506,7 +1827,7 @@ pub fn run_mode(devin: bool, claude: bool, codex: bool, hermes: bool, opencode: 
         println!("Done. dmem hooks removed (the agent's other hooks/plugins are untouched).");
     } else {
         println!("Done. dmem is wired in (SessionStart -> persona/recent, UserPromptSubmit -> recall + save nudge).");
-        println!("Undo any time with:  dmem bootstrap --remove --devin / --claude / --codex / --hermes / --opencode / --grok / --claude-desktop / --cowork");
+        println!("Undo any time with:  dmem bootstrap --remove --devin / --claude / --codex / --hermes / --opencode / --grok / --workbuddy / --claude-desktop / --cowork");
     }
     Ok(())
 }
@@ -1670,6 +1991,165 @@ mod tests {
         let edited = opencode_write_config(&fresh, "/abs/dmem", "file:///p/dmem.ts", true).unwrap();
         assert!(edited);
         assert!(dir.join("opencode.json.dmbak").exists(), "backup written");
+    }
+
+    #[test]
+    fn workbuddy_settings_wires_hooks_and_disables_auto_memory() {
+        let dir = std::env::temp_dir().join(format!("dmwb-{}-{}", std::process::id(), crate::entry::now_ms()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = dir.join("settings.json");
+        // pre-existing user state: an unrelated hook, an unrelated memory subkey, a sibling key
+        std::fs::write(
+            &cfg,
+            r#"{"hooks":{"SessionStart":[{"matcher":"","hooks":[{"type":"command","command":"/other/tool x"}]}]},"memory":{"memoryExtraction":true},"theme":"dark"}"#,
+        )
+        .unwrap();
+
+        assert!(workbuddy_settings_install(&cfg, "/path/to/dmem", true, false).unwrap());
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&cfg).unwrap()).unwrap();
+        assert!(v["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"].as_str().unwrap().contains("hook user_prompt_submit"));
+        assert_eq!(v["hooks"]["SessionStart"].as_array().unwrap().len(), 2, "unrelated hook preserved");
+        assert_eq!(v["memory"]["autoMemoryEnabled"], false, "native auto-memory disabled");
+        assert_eq!(v["memory"]["memoryExtraction"], true, "unrelated memory subkey preserved");
+        assert_eq!(v["enabledPlugins"]["dmem@dmem"], true, "MCP plugin enabled");
+        assert_eq!(v["theme"], "dark");
+        assert!(dir.join("settings.json.dmbak").exists(), "backup written");
+
+        // idempotent re-run: still one dm entry per event, still disabled
+        assert!(workbuddy_settings_install(&cfg, "/path/to/dmem", true, false).unwrap());
+        let v2: Value = serde_json::from_str(&std::fs::read_to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(v2["hooks"]["SessionStart"].as_array().unwrap().len(), 2);
+        assert_eq!(v2["memory"]["autoMemoryEnabled"], false);
+
+        // remove: our hooks + plugin enable gone, autoMemoryEnabled dropped (stock default),
+        // the rest intact
+        assert!(workbuddy_settings_install(&cfg, "/path/to/dmem", true, true).unwrap());
+        let v3: Value = serde_json::from_str(&std::fs::read_to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(v3["hooks"]["SessionStart"].as_array().unwrap().len(), 1);
+        assert!(v3["hooks"].get("UserPromptSubmit").is_none());
+        assert!(v3["memory"].get("autoMemoryEnabled").is_none(), "key dropped -> stock default");
+        assert_eq!(v3["memory"]["memoryExtraction"], true);
+        assert!(v3.get("enabledPlugins").is_none(), "our enable dropped, empty table removed");
+
+        // a CLI home (enable_plugin=false) never grows an enabledPlugins entry
+        let cli = dir.join("cli.json");
+        assert!(workbuddy_settings_install(&cli, "/path/to/dmem", false, false).unwrap());
+        let vc: Value = serde_json::from_str(&std::fs::read_to_string(&cli).unwrap()).unwrap();
+        assert!(vc.get("enabledPlugins").is_none());
+
+        // a user's OTHER enabled plugin survives install + remove
+        let other = dir.join("other.json");
+        std::fs::write(&other, r#"{"enabledPlugins":{"weixinpay@workbuddy-builtin":true}}"#).unwrap();
+        assert!(workbuddy_settings_install(&other, "/path/to/dmem", true, false).unwrap());
+        assert!(workbuddy_settings_install(&other, "/path/to/dmem", true, true).unwrap());
+        let vo: Value = serde_json::from_str(&std::fs::read_to_string(&other).unwrap()).unwrap();
+        assert_eq!(vo["enabledPlugins"]["weixinpay@workbuddy-builtin"], true);
+        assert!(vo["enabledPlugins"].get("dmem@dmem").is_none());
+
+        // a memory table we created ourselves is dropped entirely on remove
+        let fresh = dir.join("fresh.json");
+        assert!(workbuddy_settings_install(&fresh, "/path/to/dmem", false, false).unwrap());
+        assert!(workbuddy_settings_install(&fresh, "/path/to/dmem", false, true).unwrap());
+        let v4: Value = serde_json::from_str(&std::fs::read_to_string(&fresh).unwrap()).unwrap();
+        assert!(v4.get("memory").is_none(), "empty memory table removed");
+
+        // not-strict-JSON settings are refused untouched
+        let broken = dir.join("broken.json");
+        std::fs::write(&broken, "{ oops").unwrap();
+        assert!(!workbuddy_settings_install(&broken, "/path/to/dmem", true, false).unwrap());
+        assert_eq!(std::fs::read_to_string(&broken).unwrap(), "{ oops");
+    }
+
+    #[test]
+    fn workbuddy_plugin_and_marketplace_roundtrip() {
+        let home = std::env::temp_dir().join(format!("dmwbp-{}-{}", std::process::id(), crate::entry::now_ms()));
+        std::fs::create_dir_all(&home).unwrap();
+        let mp = home.join("plugins/marketplaces/dmem");
+        workbuddy_write_plugin(&mp, "/abs/dmem").unwrap();
+        let m: Value = serde_json::from_str(&std::fs::read_to_string(mp.join(".codebuddy-plugin/marketplace.json")).unwrap()).unwrap();
+        assert_eq!(m["plugins"][0]["source"], "./plugins/dmem");
+        let p: Value = serde_json::from_str(&std::fs::read_to_string(mp.join("plugins/dmem/.codebuddy-plugin/plugin.json")).unwrap()).unwrap();
+        assert_eq!(p["mcpServers"]["dmem"]["command"], "/abs/dmem");
+        assert_eq!(p["mcpServers"]["dmem"]["args"][0], "mcp");
+
+        // registration preserves the app's other marketplaces and is idempotent
+        let known = home.join("plugins/known_marketplaces.json");
+        std::fs::write(&known, r#"{"workbuddy-builtin":{"type":"directory","autoUpdate":false}}"#).unwrap();
+        assert!(workbuddy_register_marketplace(&home, &mp, false).unwrap());
+        assert!(workbuddy_register_marketplace(&home, &mp, false).unwrap());
+        let k: Value = serde_json::from_str(&std::fs::read_to_string(&known).unwrap()).unwrap();
+        assert_eq!(k["dmem"]["type"], "directory");
+        assert_eq!(k["dmem"]["installLocation"], mp.to_string_lossy().as_ref());
+        assert_eq!(k["workbuddy-builtin"]["type"], "directory", "other marketplace preserved");
+        // remove drops only ours
+        assert!(workbuddy_register_marketplace(&home, &mp, true).unwrap());
+        let k2: Value = serde_json::from_str(&std::fs::read_to_string(&known).unwrap()).unwrap();
+        assert!(k2.get("dmem").is_none());
+        assert!(k2.get("workbuddy-builtin").is_some());
+        // a broken registry is refused untouched
+        std::fs::write(&known, "{ nope").unwrap();
+        assert!(!workbuddy_register_marketplace(&home, &mp, false).unwrap());
+        assert_eq!(std::fs::read_to_string(&known).unwrap(), "{ nope");
+    }
+
+    #[test]
+    fn workbuddy_mcp_prefers_existing_file_and_defaults_to_dotfile() {
+        let dir = std::env::temp_dir().join(format!("dmwbm-{}-{}", std::process::id(), crate::entry::now_ms()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // no file yet -> the runtime's default (.mcp.json) is created
+        let p = workbuddy_mcp_install(&dir, "/abs/dmem", false).unwrap().unwrap();
+        assert_eq!(p, dir.join(".mcp.json"));
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        assert_eq!(v["mcpServers"]["dmem"]["command"], "/abs/dmem");
+        std::fs::remove_file(&p).unwrap();
+        // an existing bare mcp.json (with another server) is the resolver's pick -> edited in place
+        let bare = dir.join("mcp.json");
+        std::fs::write(&bare, r#"{"mcpServers":{"other":{"command":"x"}}}"#).unwrap();
+        let p = workbuddy_mcp_install(&dir, "/abs/dmem", false).unwrap().unwrap();
+        assert_eq!(p, bare);
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&bare).unwrap()).unwrap();
+        assert_eq!(v["mcpServers"]["dmem"]["command"], "/abs/dmem");
+        assert_eq!(v["mcpServers"]["other"]["command"], "x", "unrelated server preserved");
+        assert!(!dir.join(".mcp.json").exists(), "no second MCP file created");
+        // remove drops only our entry
+        workbuddy_mcp_install(&dir, "/abs/dmem", true).unwrap().unwrap();
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&bare).unwrap()).unwrap();
+        assert!(v["mcpServers"].get("dmem").is_none());
+        assert_eq!(v["mcpServers"]["other"]["command"], "x");
+        // a JSONC/broken file is refused untouched
+        std::fs::write(&bare, "// hi\n{}").unwrap();
+        assert!(workbuddy_mcp_install(&dir, "/abs/dmem", false).unwrap().is_none());
+        assert_eq!(std::fs::read_to_string(&bare).unwrap(), "// hi\n{}");
+    }
+
+    #[test]
+    fn upsert_managed_block_inserts_replaces_and_removes_preserving_user_content() {
+        let dir = std::env::temp_dir().join(format!("dmblk-{}-{}", std::process::id(), crate::entry::now_ms()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("SOUL.md");
+        std::fs::write(&f, "# My Soul\n\nUser prose stays.\n").unwrap();
+        upsert_managed_block(&f, WB_BEGIN, SOUL_END, Some("BLOCK v1")).unwrap();
+        let s = std::fs::read_to_string(&f).unwrap();
+        assert!(s.starts_with("# My Soul"), "user content first, verbatim");
+        assert!(s.contains("BLOCK v1"));
+        // replace, not append: re-sync swaps the block content, one fence only
+        upsert_managed_block(&f, WB_BEGIN, SOUL_END, Some("BLOCK v2")).unwrap();
+        let s = std::fs::read_to_string(&f).unwrap();
+        assert!(!s.contains("BLOCK v1"));
+        assert!(s.contains("BLOCK v2"));
+        assert_eq!(s.matches(WB_BEGIN).count(), 1);
+        assert!(s.contains("User prose stays."));
+        // remove: only the fenced block goes
+        upsert_managed_block(&f, WB_BEGIN, SOUL_END, None).unwrap();
+        let s = std::fs::read_to_string(&f).unwrap();
+        assert!(!s.contains("BLOCK v2"));
+        assert!(s.contains("User prose stays."));
+        // a file that was ONLY our block becomes empty, not deleted
+        let solo = dir.join("solo.md");
+        upsert_managed_block(&solo, WB_BEGIN, SOUL_END, Some("X")).unwrap();
+        upsert_managed_block(&solo, WB_BEGIN, SOUL_END, None).unwrap();
+        assert!(solo.exists());
+        assert_eq!(std::fs::read_to_string(&solo).unwrap(), "");
     }
 
     #[test]

@@ -145,10 +145,13 @@ The trust boundaries, plainly:
 - **Tokens:** prefer `dmem login <url>` with `$DM_LOGIN_TOKEN` or the prompt - a positional token lands in shell history and `ps`.
 - **Files:** tenant DBs and `iam.db` are created/re-chmodded 0600 on Unix. On Windows there is no ACL tightening yet - rely on the account boundary.
 - **Upgrades are signed:** `dmem upgrade` installs a release only when its `.minisig` verifies against a release key compiled into your binary, and refuses otherwise. 0.3.6 replaced that key, so an install on 0.3.5 or older cannot verify 0.3.6: install 0.3.6 once by hand from the release page, and `dmem upgrade` works again from there.
+- **A managed install does not self-upgrade:** when the file `.daimon-managed` sits beside the real `dmem` binary (what a host installer writes, root-owned), or `DM_MANAGED` is `1`, `true`, `yes` or `on` in the command's environment, `dmem upgrade` refuses before it does anything, names `daimon-expert upgrade`, and exits 3. The marker is the fence that holds; the variable reaches only the command it is set for. If dmem cannot tell, it refuses. See [docs/managed-install.md](docs/managed-install.md).
 - **The local graph viewer (`dmem ui`) has no auth** by design: keep it on the default loopback bind and reach it over an SSH tunnel. It rejects DNS-name Host headers (rebinding guard); IP-literal and localhost Hosts are allowed.
 
 ## Docs
 
 Full documentation is in the [project wiki](https://github.com/wakbijok/dm-lite/wiki): install and first run, wiring each agent, run as a server, run as a client, embedding models and footprint, multitenant admin, persona and governance, migrating from v1, upgrading, and building from source.
+
+For people who install or release dmem on a host: [managed installs](docs/managed-install.md), the file and variable that stop `dmem upgrade` on an installer-managed host, and [releasing](docs/releasing.md), how a release is built, packaged, signed and published.
 
 License: [Apache License 2.0](LICENSE), with attribution in [NOTICE](NOTICE). See also [CONTRIBUTING](CONTRIBUTING.md), [CODE_OF_CONDUCT](CODE_OF_CONDUCT.md), and [SECURITY](SECURITY.md).
