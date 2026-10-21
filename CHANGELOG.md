@@ -30,9 +30,8 @@ fixes.
 - **`THIRD_PARTY_LICENSES.md`**, the licence text of every Rust crate compiled into the
   `dist` build for the four release targets, is made by cargo-about from `about.toml` and
   `about.md.hbs` (`scripts/package-release.sh --write-notice`), and the script refuses to
-  package when the committed file is not what cargo-about generates. The file is not
-  committed yet: it has to be generated once on a host that has every crate of
-  `Cargo.lock` in its cargo cache.
+  package when the committed file is not what cargo-about generates. It is committed
+  and ships in every archive from 0.4.0 on.
 
 - **`docs/releasing.md`** is the release runbook that matches the scripts: the two lanes
   (hand and workflow) and which one is in use, the gate (`cargo test --features dist`), what a
