@@ -85,6 +85,22 @@ fixes.
   hits render whole, and a wide result set is clipped no harder than before.
   `DM_RECALL_BODY_CHARS` sets the per-record limit on every surface (`0` never clips).
 
+### Security
+
+- **rustls 0.23.46, rustls-webpki 0.103.16 and webpki-roots 1.0.10** (compatible
+  updates; nothing else in `Cargo.lock` moves). They fix RUSTSEC-2026-0349 (an
+  unauthenticated ServerHello could downgrade later connections to a classical key
+  exchange, which undoes the post-quantum key exchange of 0.3.8), RUSTSEC-2026-0346,
+  -0347 and -0348 (rustls), RUSTSEC-2026-0382 (rustls-webpki could accept a distrusted
+  intermediate) and RUSTSEC-2026-0381 for webpki-roots 1.x (distrusted emSign
+  intermediates).
+- **Accepted for this release**, because fixing them needs major upgrades of candle and
+  hf-hub:
+  - RUSTSEC-2026-0367, -0368 and -0369 in zip 1.1.4. candle reads model archives with
+    `ZipArchive` and never calls `extract`, which is where all three are.
+  - RUSTSEC-2026-0381 in webpki-roots 0.26.11, the root store of the HTTPS client that
+    hf-hub uses to download the embedding model.
+
 ## 0.3.8 - 2026-09-30
 
 Server stability before a replicated deployment: every change below but the

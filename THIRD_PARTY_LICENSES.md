@@ -4728,7 +4728,7 @@ limitations under the License.
 
 ### Apache License 2.0 (`Apache-2.0`)
 
-Used by: ahash 0.8.12, arc-swap 1.9.1, atomic-waker 1.1.2, base64 0.13.1, base64 0.22.1, bitflags 1.3.2, bitflags 2.13.0, cfg-if 1.0.4, core-foundation-sys 0.8.7, core-foundation 0.10.1, core-foundation 0.9.4, crossbeam-deque 0.8.6, crossbeam-epoch 0.9.20, crossbeam-utils 0.8.21, displaydoc 0.2.6, either 1.16.0, equivalent 1.0.2, errno 0.3.14, fastrand 2.4.1, filetime 0.2.29, flate2 1.1.9, fnv 1.0.7, form_urlencoded 1.2.2, hashbrown 0.14.5, hashbrown 0.17.1, heck 0.5.0, httparse 1.10.1, hyper-rustls 0.27.9, hyper-tls 0.6.0, idna 1.1.0, idna_adapter 1.2.2, indexmap 2.14.0, itertools 0.14.0, linux-raw-sys 0.12.1, log 0.4.32, mime 0.3.17, num-bigint 0.4.6, num-complex 0.4.6, num-integer 0.1.46, num-iter 0.1.45, num-rational 0.4.2, num-traits 0.2.19, num 0.4.3, num_cpus 1.17.0, once_cell 1.21.4, openssl-probe 0.2.1, percent-encoding 2.3.2, rayon-cond 0.4.0, rayon-core 1.13.0, rayon 1.12.0, regex-automata 0.4.14, regex-syntax 0.8.11, regex 1.12.4, ring 0.17.14, rustix 1.1.4, rustls-pemfile 2.2.0, rustls 0.23.45, security-framework-sys 2.17.0, security-framework 3.7.0, self-replace 1.5.0, serde_plain 1.0.2, signal-hook-registry 1.4.8, smallvec 1.15.2, socket2 0.6.4, stable_deref_trait 1.2.1, system-configuration-sys 0.6.0, system-configuration 0.7.0, tar 0.4.46, tempfile 3.27.0, unicode-normalization-alignments 0.1.12, unicode-segmentation 1.13.3, unicode-width 0.2.2, ureq 2.12.1, url 2.5.8, xattr 1.6.1
+Used by: ahash 0.8.12, arc-swap 1.9.1, atomic-waker 1.1.2, base64 0.13.1, base64 0.22.1, bitflags 1.3.2, bitflags 2.13.0, cfg-if 1.0.4, core-foundation-sys 0.8.7, core-foundation 0.10.1, core-foundation 0.9.4, crossbeam-deque 0.8.6, crossbeam-epoch 0.9.20, crossbeam-utils 0.8.21, displaydoc 0.2.6, either 1.16.0, equivalent 1.0.2, errno 0.3.14, fastrand 2.4.1, filetime 0.2.29, flate2 1.1.9, fnv 1.0.7, form_urlencoded 1.2.2, hashbrown 0.14.5, hashbrown 0.17.1, heck 0.5.0, httparse 1.10.1, hyper-rustls 0.27.9, hyper-tls 0.6.0, idna 1.1.0, idna_adapter 1.2.2, indexmap 2.14.0, itertools 0.14.0, linux-raw-sys 0.12.1, log 0.4.32, mime 0.3.17, num-bigint 0.4.6, num-complex 0.4.6, num-integer 0.1.46, num-iter 0.1.45, num-rational 0.4.2, num-traits 0.2.19, num 0.4.3, num_cpus 1.17.0, once_cell 1.21.4, openssl-probe 0.2.1, percent-encoding 2.3.2, rayon-cond 0.4.0, rayon-core 1.13.0, rayon 1.12.0, regex-automata 0.4.14, regex-syntax 0.8.11, regex 1.12.4, ring 0.17.14, rustix 1.1.4, rustls-pemfile 2.2.0, rustls 0.23.46, security-framework-sys 2.17.0, security-framework 3.7.0, self-replace 1.5.0, serde_plain 1.0.2, signal-hook-registry 1.4.8, smallvec 1.15.2, socket2 0.6.4, stable_deref_trait 1.2.1, system-configuration-sys 0.6.0, system-configuration 0.7.0, tar 0.4.46, tempfile 3.27.0, unicode-normalization-alignments 0.1.12, unicode-segmentation 1.13.3, unicode-width 0.2.2, ureq 2.12.1, url 2.5.8, xattr 1.6.1
 
 ~~~~~~~~text
                               Apache License
@@ -6933,7 +6933,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 ### Community Data License Agreement Permissive 2.0 (`CDLA-Permissive-2.0`)
 
-Used by: webpki-roots 0.26.11, webpki-roots 1.0.8
+Used by: webpki-roots 0.26.11, webpki-roots 1.0.10
 
 ~~~~~~~~text
 # Community Data License Agreement - Permissive - Version 2.0
@@ -7907,7 +7907,7 @@ THIS SOFTWARE.
 
 ### ISC License (`ISC`)
 
-Used by: rustls-webpki 0.103.15
+Used by: rustls-webpki 0.103.16
 
 ~~~~~~~~text
 Except as otherwise noted, this project is licensed under the following
