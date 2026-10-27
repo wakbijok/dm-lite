@@ -87,8 +87,9 @@ Rename the `Unreleased` section of `CHANGELOG.md` to `## X.Y.Z - YYYY-MM-DD`. Th
 script refuses a version with no such section, and a `Cargo.lock` that does not carry the
 version.
 
-**Licence notices.** If a dependency changed, make the notice again on a host that has every
-crate of `Cargo.lock` in its cargo cache (cargo-about 0.9.2 reads each crate's manifest and
+**Licence notices.** Make the notice again at every version bump (it names dm-lite's own
+version among the crates it lists, so a bump alone makes it stale) and whenever a dependency
+changed, on a host that has every crate of `Cargo.lock` in its cargo cache (cargo-about 0.9.2 reads each crate's manifest and
 licence files), then read the diff and commit it:
 
 ```sh
@@ -123,6 +124,8 @@ export CARGO_TARGET_DIR=$(mktemp -d /var/tmp/dmem-build.XXXXXX)     # fresh: not
 export ZVEC_LIB_DIR=/path/to/the/directory/holding/libzvec_c_api.so
 export ZVEC_AUTO_BUILD=0
 export CARGO_INCREMENTAL=0
+export CFLAGS="-ffile-prefix-map=$PWD=/dm-lite -ffile-prefix-map=${CARGO_HOME:-$HOME/.cargo}=/cargo"
+export CXXFLAGS="$CFLAGS"
 export RUSTFLAGS="--remap-path-prefix=$PWD=/dm-lite \
   --remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo \
   --remap-path-prefix=$(rustc --print sysroot)=/rust-sysroot"
@@ -135,7 +138,9 @@ binary can run in place) and the builder's cargo directory in its panic messages
 in different directories cannot give the same bytes. A fresh `CARGO_TARGET_DIR` with `ZVEC_LIB_DIR` set
 leaves no `zvec-prebuilt` directory to find, and the remapping replaces the three directories
 the compiler would otherwise name (a toolchain with the `rust-src` component names its own
-directory under `~/.rustup`, which the sysroot line covers). The packaging script checks the
+directory under `~/.rustup`, which the sysroot line covers). `RUSTFLAGS` reaches only the Rust
+compiler: the C sources that `aws-lc-sys` compiles keep their `__FILE__` paths under the cargo
+registry unless `CFLAGS` maps them too (the first 0.4.0 build had them and was refused). The packaging script checks the
 result and refuses a binary that still has either.
 
 The binary is `$CARGO_TARGET_DIR/release/dmem`. The same compiler, flags and dependencies give

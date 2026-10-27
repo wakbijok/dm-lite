@@ -3,6 +3,34 @@
 Notable changes to dm-lite (`dmem`). Releases up to and including 0.3.6 are
 described on [GitHub Releases](https://github.com/wakbijok/dm-lite/releases).
 
+## 0.4.1 - 2026-10-27
+
+A fix release after the 27-10-2026 power-off, which left a tenant's vector index torn and
+put a dmem server into a crash loop.
+
+### Fixed
+
+- **A torn vector index no longer crashes dmem on every start.** On 27-10-2026 a hypervisor
+  power-off cut a vector flush off mid-write and left a tenant's newest zvec manifest at 0
+  bytes. zvec's native open does not fail on that: `dmem serve` died with SIGSEGV while
+  opening tenants, on every restart, and took the service down. Opening a vector index now
+  checks it first. An index with no `manifest.N`, or whose newest one is empty, is moved
+  aside to `<tenant>.corrupt-<UTC time>` (a rename; nothing is deleted), and a fresh index
+  takes its place, rebuilt from the database. The check sees file names and sizes only: a
+  manifest that is torn but not empty still reaches zvec.
+- **A fresh vector index next to existing records is filled.** Before, an index created while
+  the tenant's database already had records stayed empty for good (on 27-10-2026 one was moved
+  aside by hand), so every record dropped out of hybrid recall, which gates on cosine. Now
+  such an index gets a `<tenant>.backfill` marker and is rebuilt from the database:
+  - `dmem serve` rebuilds on a background thread, one record per save permit. The tenant
+    serves meanwhile (records not yet rebuilt are found by keyword) and readiness is not held
+    up. A stop part-way repeats the rebuild on the next start.
+  - The CLI and the hooks rebuild during the open, resumably, with a checkpoint.
+- **The vector index is synced after a flush.** zvec writes its files without syncing them.
+  After dmem's own flush (at a planned stop) every file and directory of the index is now
+  synced, so a power-off right after a stop cannot leave an empty manifest. zvec's own writes
+  between flushes are not covered: the open-time check above guards against those.
+
 ## 0.4.0 - 2026-10-20
 
 The last feature release of dm-lite: the held branches are merged

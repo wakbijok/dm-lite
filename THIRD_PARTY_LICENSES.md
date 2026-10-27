@@ -453,7 +453,7 @@ Used by: deranged 0.5.8
 
 ### Apache License 2.0 (`Apache-2.0`)
 
-Used by: dm-lite 0.4.0, encode_unicode 1.0.0, encoding_rs 0.8.35, static_assertions 1.1.0, utf8_iter 1.0.4, zeroize 1.9.0
+Used by: dm-lite 0.4.1, encode_unicode 1.0.0, encoding_rs 0.8.35, static_assertions 1.1.0, utf8_iter 1.0.4, zeroize 1.9.0
 
 ~~~~~~~~text
 

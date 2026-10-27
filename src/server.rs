@@ -439,9 +439,44 @@ impl AppState {
             }
         };
         self.note_vectors(tenant, local.has_vector_index());
+        #[cfg(feature = "zvec")]
+        let index = local.vector_index();
         let handle: TenantHandle = Arc::new(Mutex::new(Memory::Local(local)));
         *slot = Some(handle.clone());
+        #[cfg(feature = "zvec")]
+        if let Some(index) = index {
+            self.start_backfill(tenant, index);
+        }
         Ok(handle)
+    }
+
+    /// When `tenant`'s index was created fresh while its store had records (a torn index the
+    /// open quarantined, or one moved aside by hand), give those records their vectors on a
+    /// background thread: the tenant serves meanwhile (records not yet re-embedded are found by
+    /// keyword only), readiness is not held up, and each record waits for a save permit like
+    /// any other embedding. Once per tenant per process; the marker is removed only after a
+    /// complete run, so a stop part-way repeats it on the next start (it is idempotent).
+    #[cfg(feature = "zvec")]
+    fn start_backfill(&self, tenant: &str, index: Arc<crate::zvec_index::ZvecIndex>) {
+        static RUNNING: std::sync::OnceLock<Mutex<std::collections::HashSet<String>>> = std::sync::OnceLock::new();
+        if !LocalMemory::backfill_pending(tenant) {
+            return;
+        }
+        let running = RUNNING.get_or_init(Default::default);
+        if !running.lock().unwrap_or_else(|p| p.into_inner()).insert(tenant.to_string()) {
+            return;
+        }
+        eprintln!("dmem serve: tenant '{tenant}': its vector index is new but the database has records; rebuilding their vectors in the background");
+        let (st, t) = (self.clone(), tenant.to_string());
+        std::thread::spawn(move || {
+            st.reembed_since(&t, None, &index, i64::MIN / 2);
+            if !st.draining.load(Ordering::SeqCst) && !st.closing.load(Ordering::SeqCst) {
+                let _ = index.flush();
+                LocalMemory::finish_backfill(&t);
+                eprintln!("dmem serve: tenant '{t}': vector backfill complete");
+            }
+            running.lock().unwrap_or_else(|p| p.into_inner()).remove(&t);
+        });
     }
 
     /// Record whether a tenant has a vector index. One without is put on the retry schedule
@@ -546,6 +581,7 @@ impl AppState {
             .unwrap_or_else(crate::entry::now_ms);
         let old = slot.replace(Arc::new(Mutex::new(Memory::Local(local))));
         self.note_vectors(tenant, true);
+        self.start_backfill(tenant, index.clone());
         eprintln!("dmem serve: tenant '{tenant}' vector index opened on retry; hybrid recall is back");
         Ok(Reopened::Healed { old, index, since_ms })
     }
@@ -3878,6 +3914,55 @@ mod tests {
     // Write attribution over the wire: a save through an agent token comes back from recall
     // with the author:<agent> tag stamped by the server (the client sends no attribution).
     #[allow(clippy::await_holding_lock)] // ENV_LOCK must span the awaits, as above
+    // 27-10-2026: a power-off tore a tenant's vector index and dmem crashed opening it on every
+    // restart. Now the open quarantines it, the tenant serves at once, and the records get their
+    // vectors back on a background thread.
+    #[cfg(feature = "zvec")]
+    #[tokio::test]
+    async fn a_server_opens_a_tenant_whose_index_is_torn_and_backfills_it_in_the_background() {
+        let _g = env_lock();
+        let dir = std::env::temp_dir().join(format!("dmtorn-srv-{}-{}", std::process::id(), crate::entry::now_ms()));
+        std::env::set_var("DM_DATA_DIR", &dir);
+        std::env::set_var("DM_TOKEN_TB1", "torntok-0123456789");
+        let tok = "torntok-0123456789";
+        {
+            let app = router(Arc::new(BearerAuth::from_env().unwrap()), None);
+            for text in ["zqw pinned certificate rotation note", "zqw quartz backup restore drill"] {
+                let (st, _) = post_as(&app, "/remember", tok, json!({"text": text, "namespace": "resources/notes"}), &[]).await;
+                assert_eq!(st, StatusCode::OK);
+            }
+        }
+        // The router is gone, and its tenant handles with it. Tear the newest manifest as the
+        // power-off did.
+        let vdir = crate::config::vector_dir("tb1").unwrap();
+        let newest = std::fs::read_dir(&vdir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter_map(|e| Some((e.file_name().to_string_lossy().strip_prefix("manifest.")?.parse::<u64>().ok()?, e.path())))
+            .max_by_key(|(n, _)| *n)
+            .unwrap()
+            .1;
+        std::fs::write(&newest, b"").unwrap();
+        let app = router(Arc::new(BearerAuth::from_env().unwrap()), None);
+        let (st, v) = post_as(&app, "/recall", tok, json!({"query": "zqw certificate rotation", "limit": 5}), &[]).await;
+        assert_eq!(st, StatusCode::OK, "the tenant serves instead of crashing: {v}");
+        let marker = crate::tools::backfill_marker(&vdir);
+        let mut waited = 0;
+        while marker.exists() && waited < 200 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            waited += 1;
+        }
+        assert!(!marker.exists(), "the background backfill finished and cleared its marker");
+        let (st, v) = post_as(&app, "/recall", tok, json!({"query": "zqw pinned certificate rotation note", "limit": 5}), &[]).await;
+        assert_eq!(st, StatusCode::OK);
+        assert!(v.to_string().contains("zqw pinned certificate rotation note"), "found again after the backfill: {v}");
+        let parent = vdir.parent().unwrap();
+        let kept = std::fs::read_dir(parent).unwrap().filter_map(|e| e.ok()).any(|e| e.file_name().to_string_lossy().starts_with("tb1.corrupt-"));
+        assert!(kept, "the torn index is kept beside the new one");
+        std::env::remove_var("DM_TOKEN_TB1");
+        std::env::remove_var("DM_DATA_DIR");
+    }
+
     #[tokio::test]
     async fn remember_with_agent_token_stamps_author() {
         let _g = env_lock();

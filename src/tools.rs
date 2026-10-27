@@ -643,6 +643,62 @@ fn slot_marker(vdir: &std::path::Path) -> std::path::PathBuf {
 /// the last uri whose slots are done (the work list is in uri order), so an interrupted
 /// migration resumes after it instead of starting over.
 #[cfg(feature = "zvec")]
+/// The marker of an index that was created fresh while its store already had records (a
+/// quarantined torn index, or one moved aside by hand): those records have no vector until the
+/// backfill writes them, and hybrid recall gates on cosine, so it would not find them. Written
+/// before the backfill starts and removed when it ends, so an interrupted one resumes.
+#[cfg(feature = "zvec")]
+pub(crate) fn backfill_marker(vdir: &std::path::Path) -> std::path::PathBuf {
+    let name = vdir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    vdir.with_file_name(format!("{name}.backfill"))
+}
+
+#[cfg(feature = "zvec")]
+fn backfill_progress(vdir: &std::path::Path) -> std::path::PathBuf {
+    let name = vdir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    vdir.with_file_name(format!("{name}.backfill.progress"))
+}
+
+/// Give every record in `store` its vectors in `vindex` (each uri's live rows, per scope),
+/// resuming after the last uri a previous, interrupted run finished; then clear the marker.
+/// Returns the vectors written. The local engine runs it when it opens a marked index; `dmem
+/// serve` runs it on a background thread instead, so a large store does not hold up readiness.
+#[cfg(feature = "zvec")]
+pub fn backfill_vectors(
+    store: &SqliteStore,
+    vindex: &crate::zvec_index::ZvecIndex,
+    embedder: &dyn crate::embedder::Embedder,
+    vdir: &std::path::Path,
+) -> Result<usize> {
+    let progress = backfill_progress(vdir);
+    // Every uri the store has ever held (global ones too, which the slot migration skips),
+    // in uri order (`uris_changed_since` sorts by uri, binary collation = Rust str order), so
+    // the checkpoint resumes exactly where an interrupted run stopped.
+    let done_through = std::fs::read_to_string(&progress).ok().filter(|s| !s.is_empty());
+    let uris = store.uris_changed_since(i64::MIN / 2)?;
+    let todo: Vec<&String> = uris.iter().filter(|u| done_through.as_deref().is_none_or(|d| u.as_str() > d)).collect();
+    if !todo.is_empty() {
+        eprintln!(
+            "dmem: backfilling the vector index from the database: {} of {} uri(s) to do{}",
+            todo.len(),
+            uris.len(),
+            if done_through.is_some() { " (resuming an interrupted run)" } else { "" }
+        );
+    }
+    let mut n = 0usize;
+    for (i, uri) in todo.iter().enumerate() {
+        n += migrate_uri_slots(store, vindex, embedder, uri)?;
+        write_slot_checkpoint(&progress, uri);
+        if (i + 1) % 100 == 0 {
+            eprintln!("dmem: vector index backfill: {}/{} uri(s) done", i + 1, todo.len());
+        }
+    }
+    let _ = vindex.flush();
+    let _ = std::fs::remove_file(&progress);
+    let _ = std::fs::remove_file(backfill_marker(vdir));
+    Ok(n)
+}
+
 fn slot_progress(vdir: &std::path::Path) -> std::path::PathBuf {
     let name = vdir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     vdir.with_file_name(format!("{name}.scope-slots.progress"))
@@ -688,7 +744,29 @@ fn open_vector_index(
     vdir: &std::path::Path,
     embedder: &dyn crate::embedder::Embedder,
     require_vectors: bool,
+    defer_backfill: bool,
 ) -> Result<Option<crate::zvec_index::ZvecIndex>> {
+    // Never hand zvec a torn index: its native open dies with SIGSEGV on an empty manifest,
+    // and a process that crashes opening a tenant crashes on every restart. Move it aside
+    // (nothing is deleted) and start a fresh one, which the backfill below fills from the
+    // database, the authoritative copy.
+    if let Some(why) = crate::zvec_index::torn_reason(vdir) {
+        crate::metrics::zvec_failure(crate::metrics::ZvecOp::Open);
+        match crate::zvec_index::quarantine(vdir) {
+            Ok(to) => eprintln!(
+                "dmem: vector index {} is torn ({why}), as an unclean stop leaves it; moved it to {} and starting a fresh index, rebuilt from the database",
+                vdir.display(),
+                to.display()
+            ),
+            Err(e) => {
+                eprintln!("dmem: vector index {} is torn ({why}) and could not be moved aside ({e:#}); it is not opened", vdir.display());
+                if require_vectors {
+                    return Err(VectorIndexRequired(format!("torn vector index ({why})")).into());
+                }
+                return Ok(None);
+            }
+        }
+    }
     let fresh = !vdir.exists();
     let vindex = match crate::zvec_index::ZvecIndex::open(vdir) {
         Ok(v) => v,
@@ -724,6 +802,20 @@ fn open_vector_index(
         }
     }
     let _ = std::fs::remove_file(&progress);
+    // A fresh index next to a store that already has records: mark it for the backfill
+    // (0.3.8 left such an index empty for good, so those records dropped out of recall).
+    let marker = backfill_marker(vdir);
+    if fresh && !store.uris_changed_since(i64::MIN / 2).map(|u| u.is_empty()).unwrap_or(true) {
+        if let Err(e) = std::fs::write(&marker, "this index was created while the database had records: their vectors are being rebuilt; delete to skip\n") {
+            eprintln!("dmem: could not write {} ({e}); the records already saved get no vector until `dmem reindex_embeddings`", marker.display());
+        }
+    }
+    if marker.exists() && !defer_backfill {
+        match backfill_vectors(store, &vindex, embedder, vdir) {
+            Ok(n) => eprintln!("dmem: vector index backfilled from the database ({n} record vector(s))"),
+            Err(e) => eprintln!("dmem: vector index backfill failed ({e:#}); it resumes on the next open"),
+        }
+    }
     Ok(Some(vindex))
 }
 
@@ -873,8 +965,10 @@ impl LocalMemory {
     /// Open a specific tenant's store explicitly. Server mode uses this per request so it
     /// never mutates the process-global $DM_TENANT (which would race under concurrency).
     pub fn open_tenant(tenant: &str) -> Result<Self> {
+        // Not deferred: a local caller (the CLI, the hooks) has no background thread to run
+        // a pending backfill, so the open runs it (resumable, see `backfill_vectors`).
         #[cfg(feature = "zvec")]
-        return Self::open_tenant_with_embedder(tenant, make_embedder());
+        return Self::open_tenant_inner(tenant, make_embedder(), false);
         #[cfg(not(feature = "zvec"))]
         Self::open_tenant_inner(tenant)
     }
@@ -883,12 +977,15 @@ impl LocalMemory {
     /// pre-embeds with, so a pre-embedded vector is exactly what this handle would compute).
     #[cfg(feature = "zvec")]
     pub fn open_tenant_with_embedder(tenant: &str, embedder: std::sync::Arc<dyn crate::embedder::Embedder>) -> Result<Self> {
-        Self::open_tenant_inner(tenant, embedder)
+        // `dmem serve` is the caller: it runs a pending backfill on a background thread
+        // (`backfill_pending`), so a tenant with many records does not hold up readiness.
+        Self::open_tenant_inner(tenant, embedder, true)
     }
 
     fn open_tenant_inner(
         tenant: &str,
         #[cfg(feature = "zvec")] embedder: std::sync::Arc<dyn crate::embedder::Embedder>,
+        #[cfg(feature = "zvec")] defer_backfill: bool,
     ) -> Result<Self> {
         // The embedding model first (`DM_REQUIRE_MODEL`): a refused open touches no file.
         #[cfg(feature = "zvec")]
@@ -907,7 +1004,7 @@ impl LocalMemory {
         #[cfg(feature = "zvec")]
         let m = {
             let vdir = config::vector_dir(tenant)?;
-            let vindex = open_vector_index(&store, &vdir, &*embedder, config::require_vectors())?.map(std::sync::Arc::new);
+            let vindex = open_vector_index(&store, &vdir, &*embedder, config::require_vectors(), defer_backfill)?.map(std::sync::Arc::new);
             Self {
                 store,
                 write_scope,
@@ -1002,6 +1099,22 @@ impl LocalMemory {
     #[cfg(feature = "zvec")]
     pub fn vector_index(&self) -> Option<std::sync::Arc<crate::zvec_index::ZvecIndex>> {
         self.vindex.clone()
+    }
+
+    /// The tenant's index still has records to backfill (`backfill_marker`): set only for a
+    /// handle opened with the backfill deferred (`dmem serve`), which runs `backfill_vectors`.
+    #[cfg(feature = "zvec")]
+    pub fn backfill_pending(tenant: &str) -> bool {
+        config::vector_dir(tenant).map(|d| backfill_marker(&d).exists()).unwrap_or(false)
+    }
+
+    /// The backfill of `tenant`'s index is complete (`dmem serve`'s background run): drop the
+    /// marker, so the next open does not run it again.
+    #[cfg(feature = "zvec")]
+    pub fn finish_backfill(tenant: &str) {
+        if let Ok(d) = config::vector_dir(tenant) {
+            let _ = std::fs::remove_file(backfill_marker(&d));
+        }
     }
 
     /// Does this tenant have a working vector index (hybrid recall)? False for a keyword-only
@@ -1981,7 +2094,7 @@ impl LocalMemory {
     /// `vdir` is migrated exactly as at a real start-up.
     pub(crate) fn for_test_vec(store: SqliteStore, vdir: &std::path::Path) -> Self {
         let mut m = Self::for_test(store);
-        m.vindex = Some(std::sync::Arc::new(open_vector_index(&m.store, vdir, &*m.embedder, false).unwrap().expect("open test vector index")));
+        m.vindex = Some(std::sync::Arc::new(open_vector_index(&m.store, vdir, &*m.embedder, false, false).unwrap().expect("open test vector index")));
         m
     }
 }
@@ -2696,6 +2809,88 @@ mod tests {
         let qv = m.embedder.embed(text);
         let slot = crate::zvec_index::slot_of(uri, scope);
         m.vindex.as_ref().unwrap().search(&qv, 64).unwrap().into_iter().find(|h| h.slot == slot).map(|h| h.score)
+    }
+
+    /// The newest `manifest.N` file of an index directory.
+    #[cfg(feature = "zvec")]
+    fn newest_manifest(vdir: &std::path::Path) -> std::path::PathBuf {
+        std::fs::read_dir(vdir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter_map(|e| {
+                let n: u64 = e.file_name().to_string_lossy().strip_prefix("manifest.")?.parse().ok()?;
+                Some((n, e.path()))
+            })
+            .max_by_key(|(n, _)| *n)
+            .expect("an index has a manifest")
+            .1
+    }
+
+    /// A real index with two records, flushed and closed, leaving `m` without a vector index.
+    #[cfg(feature = "zvec")]
+    fn two_records_flushed(vdir: &std::path::Path) -> (LocalMemory, String, String) {
+        let mut m = LocalMemory::for_test_vec(tmp_store(), vdir);
+        let a = m.remember("zebra pinned certificate rotation note", "resources/notes", None, None, None).unwrap();
+        let b = m.remember("quartz backup restore drill for the archive", "resources/notes", None, None, None).unwrap();
+        m.vindex.as_ref().unwrap().flush().unwrap();
+        m.vindex = None; // closes the collection (the only handle)
+        (m, a, b)
+    }
+
+    #[cfg(feature = "zvec")]
+    #[test]
+    fn a_torn_index_is_quarantined_and_rebuilt_instead_of_crashing_the_open() {
+        // The 27-10-2026 failure: a power-off cut a flush off and left the newest manifest at
+        // 0 bytes; zvec's open then died with SIGSEGV on every restart. Were the guard missing,
+        // this test process would die the same way.
+        let vdir = tmp_vdir();
+        let (mut m, a, b) = two_records_flushed(&vdir);
+        let torn = newest_manifest(&vdir);
+        std::fs::write(&torn, b"").unwrap();
+        assert!(crate::zvec_index::torn_reason(&vdir).is_some());
+        let idx = open_vector_index(&m.store, &vdir, &*m.embedder, false, false).unwrap().expect("a fresh index, not keyword-only");
+        let parent = vdir.parent().unwrap();
+        let name = vdir.file_name().unwrap().to_string_lossy().into_owned();
+        let moved: Vec<_> = std::fs::read_dir(parent)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with(&format!("{name}.corrupt-")))
+            .collect();
+        assert_eq!(moved.len(), 1, "the torn index is kept, next to the new one");
+        assert!(moved[0].path().join(torn.file_name().unwrap()).exists());
+        assert!(!backfill_marker(&vdir).exists(), "the local open ran the backfill and cleared the marker");
+        m.vindex = Some(std::sync::Arc::new(idx));
+        for (uri, text) in [(&a, "zebra pinned certificate rotation note"), (&b, "quartz backup restore drill for the archive")] {
+            assert!(vec_score(&m, text, uri).is_some_and(|c| c > 0.99), "{uri} has its vector back");
+        }
+        assert_eq!(m.recall("zebra certificate rotation", 3).unwrap().first().map(|e| e.uri.clone()), Some(a));
+    }
+
+    #[cfg(feature = "zvec")]
+    #[test]
+    fn a_fresh_index_beside_records_is_marked_and_the_deferred_backfill_fills_it() {
+        // The other half of 27-10-2026: an index moved aside by hand came back fresh and EMPTY,
+        // and 0.3.8 never filled it, so every record dropped out of hybrid recall.
+        let vdir = tmp_vdir();
+        let (mut m, a, _) = two_records_flushed(&vdir);
+        std::fs::rename(&vdir, vdir.with_extension("aside")).unwrap();
+        let idx = open_vector_index(&m.store, &vdir, &*m.embedder, false, true).unwrap().unwrap();
+        assert!(backfill_marker(&vdir).exists(), "deferred: the server runs it, so the marker stays");
+        m.vindex = Some(std::sync::Arc::new(idx));
+        assert!(vec_score(&m, "zebra pinned certificate rotation note", &a).is_none(), "nothing backfilled yet");
+        let n = backfill_vectors(&m.store, m.vindex.as_ref().unwrap(), &*m.embedder, &vdir).unwrap();
+        assert!(n >= 2, "{n}");
+        assert!(!backfill_marker(&vdir).exists() && !backfill_progress(&vdir).exists());
+        assert!(vec_score(&m, "zebra pinned certificate rotation note", &a).is_some_and(|c| c > 0.99));
+    }
+
+    #[cfg(feature = "zvec")]
+    #[test]
+    fn a_fresh_index_on_an_empty_store_needs_no_backfill() {
+        let vdir = tmp_vdir();
+        let m = LocalMemory::for_test(tmp_store());
+        assert!(open_vector_index(&m.store, &vdir, &*m.embedder, false, true).unwrap().is_some());
+        assert!(!backfill_marker(&vdir).exists());
     }
 
     #[cfg(feature = "zvec")]
@@ -3869,8 +4064,8 @@ mod tests {
         std::fs::create_dir_all(vdir.parent().unwrap()).unwrap();
         std::fs::write(&vdir, "not a vector index").unwrap(); // a file where the index dir belongs
         let embedder = crate::embedder::HashEmbedder::new();
-        assert!(open_vector_index(&store, &vdir, &embedder, false).unwrap().is_none(), "keyword-only, as before");
-        let Err(e) = open_vector_index(&store, &vdir, &embedder, true) else { panic!("the open must fail") };
+        assert!(open_vector_index(&store, &vdir, &embedder, false, false).unwrap().is_none(), "keyword-only, as before");
+        let Err(e) = open_vector_index(&store, &vdir, &embedder, true, false) else { panic!("the open must fail") };
         assert!(e.downcast_ref::<VectorIndexRequired>().is_some(), "{e:#}");
         assert!(format!("{e:#}").contains("DM_REQUIRE_VECTORS"), "{e:#}");
     }

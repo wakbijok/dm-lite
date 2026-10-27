@@ -82,6 +82,61 @@ fn chunk_pk(uri: &str, scope: &str, i: usize) -> String {
 /// Length of a slot id (and so of a chunk-0 PK); later chunks append two hex chars.
 const SLOT_LEN: usize = 32;
 
+/// Why the index under `dir` cannot be opened safely, if it cannot: it has no `manifest.N`
+/// file, or its newest one is empty. That is what an unclean stop leaves when it cuts a flush
+/// off mid-write (a power-off on 27-10-2026 left `manifest.3` at 0 bytes), and zvec's native
+/// open does not fail on it: the process dies with SIGSEGV, on every restart. None for a
+/// directory that does not exist (a fresh index) or looks whole. A cheap check on file names
+/// and sizes only; it cannot see a manifest that is torn but not empty.
+pub fn torn_reason(dir: &Path) -> Option<String> {
+    let entries = std::fs::read_dir(dir).ok()?;
+    let newest = entries
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let n: u64 = name.strip_prefix("manifest.")?.parse().ok()?;
+            Some((n, e.metadata().map(|m| m.len()).unwrap_or(0)))
+        })
+        .max_by_key(|(n, _)| *n);
+    match newest {
+        None => Some("it has no manifest".to_string()),
+        Some((n, 0)) => Some(format!("its newest manifest, manifest.{n}, is empty")),
+        Some(_) => None,
+    }
+}
+
+/// Move a torn index aside, next to where it was: `<name>.corrupt-<UTC time>` (with a counter
+/// when that name is taken), so nothing is lost and a fresh index can take its place. A rename
+/// on the same filesystem, so it is atomic. Returns where it went.
+pub fn quarantine(dir: &Path) -> Result<std::path::PathBuf> {
+    let name = dir.file_name().map(|n| n.to_string_lossy().into_owned()).ok_or_else(|| anyhow!("no index directory name"))?;
+    let stamp = utc_stamp(std::time::SystemTime::now());
+    let mut to = dir.with_file_name(format!("{name}.corrupt-{stamp}"));
+    let mut i = 2;
+    while to.exists() {
+        to = dir.with_file_name(format!("{name}.corrupt-{stamp}-{i}"));
+        i += 1;
+    }
+    std::fs::rename(dir, &to).map_err(|e| anyhow!("move {} to {}: {e}", dir.display(), to.display()))?;
+    Ok(to)
+}
+
+/// `YYYYMMDD-HHMMSSZ` in UTC, for file names (civil date from days, H. Hinnant).
+fn utc_stamp(t: std::time::SystemTime) -> String {
+    let secs = t.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0) as i64;
+    let (days, rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!("{y:04}{m:02}{d:02}-{:02}{:02}{:02}Z", rem / 3600, (rem % 3600) / 60, rem % 60)
+}
+
 /// One vector-search hit: the record's uri, its slot id (`slot_of(uri, scope)` of the record the
 /// vector embeds - match it against the uri's live scopes to learn which record), and the cosine
 /// similarity of its best-matching chunk.
@@ -94,6 +149,21 @@ pub struct VectorHit {
 
 pub struct ZvecIndex {
     collection: Collection,
+    /// Where the index lives, for syncing it after a flush.
+    dir: Option<std::path::PathBuf>,
+}
+
+/// fsync every file under `dir`, then each directory (so new names are durable too).
+fn sync_tree(dir: &Path) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let path = entry?.path();
+        if path.is_dir() {
+            sync_tree(&path)?;
+        } else if let Ok(f) = std::fs::File::open(&path) {
+            f.sync_all()?;
+        }
+    }
+    std::fs::File::open(dir)?.sync_all()
 }
 
 impl ZvecIndex {
@@ -122,7 +192,7 @@ impl ZvecIndex {
                 .map_err(ze)?;
             Collection::create_and_open(&path, &schema, None).map_err(ze)?
         };
-        Ok(Self { collection })
+        Ok(Self { collection, dir: Some(dir.to_path_buf()) })
     }
 
     /// Upsert (supersede) one record's vectors - the (uri, scope) slot - one per body window.
@@ -149,8 +219,20 @@ impl ZvecIndex {
     /// Write the collection's buffered changes to disk. `dmem serve` calls it for every open
     /// tenant when it shuts down (SIGTERM), after in-flight requests have drained, so a
     /// planned stop leaves the index as current as the database beside it.
+    ///
+    /// zvec writes its files without syncing them, so after its flush every file of the index
+    /// (and each directory) is synced too: a power-off right after a planned stop then cannot
+    /// leave a manifest whose data never reached the disk. This does not cover zvec's own
+    /// writes between flushes, which a power-off can still tear; the open guards against that
+    /// (`torn_reason`, quarantine, rebuild from the database).
     pub fn flush(&self) -> Result<()> {
-        self.collection.flush().map_err(ze)
+        self.collection.flush().map_err(ze)?;
+        if let Some(dir) = &self.dir {
+            if let Err(e) = sync_tree(dir) {
+                eprintln!("dmem: vector index {} flushed but not synced ({e})", dir.display());
+            }
+        }
+        Ok(())
     }
 
     /// Remove all chunk vectors of one record, the (uri, scope) slot (used by forget and by an
@@ -207,6 +289,57 @@ impl ZvecIndex {
 
 #[cfg(test)]
 mod tests {
+
+    fn tmp(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("dmtorn-{tag}-{}-{}", std::process::id(), crate::entry::now_ms()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn a_torn_index_is_one_whose_newest_manifest_is_empty_or_missing() {
+        let base = tmp("reason");
+        let idx = base.join("t");
+        assert_eq!(torn_reason(&idx), None, "no directory: a fresh index, not a torn one");
+        std::fs::create_dir_all(idx.join("0")).unwrap();
+        assert_eq!(torn_reason(&idx).as_deref(), Some("it has no manifest"));
+        std::fs::write(idx.join("manifest.0"), [1u8; 100]).unwrap();
+        assert_eq!(torn_reason(&idx), None);
+        // The 27-10-2026 shape: older manifests whole, the newest one written as 0 bytes.
+        std::fs::write(idx.join("manifest.2"), [1u8; 375]).unwrap();
+        std::fs::write(idx.join("manifest.3"), b"").unwrap();
+        assert_eq!(torn_reason(&idx).as_deref(), Some("its newest manifest, manifest.3, is empty"));
+        // Numeric order, not text order: manifest.10 is newer than manifest.3.
+        std::fs::write(idx.join("manifest.10"), [1u8; 200]).unwrap();
+        assert_eq!(torn_reason(&idx), None);
+        std::fs::write(idx.join("manifest.x"), b"").unwrap();
+        assert_eq!(torn_reason(&idx), None, "names that are not manifest.<number> are ignored");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn quarantine_moves_the_index_aside_and_never_overwrites() {
+        let base = tmp("quar");
+        let idx = base.join("tenant-a");
+        std::fs::create_dir_all(&idx).unwrap();
+        std::fs::write(idx.join("manifest.3"), b"").unwrap();
+        let first = quarantine(&idx).unwrap();
+        assert!(!idx.exists() && first.join("manifest.3").exists());
+        let name = first.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.starts_with("tenant-a.corrupt-") && name.ends_with('Z'), "{name}");
+        std::fs::create_dir_all(&idx).unwrap();
+        let second = quarantine(&idx).unwrap();
+        assert_ne!(first, second, "a second quarantine in the same second gets its own name");
+        assert!(first.exists() && second.exists());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn the_stamp_is_utc_calendar_time() {
+        let t = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_793_072_338); // 2026-10-27T03:38:58Z
+        assert_eq!(utc_stamp(t), "20261027-033858Z");
+        assert_eq!(utc_stamp(std::time::UNIX_EPOCH), "19700101-000000Z");
+    }
     use super::*;
 
     /// (uri, score) per hit - the per-uri view the single-scope tests reason in.
