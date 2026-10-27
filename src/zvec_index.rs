@@ -205,7 +205,6 @@ pub fn probe_many(dirs: &[std::path::PathBuf]) -> usize {
 
 /// `probe` with the program and the timeout given (the env lookups done by the caller).
 pub fn probe_with(dir: &Path, exe: &Path, timeout: std::time::Duration) -> Probe {
-    use std::os::unix::process::CommandExt;
     let mut cmd = std::process::Command::new(exe);
     cmd.arg(PROBE_SUBCOMMAND)
         .arg(dir)
@@ -215,18 +214,25 @@ pub fn probe_with(dir: &Path, exe: &Path, timeout: std::time::Duration) -> Probe
     // zvec opens its files without close-on-exec, so a child would inherit the descriptors of
     // every index this process has open, LOCK files included: an index closed here while the
     // child lives would stay locked. Mark every inherited descriptor close-on-exec (not closed:
-    // std's own exec-error pipe must stay usable until the exec).
+    // std's own exec-error pipe must stay usable until the exec). Windows hands a child only
+    // the handles marked inheritable, so there is nothing to do there.
     // SAFETY: runs in the forked child before exec and makes only async-signal-safe calls
     // (close_range, fcntl).
+    #[cfg(unix)]
     unsafe {
+        use std::os::unix::process::CommandExt;
         cmd.pre_exec(|| {
-            const CLOSE_RANGE_CLOEXEC: libc::c_uint = 4;
-            if libc::syscall(libc::SYS_close_range, 3 as libc::c_uint, libc::c_uint::MAX, CLOSE_RANGE_CLOEXEC) != 0 {
-                for fd in 3..4096 {
-                    let flags = libc::fcntl(fd, libc::F_GETFD);
-                    if flags >= 0 {
-                        libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
-                    }
+            #[cfg(target_os = "linux")]
+            {
+                const CLOSE_RANGE_CLOEXEC: libc::c_uint = 4;
+                if libc::syscall(libc::SYS_close_range, 3 as libc::c_uint, libc::c_uint::MAX, CLOSE_RANGE_CLOEXEC) == 0 {
+                    return Ok(());
+                }
+            }
+            for fd in 3..4096 {
+                let flags = libc::fcntl(fd, libc::F_GETFD);
+                if flags >= 0 {
+                    libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
                 }
             }
             Ok(())
@@ -242,11 +248,14 @@ pub fn probe_with(dir: &Path, exe: &Path, timeout: std::time::Duration) -> Probe
             Ok(Some(status)) if status.success() => return Probe::Opened,
             Ok(Some(status)) if status.code() == Some(PROBE_IN_USE) => return Probe::InUse,
             Ok(Some(status)) => {
-                use std::os::unix::process::ExitStatusExt;
-                return Probe::Failed(match status.signal() {
-                    Some(sig) => format!("opening it killed the probe with signal {sig}"),
-                    None => format!("the probe could not open it (exit {})", status.code().unwrap_or(-1)),
-                });
+                #[cfg(unix)]
+                {
+                    use std::os::unix::process::ExitStatusExt;
+                    if let Some(sig) = status.signal() {
+                        return Probe::Failed(format!("opening it killed the probe with signal {sig}"));
+                    }
+                }
+                return Probe::Failed(format!("the probe could not open it (exit {})", status.code().unwrap_or(-1)));
             }
             Ok(None) if std::time::Instant::now() >= end => {
                 let _ = child.kill();
@@ -259,8 +268,6 @@ pub fn probe_with(dir: &Path, exe: &Path, timeout: std::time::Duration) -> Probe
     }
 }
 
-/// The probe's child side (`dmem __probe_vector_index <dir>`): open the index and exit 0. A
-/// crash here is what the parent is looking for. No marker is written or removed.
 /// The probe's child side (`dmem __probe_vector_index <dir>`): open the index and exit 0. A
 /// crash here is what the parent is looking for. An index another process holds open exits with
 /// `PROBE_IN_USE`, so the parent never mistakes "in use" for "damaged". No marker is written or

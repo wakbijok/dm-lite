@@ -448,7 +448,7 @@ pub(crate) fn parse_wikilinks(s: &str) -> Vec<String> {
 /// Deliberately cheap - richer aliases are a curation concern on the entity record itself.
 pub(crate) fn entity_aliases(title: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
-    let mut push = |out: &mut Vec<String>, s: &str| {
+    let push = |out: &mut Vec<String>, s: &str| {
         let s = s.trim();
         if s.len() >= 2 && !out.iter().any(|e| e == s) {
             out.push(s.to_string());

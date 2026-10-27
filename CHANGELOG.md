@@ -3,6 +3,19 @@
 Notable changes to dm-lite (`dmem`). Releases up to and including 0.3.6 are
 described on [GitHub Releases](https://github.com/wakbijok/dm-lite/releases).
 
+## 0.4.3 - 2026-10-27
+
+A build fix for 0.4.2 on macOS and Windows. Linux behaviour is unchanged.
+
+### Fixed
+
+- **macOS and Windows builds.** The 0.4.2 vector-index probe used Linux- and Unix-only calls
+  without a platform guard, so `dmem` did not compile for `aarch64-apple-darwin` or
+  `x86_64-pc-windows-msvc` and 0.4.2 has no release for them. `close_range` is now used on
+  Linux only, with the `fcntl` loop on other Unix systems. On Windows the probe skips that step
+  (a child there inherits only handles marked inheritable) and reports a failed open by exit
+  code, since Windows has no signals.
+
 ## 0.4.2 - 2026-10-27
 
 A follow-up to 0.4.1: damage to a vector index that the size check cannot see no longer
