@@ -3,6 +3,45 @@
 Notable changes to dm-lite (`dmem`). Releases up to and including 0.3.6 are
 described on [GitHub Releases](https://github.com/wakbijok/dm-lite/releases).
 
+## 0.4.2 - 2026-10-27
+
+A follow-up to 0.4.1: damage to a vector index that the size check cannot see no longer
+leaves a tenant keyword-only, and the extra checks after an unclean stop cannot hold up
+readiness for long.
+
+### Fixed
+
+- **An index the last run did not close is opened in a child process first.** Opening a
+  vector index writes `<tenant>.dirty` beside it; a clean close (flushed and synced) removes it.
+  When the marker is there at open, the last run was killed or lost power, so `dmem` opens the
+  index in a child process (`dmem __probe_vector_index`) before opening it itself. A crash
+  there (a native one in zvec), a failed open, or no answer within
+  `DM_VECTOR_PROBE_TIMEOUT_SECS` (default 20) costs only the child. The index is then moved
+  aside and rebuilt from the database, as a torn one is.
+  - `dmem serve` probes every dirty index before it opens its tenants, up to
+    `DM_VECTOR_PROBE_CONCURRENCY` (default 4) at a time. After a power-off, when every index is
+    dirty, readiness waits for about ceil(dirty / 4) x the timeout in the worst case (10 tenants:
+    at most a minute) and usually about a second. A clean start probes nothing and waits for
+    nothing.
+  - This covers damage the size check cannot see. A manifest that is damaged but not empty
+    made zvec fail the open, and the tenant stayed keyword-only until someone rebuilt it by hand.
+  - Indexes closed cleanly are not probed, so the cost falls only after an unclean stop.
+  - An index another process has open is in use, not damaged: the probe child reports the
+    held lock (exit 75) and nothing is moved. A server keeps its index's dirty marker while
+    it runs, so without this a CLI command beside it would have quarantined the live index.
+  - `DM_VECTOR_PROBE=0` turns it off.
+  - A program that embeds dm-lite (not `dmem`) skips the probe unless `DM_VECTOR_PROBE_EXE`
+    names a `dmem` to run it with.
+- **A background vector rebuild finishes its record before the server stops.** A rebuild
+  rewrites one record's vectors at a time (delete, then insert). A stop now waits, within its
+  deadline, for a running rebuild to reach the next record before it flushes the index, so no
+  record is saved with no vector. A heal that brings back a fresh index runs the full rebuild
+  on the retry thread instead of a second, narrower one alongside it.
+- **The probe child inherits no index lock.** zvec opens its files without close-on-exec, so
+  any child would hold the descriptors of every open index. The probe marks them all
+  close-on-exec before it runs.
+- **Syncing an index after a flush skips its `LOCK` files**, which hold no data.
+
 ## 0.4.1 - 2026-10-27
 
 A fix release after the 27-10-2026 power-off, which left a tenant's vector index torn and

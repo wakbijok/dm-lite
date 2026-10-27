@@ -490,6 +490,13 @@ fn parse_require_flag(v: Option<&str>) -> bool {
     }
 }
 
+/// The one lock every test that changes the process environment holds (DM_DATA_DIR, the
+/// tokens, DM_RECALL_FLOOR, ...). Tests of every module run in one process at the same time: with
+/// a lock per module, a tools test switched DM_DATA_DIR under a running server test, which then
+/// read another test's (empty) store.
+#[cfg(test)]
+pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;

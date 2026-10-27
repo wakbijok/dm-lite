@@ -292,6 +292,18 @@ enum Reopened {
     Healed { old: Option<TenantHandle>, index: Arc<crate::zvec_index::ZvecIndex>, since_ms: i64 },
 }
 
+/// Tenants whose vector backfill is running on a background thread (`AppState::start_backfill`).
+/// `close_tenants` waits for it to empty before it flushes: a backfill rewrites one record's
+/// vectors at a time (delete, then insert), and a flush between the two would persist the record
+/// with no vector.
+#[cfg(feature = "zvec")]
+static BACKFILLS: std::sync::OnceLock<Mutex<std::collections::HashSet<String>>> = std::sync::OnceLock::new();
+
+#[cfg(feature = "zvec")]
+fn backfills() -> &'static Mutex<std::collections::HashSet<String>> {
+    BACKFILLS.get_or_init(Default::default)
+}
+
 /// How long the re-embedding after a heal waits for requests still on the replaced
 /// keyword-only handle (their saves have no vector either) before it starts anyway.
 #[cfg(feature = "zvec")]
@@ -458,25 +470,31 @@ impl AppState {
     /// complete run, so a stop part-way repeats it on the next start (it is idempotent).
     #[cfg(feature = "zvec")]
     fn start_backfill(&self, tenant: &str, index: Arc<crate::zvec_index::ZvecIndex>) {
-        static RUNNING: std::sync::OnceLock<Mutex<std::collections::HashSet<String>>> = std::sync::OnceLock::new();
         if !LocalMemory::backfill_pending(tenant) {
             return;
         }
-        let running = RUNNING.get_or_init(Default::default);
-        if !running.lock().unwrap_or_else(|p| p.into_inner()).insert(tenant.to_string()) {
+        if !backfills().lock().unwrap_or_else(|p| p.into_inner()).insert(tenant.to_string()) {
             return;
         }
         eprintln!("dmem serve: tenant '{tenant}': its vector index is new but the database has records; rebuilding their vectors in the background");
         let (st, t) = (self.clone(), tenant.to_string());
-        std::thread::spawn(move || {
-            st.reembed_since(&t, None, &index, i64::MIN / 2);
-            if !st.draining.load(Ordering::SeqCst) && !st.closing.load(Ordering::SeqCst) {
-                let _ = index.flush();
-                LocalMemory::finish_backfill(&t);
-                eprintln!("dmem serve: tenant '{t}': vector backfill complete");
-            }
-            running.lock().unwrap_or_else(|p| p.into_inner()).remove(&t);
-        });
+        std::thread::spawn(move || st.run_backfill(&t, None, &index));
+    }
+
+    /// The backfill itself, on the calling thread: every record of `tenant` gets its vectors
+    /// (one per save permit; it stops at the next record once the server drains), then the
+    /// marker goes. The caller has put `tenant` in `BACKFILLS`; this takes it out at the end.
+    /// `start_backfill` runs it on a thread of its own; a heal on the retry thread runs it there.
+    #[cfg(feature = "zvec")]
+    fn run_backfill(&self, tenant: &str, old: Option<TenantHandle>, index: &crate::zvec_index::ZvecIndex) {
+        // `old`: a heal's replaced keyword-only handle, whose in-flight saves are waited for first.
+        self.reembed(tenant, old, index, i64::MIN / 2, "in the database (closed ones have no vector)");
+        if !self.draining.load(Ordering::SeqCst) && !self.closing.load(Ordering::SeqCst) {
+            let _ = index.flush();
+            LocalMemory::finish_backfill(tenant);
+            eprintln!("dmem serve: tenant '{tenant}': vector backfill complete");
+        }
+        backfills().lock().unwrap_or_else(|p| p.into_inner()).remove(tenant);
     }
 
     /// Record whether a tenant has a vector index. One without is put on the retry schedule
@@ -519,7 +537,16 @@ impl AppState {
                 Ok(Reopened::Resolved) => resolved += 1,
                 Ok(Reopened::Healed { old, index, since_ms }) => {
                     resolved += 1;
-                    self.reembed_since(&tenant, old, &index, since_ms);
+                    // A heal that came back with a fresh index (beside records) needs every record
+                    // re-embedded, not only those saved meanwhile: run the full backfill here, on
+                    // this background thread, as the narrower re-embed always ran.
+                    if LocalMemory::backfill_pending(&tenant)
+                        && backfills().lock().unwrap_or_else(|p| p.into_inner()).insert(tenant.clone())
+                    {
+                        self.run_backfill(&tenant, old, &index);
+                    } else {
+                        self.reembed_since(&tenant, old, &index, since_ms);
+                    }
                 }
                 Ok(Reopened::Not) => self.back_off_vector_retry(&tenant),
                 Err(e) => {
@@ -581,7 +608,6 @@ impl AppState {
             .unwrap_or_else(crate::entry::now_ms);
         let old = slot.replace(Arc::new(Mutex::new(Memory::Local(local))));
         self.note_vectors(tenant, true);
-        self.start_backfill(tenant, index.clone());
         eprintln!("dmem serve: tenant '{tenant}' vector index opened on retry; hybrid recall is back");
         Ok(Reopened::Healed { old, index, since_ms })
     }
@@ -596,6 +622,13 @@ impl AppState {
     /// reindex-embeddings`, with the server stopped, re-embeds everything.
     #[cfg(feature = "zvec")]
     fn reembed_since(&self, tenant: &str, old: Option<TenantHandle>, index: &crate::zvec_index::ZvecIndex, since_ms: i64) {
+        self.reembed(tenant, old, index, since_ms, "written without a vector index")
+    }
+
+    /// `reembed_since`, naming in its log what the uris are (a heal's: "written without a vector
+    /// index"; a backfill's: every uri the store holds, closed ones included).
+    #[cfg(feature = "zvec")]
+    fn reembed(&self, tenant: &str, old: Option<TenantHandle>, index: &crate::zvec_index::ZvecIndex, since_ms: i64, what: &str) {
         if let Some(old) = old {
             let end = Instant::now() + HEAL_DRAIN;
             while Arc::strong_count(&old) > 1 && Instant::now() < end && !self.draining.load(Ordering::SeqCst) {
@@ -636,7 +669,7 @@ impl AppState {
         }
         if !uris.is_empty() {
             eprintln!(
-                "dmem serve: tenant '{tenant}': re-embedded {vectors} record(s) of {} uri(s) written without a vector index{}",
+                "dmem serve: tenant '{tenant}': re-embedded {vectors} record(s) of {} uri(s) {what}{}",
                 uris.len(),
                 if failed > 0 { format!(" ({failed} failed)") } else { String::new() }
             );
@@ -666,7 +699,20 @@ impl AppState {
     #[cfg(feature = "zvec")]
     fn open_known_tenants(&self) -> usize {
         let mut opened = 0;
-        for tenant in self.known_tenants() {
+        let tenants = self.known_tenants();
+        // An unclean stop leaves every open index dirty: probe them all first, a few at a time,
+        // so readiness waits for the slowest wave, not for the sum of every probe.
+        let dirs: Vec<std::path::PathBuf> =
+            tenants.iter().filter(|t| tenant_db_exists(t)).filter_map(|t| crate::config::vector_dir(t).ok()).collect();
+        let started = Instant::now();
+        let probed = crate::zvec_index::probe_many(&dirs);
+        if probed > 0 {
+            eprintln!(
+                "dmem serve: probed {probed} vector index(es) left open by an unclean stop in {:.1} s",
+                started.elapsed().as_secs_f64()
+            );
+        }
+        for tenant in tenants {
             if self.draining.load(Ordering::SeqCst) {
                 break;
             }
@@ -728,6 +774,12 @@ impl AppState {
     fn close_tenants(&self, deadline: Instant) -> CloseReport {
         use std::sync::TryLockError;
         self.closing.store(true, Ordering::SeqCst);
+        // Backfills stop at their next record once `closing` is set: let them, so no record is
+        // flushed half rewritten (see `BACKFILLS`). Bounded by the stop's deadline.
+        #[cfg(feature = "zvec")]
+        while !backfills().lock().unwrap_or_else(|p| p.into_inner()).is_empty() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
         let mut report = CloseReport::default();
         let slots: Vec<(String, TenantSlot)> = {
             let cache = self.mem.lock().unwrap_or_else(|p| p.into_inner());
@@ -2499,7 +2551,8 @@ mod tests {
     // These tests mutate process-global env (DM_DATA_DIR, DM_TOKEN_*). Cargo runs tests in a
     // binary multithreaded, so they must serialize on this lock; any future env-reading test
     // in this binary must take it too (through `env_lock`).
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // The crate-wide test env lock (see `config::TEST_ENV_LOCK`), not one of this module's own.
+    use crate::config::TEST_ENV_LOCK as ENV_LOCK;
 
     /// POST a JSON body as `tok` with extra headers; (status, parsed body or Null).
     async fn post_as(
@@ -3918,6 +3971,7 @@ mod tests {
     // restart. Now the open quarantines it, the tenant serves at once, and the records get their
     // vectors back on a background thread.
     #[cfg(feature = "zvec")]
+    #[allow(clippy::await_holding_lock)] // ENV_LOCK must span the awaits, as above
     #[tokio::test]
     async fn a_server_opens_a_tenant_whose_index_is_torn_and_backfills_it_in_the_background() {
         let _g = env_lock();

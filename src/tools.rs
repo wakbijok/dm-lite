@@ -767,6 +767,37 @@ fn open_vector_index(
             }
         }
     }
+    // The last run did not close this index cleanly (a crash, a kill, a power-off): it may be
+    // torn in a way the file sizes do not show, so open it in a child process first, where a
+    // native crash costs the child only. Indexes closed cleanly are not probed.
+    if vdir.exists() && crate::zvec_index::dirty_marker(vdir).exists() {
+        match crate::zvec_index::probe(vdir) {
+            crate::zvec_index::Probe::Opened | crate::zvec_index::Probe::Skipped(_) => {}
+            // Another process has it open (a server beside this CLI run): in use, not damaged.
+            // The open below then fails on the lock and falls back as it always has.
+            crate::zvec_index::Probe::InUse => {}
+            crate::zvec_index::Probe::Failed(why) => {
+                crate::metrics::zvec_failure(crate::metrics::ZvecOp::Open);
+                match crate::zvec_index::quarantine(vdir) {
+                    Ok(to) => {
+                        let _ = std::fs::remove_file(crate::zvec_index::dirty_marker(vdir));
+                        eprintln!(
+                            "dmem: vector index {} failed its open probe after an unclean stop ({why}); moved it to {} and starting a fresh index, rebuilt from the database",
+                            vdir.display(),
+                            to.display()
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!("dmem: vector index {} failed its open probe ({why}) and could not be moved aside ({e:#}); it is not opened", vdir.display());
+                        if require_vectors {
+                            return Err(VectorIndexRequired(format!("vector index failed its open probe ({why})")).into());
+                        }
+                        return Ok(None);
+                    }
+                }
+            }
+        }
+    }
     let fresh = !vdir.exists();
     let vindex = match crate::zvec_index::ZvecIndex::open(vdir) {
         Ok(v) => v,
@@ -3908,13 +3939,13 @@ mod tests {
 
     // Serializes the few tests that mutate DM_RECALL_FLOOR (the other recall-calling tests assert
     // "contains X", which holds floor-on-or-off, so they don't need the lock).
-    static RECALL_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    use crate::config::TEST_ENV_LOCK as RECALL_ENV_LOCK;
 
     #[test]
     fn floor_disabled_matches_prefloor_recall() {
         // The kill-switch guarantee: DM_RECALL_FLOOR=0 reproduces pre-floor recall exactly (the
         // disabled keyword path is plain store.recall). This is what rollback depends on.
-        let _g = RECALL_ENV_LOCK.lock().unwrap();
+        let _g = RECALL_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         std::env::set_var("DM_RECALL_FLOOR", "0");
         let m = LocalMemory::for_test(tmp_store());
         m.remember("alpha bravo charlie delta", "resources/notes", None, None, None).unwrap();
@@ -4097,9 +4128,8 @@ mod tests {
 mod floor_eval {
     use super::*;
     use std::collections::{HashMap, HashSet};
-    use std::sync::Mutex;
 
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    use crate::config::TEST_ENV_LOCK as ENV_LOCK;
 
     // (label, text). Clusters share vocabulary; VO* are vector-only paraphrases of the VQ query
     // with NO shared content word; H* are hard-negatives (share a keyword with a query, off-topic);
@@ -4188,7 +4218,7 @@ mod floor_eval {
 
     #[test]
     fn floor_eval_calibrate() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let dir = std::env::temp_dir().join(format!("dmeval-{}-{}", std::process::id(), now_ms()));
         let _ = std::fs::remove_dir_all(&dir);
         std::env::set_var("DM_DATA_DIR", &dir);

@@ -1,6 +1,6 @@
 [package]
 name = "dm-lite"
-version = "0.4.1"
+version = "0.4.2"
 edition = "2021"
 authors = ["Muhammad Arif (wakbijok)"]
 description = "Memory for Hermes, Codex, Claude Code, OpenCode, Devin, and any MCP agent. daimon-memory v2: one-binary typed memory engine with hybrid recall"

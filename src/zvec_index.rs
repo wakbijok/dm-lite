@@ -105,6 +105,185 @@ pub fn torn_reason(dir: &Path) -> Option<String> {
     }
 }
 
+/// The marker of an index that is open, or was when its process last stopped: written when
+/// `ZvecIndex::open` opens it, removed when the handle closes cleanly (flushed and synced). A
+/// marker found at open means the last run did not close it, so the index may be torn in a way
+/// `torn_reason` cannot see, and `probe` opens it in a child process first.
+pub fn dirty_marker(dir: &Path) -> std::path::PathBuf {
+    let name = dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    dir.with_file_name(format!("{name}.dirty"))
+}
+
+/// What `probe` found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Probe {
+    /// The index opened in the child: safe to open here.
+    Opened,
+    /// The child could not open it: why (a signal, a failed open, or the timeout).
+    Failed(String),
+    /// No probe was run (no `dmem` binary to run it with, or `DM_VECTOR_PROBE=0`).
+    Skipped(&'static str),
+    /// Another process has the index open (its lock is held): it is in use, not damaged. A
+    /// running server keeps its index's dirty marker, so a CLI run beside it lands here.
+    InUse,
+}
+
+/// The probe child's exit status when the index is locked by another process (EX_TEMPFAIL).
+pub const PROBE_IN_USE: i32 = 75;
+
+/// The hidden `dmem` subcommand a probe runs.
+pub const PROBE_SUBCOMMAND: &str = "__probe_vector_index";
+
+/// Open the index under `dir` in a child process (`dmem __probe_vector_index <dir>`), so a
+/// native crash in zvec's open (a torn manifest that is not empty, or any other damage) kills
+/// the child instead of this process. Bounded: `DM_VECTOR_PROBE_TIMEOUT_SECS` (default 60), and
+/// a child still running then is killed and counted as a failure. The program is this process's
+/// own binary when it is `dmem` (an embedding product's binary does not have the subcommand),
+/// or `DM_VECTOR_PROBE_EXE`; `DM_VECTOR_PROBE=0` turns probing off. A verdict `probe_many`
+/// already reached for `dir` in this process is used instead of probing again.
+pub fn probe(dir: &Path) -> Probe {
+    if let Some(v) = take_verdict(dir) {
+        return v;
+    }
+    if std::env::var("DM_VECTOR_PROBE").is_ok_and(|v| ["0", "off", "false", "no"].contains(&v.trim().to_ascii_lowercase().as_str())) {
+        return Probe::Skipped("DM_VECTOR_PROBE is off");
+    }
+    let exe = match std::env::var_os("DM_VECTOR_PROBE_EXE").map(std::path::PathBuf::from) {
+        Some(p) => p,
+        None => match std::env::current_exe() {
+            Ok(p) if p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("dmem")) => p,
+            _ => return Probe::Skipped("no dmem binary to probe with"),
+        },
+    };
+    probe_with(dir, &exe, probe_timeout())
+}
+
+/// How long one probe may take: `DM_VECTOR_PROBE_TIMEOUT_SECS`, default 20. A whole index
+/// normally opens in well under a second, so a child still running at the limit is stuck.
+fn probe_timeout() -> std::time::Duration {
+    let secs = std::env::var("DM_VECTOR_PROBE_TIMEOUT_SECS").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(20);
+    std::time::Duration::from_secs(secs.max(1))
+}
+
+/// How many probes `probe_many` runs at once: `DM_VECTOR_PROBE_CONCURRENCY`, default 4.
+fn probe_concurrency() -> usize {
+    std::env::var("DM_VECTOR_PROBE_CONCURRENCY").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(4).max(1)
+}
+
+/// Verdicts `probe_many` reached, waiting for the open of their index (`probe` takes them).
+static VERDICTS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, Probe>>> = std::sync::OnceLock::new();
+
+fn take_verdict(dir: &Path) -> Option<Probe> {
+    VERDICTS.get()?.lock().unwrap_or_else(|p| p.into_inner()).remove(dir)
+}
+
+/// Probe every index in `dirs` that has a dirty marker, up to `DM_VECTOR_PROBE_CONCURRENCY` at a
+/// time, and keep each verdict for that index's open. `dmem serve` runs it before opening its
+/// tenants: after a power-off every index is dirty, and probing them one after another (each
+/// bounded by `DM_VECTOR_PROBE_TIMEOUT_SECS`) could hold readiness for minutes. Bounded: about
+/// ceil(dirty / concurrency) x timeout in the worst case. A clean start probes nothing.
+/// Returns how many indexes were probed.
+pub fn probe_many(dirs: &[std::path::PathBuf]) -> usize {
+    let dirty: Vec<&std::path::PathBuf> = dirs.iter().filter(|d| d.exists() && dirty_marker(d).exists()).collect();
+    if dirty.is_empty() {
+        return 0;
+    }
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let verdicts = VERDICTS.get_or_init(Default::default);
+    std::thread::scope(|scope| {
+        for _ in 0..probe_concurrency().min(dirty.len()) {
+            scope.spawn(|| loop {
+                let i = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let Some(dir) = dirty.get(i) else { break };
+                let v = probe(dir);
+                verdicts.lock().unwrap_or_else(|p| p.into_inner()).insert((*dir).clone(), v);
+            });
+        }
+    });
+    dirty.len()
+}
+
+/// `probe` with the program and the timeout given (the env lookups done by the caller).
+pub fn probe_with(dir: &Path, exe: &Path, timeout: std::time::Duration) -> Probe {
+    use std::os::unix::process::CommandExt;
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg(PROBE_SUBCOMMAND)
+        .arg(dir)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    // zvec opens its files without close-on-exec, so a child would inherit the descriptors of
+    // every index this process has open, LOCK files included: an index closed here while the
+    // child lives would stay locked. Mark every inherited descriptor close-on-exec (not closed:
+    // std's own exec-error pipe must stay usable until the exec).
+    // SAFETY: runs in the forked child before exec and makes only async-signal-safe calls
+    // (close_range, fcntl).
+    unsafe {
+        cmd.pre_exec(|| {
+            const CLOSE_RANGE_CLOEXEC: libc::c_uint = 4;
+            if libc::syscall(libc::SYS_close_range, 3 as libc::c_uint, libc::c_uint::MAX, CLOSE_RANGE_CLOEXEC) != 0 {
+                for fd in 3..4096 {
+                    let flags = libc::fcntl(fd, libc::F_GETFD);
+                    if flags >= 0 {
+                        libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+                    }
+                }
+            }
+            Ok(())
+        });
+    }
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => return Probe::Failed(format!("the probe could not start ({e})")),
+    };
+    let end = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => return Probe::Opened,
+            Ok(Some(status)) if status.code() == Some(PROBE_IN_USE) => return Probe::InUse,
+            Ok(Some(status)) => {
+                use std::os::unix::process::ExitStatusExt;
+                return Probe::Failed(match status.signal() {
+                    Some(sig) => format!("opening it killed the probe with signal {sig}"),
+                    None => format!("the probe could not open it (exit {})", status.code().unwrap_or(-1)),
+                });
+            }
+            Ok(None) if std::time::Instant::now() >= end => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Probe::Failed(format!("opening it did not finish within {} s", timeout.as_secs()));
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(20)),
+            Err(e) => return Probe::Failed(format!("the probe could not be watched ({e})")),
+        }
+    }
+}
+
+/// The probe's child side (`dmem __probe_vector_index <dir>`): open the index and exit 0. A
+/// crash here is what the parent is looking for. No marker is written or removed.
+/// The probe's child side (`dmem __probe_vector_index <dir>`): open the index and exit 0. A
+/// crash here is what the parent is looking for. An index another process holds open exits with
+/// `PROBE_IN_USE`, so the parent never mistakes "in use" for "damaged". No marker is written or
+/// removed.
+pub fn probe_child(dir: &Path) -> Result<()> {
+    INIT.call_once(|| {
+        let _ = initialize(None);
+    });
+    match Collection::open(&dir.to_string_lossy(), None).map_err(ze) {
+        Ok(collection) => {
+            drop(collection);
+            Ok(())
+        }
+        Err(e) if is_lock_error(&e) => std::process::exit(PROBE_IN_USE),
+        Err(e) => Err(e),
+    }
+}
+
+/// zvec's refusal to open a collection another process has locked.
+fn is_lock_error(e: &anyhow::Error) -> bool {
+    format!("{e:#}").contains("Can't lock")
+}
+
 /// Move a torn index aside, next to where it was: `<name>.corrupt-<UTC time>` (with a counter
 /// when that name is taken), so nothing is lost and a fresh index can take its place. A rename
 /// on the same filesystem, so it is atomic. Returns where it went.
@@ -153,12 +332,32 @@ pub struct ZvecIndex {
     dir: Option<std::path::PathBuf>,
 }
 
-/// fsync every file under `dir`, then each directory (so new names are durable too).
+impl Drop for ZvecIndex {
+    /// A clean close: flush and sync, then drop the dirty marker. Skipped while panicking, and
+    /// the marker stays when the flush fails, so the next open probes the index.
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            return;
+        }
+        if self.flush().is_ok() {
+            if let Some(dir) = &self.dir {
+                let _ = std::fs::remove_file(dirty_marker(dir));
+            }
+        }
+    }
+}
+
+/// fsync every file under `dir`, then each directory (so new names are durable too). LOCK
+/// files are skipped: they hold no data, and they carry the open index's locks, which a POSIX
+/// record lock loses when ANY descriptor of the file closes, so opening one here could release
+/// the index's own lock while it is still open.
 fn sync_tree(dir: &Path) -> std::io::Result<()> {
     for entry in std::fs::read_dir(dir)? {
         let path = entry?.path();
         if path.is_dir() {
             sync_tree(&path)?;
+        } else if path.file_name().is_some_and(|n| n == "LOCK") {
+            continue;
         } else if let Ok(f) = std::fs::File::open(&path) {
             f.sync_all()?;
         }
@@ -192,6 +391,11 @@ impl ZvecIndex {
                 .map_err(ze)?;
             Collection::create_and_open(&path, &schema, None).map_err(ze)?
         };
+        // Open now: until a clean close removes it, the marker says the index may be dirty.
+        let marker = dirty_marker(dir);
+        if let Err(e) = std::fs::write(&marker, "this vector index is open, or its process stopped without closing it\n") {
+            eprintln!("dmem: could not write {} ({e}); an unclean stop is not detected for this index", marker.display());
+        }
         Ok(Self { collection, dir: Some(dir.to_path_buf()) })
     }
 
@@ -419,6 +623,36 @@ mod tests {
             "aligned vector must outscore the orthogonal one, got {:?}",
             hits
         );
+    }
+
+    #[test]
+    fn a_flush_keeps_the_open_index_locked() {
+        let dir = std::env::temp_dir().join(format!("zvecflushlock-{}-{}", std::process::id(), crate::entry::now_ms()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let idx = ZvecIndex::open(&dir).expect("open(create)");
+        assert!(ZvecIndex::open(&dir).is_err(), "a second open is refused while the first is open");
+        idx.flush().expect("flush");
+        assert!(ZvecIndex::open(&dir).is_err(), "still refused after a flush: syncing must not release the lock");
+        drop(idx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_flushed_and_closed_index_reopens() {
+        // flush() syncs the index's files; it must leave the index's locks alone, or the
+        // closed collection keeps its lock and the next open in this process is refused.
+        let dir = std::env::temp_dir().join(format!("zvecflushreopen-{}-{}", std::process::id(), crate::entry::now_ms()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut a = vec![0f32; DIM];
+        a[7] = 1.0;
+        {
+            let idx = ZvecIndex::open(&dir).expect("open(create)");
+            idx.upsert_chunks("uri-f", "", std::slice::from_ref(&a)).expect("upsert");
+            idx.flush().expect("flush");
+        }
+        let idx2 = ZvecIndex::open(&dir).expect("reopen after flush + close");
+        assert!(pairs(idx2.search(&a, 5).unwrap()).iter().any(|(u, _)| u == "uri-f"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

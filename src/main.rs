@@ -288,6 +288,10 @@ enum Cmd {
     Skills(SkillsCmd),
     /// Show store + wiring status.
     Status,
+    /// Internal: open a vector index and exit (the open probe's child; see zvec_index::probe).
+    #[cfg(feature = "zvec")]
+    #[command(name = "__probe_vector_index", hide = true)]
+    ProbeVectorIndex { dir: std::path::PathBuf },
     /// Diagnose readiness, especially for offline / air-gapped deploys: active embedder + model,
     /// HuggingFace cache dir and whether the model is already cached, CPU features, and env.
     Doctor {
@@ -790,6 +794,8 @@ fn run() -> Result<()> {
             SkillsCmd::List => skills::list(),
         },
         Cmd::Status => status(),
+        #[cfg(feature = "zvec")]
+        Cmd::ProbeVectorIndex { dir } => dm_lite::zvec_index::probe_child(&dir),
         Cmd::Doctor { json } => doctor(json),
         Cmd::Mcp => mcp::serve(),
         #[cfg(feature = "ui")]
