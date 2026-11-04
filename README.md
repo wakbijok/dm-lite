@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/dm-lite-banner.png" alt="dm-lite, the daimon-memory successor" width="840">
+  <img src="assets/dm-lite-overview-banner.png" alt="dm-lite: shared memory and structured knowledge for AI workflows: project context, decisions and lessons, entities and relationships, and cross-tool continuity" width="840">
 </p>
 
 # dm-lite

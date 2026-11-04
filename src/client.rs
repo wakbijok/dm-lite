@@ -268,6 +268,20 @@ impl RemoteClient {
         Ok(())
     }
 
+    /// Erase at rest every record of one scope in a tenant: (versions, records) erased.
+    pub fn admin_purge_scope(&self, tenant: &str, scope: &str) -> Result<(usize, usize)> {
+        let v = self.post("/admin/purge_scope", json!({ "tenant": tenant, "scope": scope }))?;
+        let n = |k: &str| v.get(k).and_then(|n| n.as_u64()).unwrap_or(0) as usize;
+        Ok((n("purged"), n("records")))
+    }
+
+    /// Erase a suspended tenant at rest. True when this call erased it, false when it was
+    /// erased before.
+    pub fn admin_purge_tenant(&self, tenant: &str) -> Result<bool> {
+        let v = self.post("/admin/purge_tenant", json!({ "target": tenant }))?;
+        Ok(v.get("purged").and_then(|x| x.as_bool()).unwrap_or(false))
+    }
+
     /// A save: the stored uri. With `--scope`, the server's echo of the scope it stamped must
     /// match, or the save is reported as an error saying where it went (never as done).
     fn uri_of(&self, path: &str, body: Value) -> Result<String> {
@@ -310,6 +324,12 @@ impl RemoteClient {
     pub fn forget(&self, uri: &str) -> Result<usize> {
         let v = self.post_write("/forget", json!({ "uri": uri }))?;
         Ok(v.get("forgotten").and_then(|n| n.as_u64()).unwrap_or(0) as usize)
+    }
+    /// Erase at rest every record under the namespace prefixes: (versions, records) erased.
+    pub fn purge(&self, prefixes: &[String]) -> Result<(usize, usize)> {
+        let v = self.post_write("/purge", json!({ "namespaces": prefixes }))?;
+        let n = |k: &str| v.get(k).and_then(|n| n.as_u64()).unwrap_or(0) as usize;
+        Ok((n("purged"), n("records")))
     }
     pub fn persona(&self) -> Result<Vec<Entry>> {
         self.list("/persona", json!({}))

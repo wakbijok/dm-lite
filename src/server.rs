@@ -497,6 +497,68 @@ impl AppState {
         backfills().lock().unwrap_or_else(|p| p.into_inner()).remove(tenant);
     }
 
+    /// Erase a suspended tenant at rest (`/admin/purge_tenant`): close it here, delete its
+    /// database and vector index with every file beside them (`erase_tenant_files`), delete its
+    /// tokens and mark it `purged` (`Iam::mark_purged`). Only a tenant `/admin/rm` suspended:
+    /// an active one is refused, and one already purged is swept again (a retry finds nothing).
+    /// Blocking: call it on the blocking pool.
+    fn purge_tenant(&self, target: &str) -> Result<PurgeTenant> {
+        let t = crate::config::canonical_tenant(target);
+        let iam = crate::iam::Iam::open()?;
+        let already = match iam.tenant_status(&t)?.as_deref() {
+            None => return Ok(PurgeTenant::Unknown),
+            Some("active") => return Ok(PurgeTenant::Active),
+            Some("purged") => true,
+            Some(_) => false,
+        };
+        #[cfg(feature = "zvec")]
+        if backfills().lock().unwrap_or_else(|p| p.into_inner()).contains(&t) {
+            return Ok(PurgeTenant::Busy("its vector backfill is still running"));
+        }
+        // Close the tenant: its cached handle goes, unless a request still holds a copy.
+        let slot = self.mem.lock().unwrap_or_else(|p| p.into_inner()).get(&t).cloned();
+        if let Some(slot) = slot {
+            let mut slot = slot.lock().unwrap_or_else(|p| p.into_inner());
+            if slot.as_ref().is_some_and(|h| Arc::strong_count(h) > 1) {
+                return Ok(PurgeTenant::Busy("a request still has it open"));
+            }
+            drop(slot.take());
+        }
+        self.mem.lock().unwrap_or_else(|p| p.into_inner()).remove(&t);
+        self.vectors.lock().unwrap_or_else(|p| p.into_inner()).remove(&t);
+        self.vector_retry.lock().unwrap_or_else(|p| p.into_inner()).remove(&t);
+        erase_tenant_files(&t)?;
+        iam.mark_purged(&t)?;
+        Ok(if already { PurgeTenant::Already } else { PurgeTenant::Purged })
+    }
+
+    /// Erase at rest one scope's records in `tenant` (`/admin/purge_scope`,
+    /// `LocalMemory::purge_scope`). A tenant IAM does not know, or one already purged, is
+    /// unknown; one with no database yet has nothing to erase. Blocking: call it on the
+    /// blocking pool.
+    fn purge_scope(&self, tenant: &str, scope: &str) -> Result<Option<crate::sqlite::Purged>> {
+        let t = crate::config::canonical_tenant(tenant);
+        match crate::iam::Iam::open()?.tenant_status(&t)?.as_deref() {
+            None | Some("purged") => return Ok(None),
+            Some(_) => {}
+        }
+        if !tenant_db_exists(&t) {
+            return Ok(Some(crate::sqlite::Purged::default()));
+        }
+        #[cfg(feature = "zvec")]
+        if backfills().lock().unwrap_or_else(|p| p.into_inner()).contains(&t) {
+            return Err(ShuttingDown.into());
+        }
+        let handle = self.memory_for(&t)?;
+        let mem = handle.lock().unwrap_or_else(|p| p.into_inner());
+        #[allow(irrefutable_let_patterns)]
+        let Memory::Local(local) = &*mem
+        else {
+            anyhow::bail!("tenant {t} is not held locally");
+        };
+        Ok(Some(local.purge_scope(scope)?))
+    }
+
     /// Record whether a tenant has a vector index. One without is put on the retry schedule
     /// (a vector build only: a keyword-only build has nothing to retry).
     fn note_vectors(&self, tenant: &str, ok: bool) {
@@ -1039,6 +1101,49 @@ fn bad_request(e: anyhow::Error) -> ApiResp {
 /// An engine guard's refusal (`tools::Refusal`): 400 carrying its message, on every route. The
 /// message names the rule that refused and nothing internal, so the caller can act on it; any
 /// other failure keeps the route's generic body.
+/// What `/admin/purge_tenant` found and did.
+enum PurgeTenant {
+    Purged,
+    /// Purged before: its files were swept again.
+    Already,
+    /// Still active: `/admin/rm` comes first.
+    Active,
+    Unknown,
+    /// Could not be closed now; the caller retries.
+    Busy(&'static str),
+}
+
+/// Delete every file of tenant `t` under the data directory: in `tenants/` and `vectors/`,
+/// the entries named `t` or starting `t.` (the database with its -wal and -shm, the vector
+/// index, its markers, and any index a torn open or a rebuild set aside, which are copies of
+/// the data too). A tenant name has no `.`, so `t.` never starts another tenant's name.
+fn erase_tenant_files(t: &str) -> Result<()> {
+    let data = crate::config::data_dir()?;
+    for dir in [data.join("tenants"), data.join("vectors")] {
+        let rd = match std::fs::read_dir(&dir) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e.into()),
+        };
+        for ent in rd {
+            let ent = ent?;
+            let name = ent.file_name().to_string_lossy().into_owned();
+            if name != t && !name.starts_with(&format!("{t}.")) {
+                continue;
+            }
+            let path = ent.path();
+            if ent.file_type()?.is_dir() {
+                std::fs::remove_dir_all(&path)
+            } else {
+                std::fs::remove_file(&path)
+            }
+            .map_err(|e| anyhow::anyhow!("remove {}: {e}", path.display()))?;
+        }
+        std::fs::File::open(&dir)?.sync_all()?;
+    }
+    Ok(())
+}
+
 fn refusal(e: &anyhow::Error) -> Option<ApiResp> {
     let r = e.downcast_ref::<crate::tools::Refusal>()?;
     eprintln!("dmem serve: refused: {r}");
@@ -1569,6 +1674,15 @@ async fn capabilities_h(State(st): State<AppState>, headers: HeaderMap) -> ApiRe
                 "version": env!("CARGO_PKG_VERSION"),
                 "write_scope": true,
                 "write_scope_header": id.scope_unbound() || id.adapter,
+                // `POST /purge` and `/admin/purge_tenant` erase at rest (0.4.4).
+                "purge": true,
+                // Whether `/purge` accepts this token (full tenant, no agent identity), and the
+                // agent it carries, so a caller can tell at start rather than on its first purge.
+                "purge_allowed": id.scope_unbound() && id.agent.is_none(),
+                "agent": id.agent,
+                // `/admin/purge_scope` (0.4.4), and the tenant this token belongs to, which it names.
+                "purge_scope": true,
+                "tenant": id.tenant,
             })),
         ),
         _ => err(StatusCode::UNAUTHORIZED, "invalid or missing bearer token"),
@@ -1963,6 +2077,94 @@ async fn admin_rm_h(State(st): State<AppState>, headers: HeaderMap, Json(req): J
     })
 }
 
+#[derive(Deserialize)]
+struct PurgeReq {
+    namespaces: Vec<String>,
+}
+
+/// `POST /purge`: erase at rest, in the caller's tenant, every record under the namespace
+/// prefixes (`LocalMemory::purge`). A full-tenant token with no agent identity only: erasure is
+/// never by scope, and an agent's view hides other agents' records it would erase.
+async fn purge_h(State(st): State<AppState>, headers: HeaderMap, Json(req): Json<PurgeReq>) -> ApiResp {
+    let id = resolve_identity(&st, &headers);
+    if let Some(id) = &id {
+        if id.tenant.is_some() && (!id.scope_unbound() || id.agent.is_some()) {
+            return err(StatusCode::FORBIDDEN, "a purge needs a full-tenant token without an agent identity");
+        }
+    }
+    if req.namespaces.is_empty() {
+        return err(StatusCode::BAD_REQUEST, "namespaces: name at least one prefix");
+    }
+    for p in &req.namespaces {
+        if let Err(e) = crate::sqlite::purge_prefix(p) {
+            return err(StatusCode::BAD_REQUEST, &e.to_string());
+        }
+    }
+    #[cfg(feature = "zvec")]
+    if let Some(t) = id.as_ref().and_then(|i| i.tenant.as_deref()) {
+        if backfills().lock().unwrap_or_else(|p| p.into_inner()).contains(&crate::config::canonical_tenant(t)) {
+            return err(StatusCode::SERVICE_UNAVAILABLE, "this tenant's vector backfill is still running; try again later");
+        }
+    }
+    with_tenant(&st, &headers, false, move |m, _agent| {
+        let p = m.purge(&req.namespaces)?;
+        Ok(json!({ "purged": p.versions, "records": p.uris.len() }))
+    })
+    .await
+}
+
+/// `POST /admin/purge_tenant`: erase a tenant `/admin/rm` suspended (`AppState::purge_tenant`).
+/// 409 while it is active, 404 when unknown, 503 when it cannot be closed now.
+async fn admin_purge_tenant_h(State(st): State<AppState>, headers: HeaderMap, Json(req): Json<AdminTargetReq>) -> ApiResp {
+    match resolve_identity(&st, &headers) {
+        Some(id) if id.is_admin => {}
+        Some(_) => return err(StatusCode::FORBIDDEN, "admin token required"),
+        None => return err(StatusCode::UNAUTHORIZED, "invalid or missing bearer token"),
+    }
+    let target = req.target.clone();
+    let done = tokio::task::spawn_blocking(move || st.purge_tenant(&target)).await;
+    match done {
+        Ok(Ok(PurgeTenant::Purged)) => (StatusCode::OK, Json(json!({ "purged": true, "tenant": req.target }))),
+        Ok(Ok(PurgeTenant::Already)) => (StatusCode::OK, Json(json!({ "purged": false, "tenant": req.target }))),
+        Ok(Ok(PurgeTenant::Active)) => err(StatusCode::CONFLICT, "the tenant is active: suspend it with /admin/rm first"),
+        Ok(Ok(PurgeTenant::Unknown)) => err(StatusCode::NOT_FOUND, "no such tenant"),
+        Ok(Ok(PurgeTenant::Busy(why))) => err(StatusCode::SERVICE_UNAVAILABLE, &format!("the tenant cannot be closed now ({why}); try again")),
+        Ok(Err(e)) => internal(e),
+        Err(e) => internal(anyhow::anyhow!("purge_tenant task: {e}")),
+    }
+}
+
+#[derive(Deserialize)]
+struct PurgeScopeReq {
+    tenant: String,
+    scope: String,
+}
+
+/// `POST /admin/purge_scope`: erase at rest, in one tenant, every record of exactly one scope
+/// (`AppState::purge_scope`). Admin only: an adapter may retract within the scopes it asserts,
+/// but erasing is not undone. The global scope is refused (400); 404 for an unknown tenant;
+/// 503 while the tenant's vector backfill runs or the server is stopping.
+async fn admin_purge_scope_h(State(st): State<AppState>, headers: HeaderMap, Json(req): Json<PurgeScopeReq>) -> ApiResp {
+    match resolve_identity(&st, &headers) {
+        Some(id) if id.is_admin => {}
+        Some(_) => return err(StatusCode::FORBIDDEN, "admin token required"),
+        None => return err(StatusCode::UNAUTHORIZED, "invalid or missing bearer token"),
+    }
+    if req.scope.is_empty() {
+        return err(StatusCode::BAD_REQUEST, "scope: the global scope cannot be purged by scope");
+    }
+    let done = tokio::task::spawn_blocking(move || st.purge_scope(&req.tenant, &req.scope)).await;
+    match done {
+        Ok(Ok(Some(p))) => (StatusCode::OK, Json(json!({ "purged": p.versions, "records": p.uris.len() }))),
+        Ok(Ok(None)) => err(StatusCode::NOT_FOUND, "no such tenant"),
+        Ok(Err(e)) if e.downcast_ref::<ShuttingDown>().is_some() => {
+            err(StatusCode::SERVICE_UNAVAILABLE, "the tenant is busy (a vector backfill, or the server is stopping); try again")
+        }
+        Ok(Err(e)) => internal(e),
+        Err(e) => internal(anyhow::anyhow!("purge_scope task: {e}")),
+    }
+}
+
 /// Assemble the router. `/healthz` is open; every other route requires a valid bearer token. `iam`
 /// is the startup-opened IAM handle (None if it could not be opened), shared for token resolution;
 /// the per-tenant memory cache starts empty and fills on first use. `/mcp` is POST-only: a GET
@@ -2107,6 +2309,7 @@ fn router_with_state(state: AppState) -> Router {
         .route("/latest_save", post(latest_save_h))
         .route("/history", post(history_h))
         .route("/forget", post(forget_h))
+        .route("/purge", post(purge_h))
         .route("/remember", post(remember_h))
         .route("/invalidate", post(invalidate_h))
         .route("/link", post(link_h))
@@ -2130,6 +2333,8 @@ fn router_with_state(state: AppState) -> Router {
         .route("/admin/tenant_policy", post(admin_policy_h))
         .route("/admin/revoke", post(admin_revoke_h))
         .route("/admin/rm", post(admin_rm_h))
+        .route("/admin/purge_tenant", post(admin_purge_tenant_h))
+        .route("/admin/purge_scope", post(admin_purge_scope_h))
         .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY_BYTES))
         .layer(axum::middleware::from_fn_with_state(state.clone(), track_requests))
         .with_state(state)
@@ -5064,6 +5269,176 @@ mod tests {
         }
         assert_eq!(slow.peak.load(Ordering::SeqCst), 1, "the two long saves never embedded at once");
         assert!(crate::metrics::embed_permit_waits(crate::metrics::EmbedPool::Save) >= waits + 2, "each save's permit wait is recorded");
+        std::env::remove_var("DM_DATA_DIR");
+    }
+
+    /// Every file under `dir` whose bytes contain `needle`.
+    fn files_holding(dir: &std::path::Path, needle: &str) -> Vec<String> {
+        let mut hits = Vec::new();
+        let Ok(rd) = std::fs::read_dir(dir) else { return hits };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                hits.extend(files_holding(&p, needle));
+            } else if std::fs::read(&p).is_ok_and(|b| b.windows(needle.len()).any(|w| w == needle.as_bytes())) {
+                hits.push(p.display().to_string());
+            }
+        }
+        hits
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn purge_over_http_erases_whole_segments_for_a_full_tenant_token_only() {
+        let _g = env_lock();
+        let (dir, iam, full, adapter) = scope_fixture("purgex");
+        let (_, agent) = iam.create_tenant("purgex", "", "", Some("helper")).unwrap();
+        let scoped = iam.mint_scoped_token("purgex", "room", None, &["room:a".into()], Some("room:a"), false).unwrap();
+        let app = router(Arc::new(BearerAuth::from_env().unwrap()), Some(iam));
+        let save = |ns: &str, title: &str| json!({"kind": "memory", "namespace": ns, "title": title, "body": format!("zq9 {title} body")});
+        let mut uris = Vec::new();
+        for (ns, title) in [("kmeta/o/p/area", "one"), ("kmeta/o/p/area", "two"), ("kmeta/o/p/area2", "sibling")] {
+            let (st, v) = post_as(&app, "/import", &full, save(ns, title), &[]).await;
+            assert_eq!(st, StatusCode::OK, "{v}");
+            uris.push(v["uri"].as_str().unwrap().to_string());
+        }
+        let caps = |tok: String| {
+            let app = app.clone();
+            async move {
+                let req = Request::builder().method("GET").uri("/capabilities").header("authorization", format!("Bearer {tok}")).body(Body::empty()).unwrap();
+                let resp = app.oneshot(req).await.unwrap();
+                let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+                serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+            }
+        };
+        let c = caps(full.clone()).await;
+        assert_eq!((c["purge"].as_bool(), c["purge_allowed"].as_bool(), c["agent"].is_null()), (Some(true), Some(true), true), "{c}");
+        let c = caps(agent.clone()).await;
+        assert_eq!((c["purge_allowed"].as_bool(), c["agent"].as_str()), (Some(false), Some("helper")), "{c}");
+        assert_eq!(caps(scoped.clone()).await["purge_allowed"].as_bool(), Some(false));
+        let body = json!({"namespaces": ["kmeta/o/p/area"]});
+        for (who, tok, hdrs) in [("adapter", &adapter, &[("x-dm-write-scope", "room:a")][..]), ("scoped", &scoped, &[][..]), ("agent", &agent, &[][..])] {
+            let (st, v) = post_as(&app, "/purge", tok, body.clone(), hdrs).await;
+            assert_eq!(st, StatusCode::FORBIDDEN, "{who}: {v}");
+        }
+        for bad in [json!({"namespaces": []}), json!({"namespaces": [""]}), json!({"namespaces": ["/kmeta"]}), json!({"namespaces": ["a/../b"]})] {
+            let (st, v) = post_as(&app, "/purge", &full, bad.clone(), &[]).await;
+            assert_eq!(st, StatusCode::BAD_REQUEST, "{bad}: {v}");
+        }
+        assert!(!files_holding(&dir.join("vectors"), &uris[0]).is_empty(), "control: the record's uri is in its vector index");
+        let (st, v) = post_as(&app, "/purge", &full, body.clone(), &[]).await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert_eq!(v["records"], 2, "{v}");
+        assert!(v["purged"].as_u64().unwrap() >= 2, "{v}");
+        for u in &uris[..2] {
+            let (_, h) = post_as(&app, "/history", &full, json!({"uri": u}), &[]).await;
+            assert_eq!(h.as_array().map(|a| a.len()), Some(0), "no version of {u} is left: {h}");
+            assert_eq!(files_holding(&dir.join("vectors"), u), Vec::<String>::new(), "{u} is in no vector index file");
+            assert_eq!(files_holding(&dir.join("tenants"), u), Vec::<String>::new(), "{u} is in no database file");
+        }
+        let (_, h) = post_as(&app, "/history", &full, json!({"uri": uris[2]}), &[]).await;
+        assert_eq!(h.as_array().map(|a| a.len()), Some(1), "area2 is another segment: {h}");
+        let (st, v) = post_as(&app, "/purge", &full, body, &[]).await;
+        assert_eq!((st, v["purged"].as_u64(), v["records"].as_u64()), (StatusCode::OK, Some(0), Some(0)), "safe to send twice: {v}");
+        let (st, v) = post_as(&app, "/recall", &full, json!({"query": "zq9 sibling body", "limit": 5}), &[]).await;
+        assert!(st == StatusCode::OK && v.as_array().is_some_and(|a| a.iter().any(|h| h["uri"] == uris[2])), "the kept record is still recalled: {v}");
+        std::env::remove_var("DM_DATA_DIR");
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn purge_tenant_erases_a_suspended_tenant_and_nothing_beside_it() {
+        let _g = env_lock();
+        let (dir, iam, full, _adapter) = scope_fixture("ptx");
+        let (_, neighbour) = iam.create_tenant("ptx2", "", "", None).unwrap();
+        let admin = iam.ensure_admin_from(None).unwrap().expect("bootstrap admin");
+        let app = router(Arc::new(BearerAuth::from_env().unwrap()), Some(iam));
+        let rec = json!({"kind": "memory", "namespace": "notes", "title": "zq10 private", "body": "zq10 body"});
+        for tok in [&full, &neighbour] {
+            let (st, v) = post_as(&app, "/import", tok, rec.clone(), &[]).await;
+            assert_eq!(st, StatusCode::OK, "{v}");
+        }
+        // A copy an earlier torn open set aside: it is the tenant's data too.
+        std::fs::create_dir_all(dir.join("vectors").join("ptx.corrupt-20261027T000000Z")).unwrap();
+        let target = |t: &str| json!({"target": t});
+        let (st, _) = post_as(&app, "/admin/purge_tenant", &full, target("ptx"), &[]).await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "a member token is refused");
+        let (st, _) = post_as(&app, "/admin/purge_tenant", &admin, target("nosuch"), &[]).await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+        let (st, v) = post_as(&app, "/admin/purge_tenant", &admin, target("ptx"), &[]).await;
+        assert_eq!(st, StatusCode::CONFLICT, "active: /admin/rm comes first: {v}");
+
+        let (st, _) = post_as(&app, "/admin/rm", &admin, target("ptx"), &[]).await;
+        assert_eq!(st, StatusCode::OK);
+        let (st, v) = post_as(&app, "/admin/purge_tenant", &admin, target("ptx"), &[]).await;
+        assert_eq!((st, v["purged"].as_bool()), (StatusCode::OK, Some(true)), "{v}");
+        let left = |sub: &str, t: &str| -> Vec<String> {
+            std::fs::read_dir(dir.join(sub))
+                .unwrap()
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n == t || n.starts_with(&format!("{t}.")))
+                .collect()
+        };
+        assert_eq!(left("tenants", "ptx"), Vec::<String>::new(), "no database file of the tenant is left");
+        assert_eq!(left("vectors", "ptx"), Vec::<String>::new(), "no vector index, marker or set-aside copy is left");
+        assert!(!left("tenants", "ptx2").is_empty() && !left("vectors", "ptx2").is_empty(), "the neighbour ptx2 is untouched");
+        let (st, v) = post_as(&app, "/recall", &neighbour, json!({"query": "zq10 body", "limit": 5}), &[]).await;
+        assert!(st == StatusCode::OK && v.as_array().is_some_and(|a| !a.is_empty()), "the neighbour still serves: {v}");
+
+        let (st, v) = post_as(&app, "/admin/purge_tenant", &admin, target("ptx"), &[]).await;
+        assert_eq!((st, v["purged"].as_bool()), (StatusCode::OK, Some(false)), "safe to send twice: {v}");
+        let iam = crate::iam::Iam::open_at(&dir.join("iam.db")).unwrap();
+        assert_eq!(iam.tenant_status("ptx").unwrap().as_deref(), Some("purged"));
+        let c = rusqlite::Connection::open(dir.join("iam.db")).unwrap();
+        let toks: i64 = c.query_row("SELECT COUNT(*) FROM tokens WHERE tenant='ptx'", [], |r| r.get(0)).unwrap();
+        assert_eq!(toks, 0, "the tenant's tokens are deleted, not just revoked");
+        let (st, _) = post_as(&app, "/recall", &full, json!({"query": "zq10", "limit": 5}), &[]).await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED, "its old token is gone");
+        std::env::remove_var("DM_DATA_DIR");
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn purge_scope_is_admin_only_and_leaves_other_scopes() {
+        let _g = env_lock();
+        let (dir, iam, full, adapter) = scope_fixture("pscx");
+        let admin = iam.ensure_admin_from(None).unwrap().expect("bootstrap admin");
+        let app = router(Arc::new(BearerAuth::from_env().unwrap()), Some(iam));
+        let rec = |title: &str, body: &str| json!({"kind": "memory", "namespace": "notes", "title": title, "body": body});
+        let as_room = |r: &'static str| [("x-dm-scopes", r), ("x-dm-write-scope", r)];
+        let (st, v) = post_as(&app, "/import", &adapter, rec("zq12 standup", "zq12 only in channel one"), &as_room("channel:s/c1")).await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        let gone = v["uri"].as_str().unwrap().to_string();
+        let (st, _) = post_as(&app, "/import", &adapter, rec("zq12 other", "zq12 channel two keeps this"), &as_room("channel:s/c2")).await;
+        assert_eq!(st, StatusCode::OK);
+        let (st, _) = post_as(&app, "/import", &full, rec("zq12 global", "zq12 everyone keeps this"), &[]).await;
+        assert_eq!(st, StatusCode::OK);
+
+        let req = |t: &str, sc: &str| json!({"tenant": t, "scope": sc});
+        for tok in [&full, &adapter] {
+            let (st, _) = post_as(&app, "/admin/purge_scope", tok, req("pscx", "channel:s/c1"), &as_room("channel:s/c1")).await;
+            assert_eq!(st, StatusCode::FORBIDDEN, "erasing is the admin's, not a tenant or adapter token's");
+        }
+        let (st, _) = post_as(&app, "/admin/purge_scope", &admin, req("pscx", ""), &[]).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "the global scope is refused");
+        let (st, _) = post_as(&app, "/admin/purge_scope", &admin, req("nosuch", "channel:s/c1"), &[]).await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+        assert!(!files_holding(&dir.join("vectors"), &gone).is_empty(), "control: the record is in the vector index");
+        let (st, v) = post_as(&app, "/admin/purge_scope", &admin, req("pscx", "channel:s/c1"), &[]).await;
+        assert_eq!((st, v["records"].as_u64()), (StatusCode::OK, Some(1)), "{v}");
+        assert_eq!(files_holding(&dir.join("vectors"), &gone), Vec::<String>::new(), "no vector file holds the erased record");
+        assert_eq!(files_holding(&dir.join("tenants"), "zq12 only in channel one"), Vec::<String>::new());
+        let (st, v) = post_as(&app, "/admin/purge_scope", &admin, req("pscx", "channel:s/c1"), &[]).await;
+        assert_eq!((st, v["purged"].as_u64(), v["records"].as_u64()), (StatusCode::OK, Some(0), Some(0)), "{v}");
+        let (_, v) = post_as(&app, "/recall", &adapter, json!({"query": "zq12 keeps this", "limit": 10}), &[("x-dm-scopes", "channel:s/c2")]).await;
+        let found: Vec<&str> = v.as_array().unwrap().iter().filter_map(|h| h["body"].as_str()).collect();
+        assert!(found.contains(&"zq12 channel two keeps this") && found.contains(&"zq12 everyone keeps this"), "{v}");
+
+        let req = Request::builder().method("GET").uri("/capabilities").header("authorization", format!("Bearer {adapter}")).body(Body::empty()).unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        let c: serde_json::Value = serde_json::from_slice(&axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap()).unwrap();
+        assert_eq!((c["purge_scope"].as_bool(), c["tenant"].as_str(), c["purge_allowed"].as_bool()), (Some(true), Some("pscx"), Some(false)), "{c}");
         std::env::remove_var("DM_DATA_DIR");
     }
 }

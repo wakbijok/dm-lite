@@ -291,6 +291,31 @@ fn is_lock_error(e: &anyhow::Error) -> bool {
     format!("{e:#}").contains("Can't lock")
 }
 
+/// Where `ZvecIndex::rebuild_keeping` builds the new index, and where it moves the old one.
+fn rebuild_paths(dir: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    let name = dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    (dir.with_file_name(format!("{name}.rebuild")), dir.with_file_name(format!("{name}.purged")))
+}
+
+/// Finish a rebuild a stop interrupted, before the index is opened. The old files
+/// (`<name>.purged`) hold what a purge erased, so they are deleted whatever the state. A
+/// complete new index (`<name>.rebuild`) with no index in place is moved in; with the index
+/// still in place, the partial new one is deleted (the purge's next call rebuilds again).
+pub fn finish_interrupted_rebuild(dir: &Path) -> Result<()> {
+    let (new, old) = rebuild_paths(dir);
+    if old.exists() {
+        std::fs::remove_dir_all(&old)?;
+    }
+    if new.exists() {
+        if dir.exists() || torn_reason(&new).is_some() {
+            std::fs::remove_dir_all(&new)?;
+        } else {
+            std::fs::rename(&new, dir)?;
+        }
+    }
+    Ok(())
+}
+
 /// Move a torn index aside, next to where it was: `<name>.corrupt-<UTC time>` (with a counter
 /// when that name is taken), so nothing is lost and a fresh index can take its place. A rename
 /// on the same filesystem, so it is atomic. Returns where it went.
@@ -334,7 +359,11 @@ pub struct VectorHit {
 }
 
 pub struct ZvecIndex {
-    collection: Collection,
+    /// Behind a lock so a rebuild (`rebuild_keeping`) can swap in the new collection while
+    /// other threads keep their handle on this index.
+    /// None only after a rebuild whose new collection failed to open (every call then fails
+    /// until the next open, which finishes the rebuild).
+    collection: std::sync::RwLock<Option<Collection>>,
     /// Where the index lives, for syncing it after a flush.
     dir: Option<std::path::PathBuf>,
 }
@@ -372,38 +401,54 @@ fn sync_tree(dir: &Path) -> std::io::Result<()> {
     std::fs::File::open(dir)?.sync_all()
 }
 
+/// Open the vector collection under `dir`, creating it the first time. zvec's
+/// `create_and_open` rejects an existing path, so we create-or-open explicitly.
+fn open_collection(dir: &Path) -> Result<Collection> {
+    INIT.call_once(|| {
+        let _ = initialize(None);
+    });
+    if let Some(parent) = dir.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    let path = dir.to_string_lossy().to_string();
+    Ok(if dir.exists() {
+        Collection::open(&path, None).map_err(ze)?
+    } else {
+        let schema = CollectionSchema::builder("entries")
+            .add_field(FieldSchema::new("uri", DataType::String, false, 0).map_err(ze)?)
+            .add_vector_field(
+                "embedding",
+                DataType::VectorFp32,
+                DIM as u32,
+                IndexParams::hnsw(MetricType::Cosine, 16, 200).map_err(ze)?,
+            )
+            .build()
+            .map_err(ze)?;
+        Collection::create_and_open(&path, &schema, None).map_err(ze)?
+    })
+}
+
 impl ZvecIndex {
-    /// Open the vector collection under `dir`, creating it the first time. zvec's
-    /// `create_and_open` rejects an existing path, so we create-or-open explicitly.
+    /// Open the index under `dir` (creating it the first time) and mark it open.
     pub fn open(dir: &Path) -> Result<Self> {
-        INIT.call_once(|| {
-            let _ = initialize(None);
-        });
-        if let Some(parent) = dir.parent() {
-            std::fs::create_dir_all(parent).ok();
-        }
-        let path = dir.to_string_lossy().to_string();
-        let collection = if dir.exists() {
-            Collection::open(&path, None).map_err(ze)?
-        } else {
-            let schema = CollectionSchema::builder("entries")
-                .add_field(FieldSchema::new("uri", DataType::String, false, 0).map_err(ze)?)
-                .add_vector_field(
-                    "embedding",
-                    DataType::VectorFp32,
-                    DIM as u32,
-                    IndexParams::hnsw(MetricType::Cosine, 16, 200).map_err(ze)?,
-                )
-                .build()
-                .map_err(ze)?;
-            Collection::create_and_open(&path, &schema, None).map_err(ze)?
-        };
+        let collection = open_collection(dir)?;
         // Open now: until a clean close removes it, the marker says the index may be dirty.
         let marker = dirty_marker(dir);
         if let Err(e) = std::fs::write(&marker, "this vector index is open, or its process stopped without closing it\n") {
             eprintln!("dmem: could not write {} ({e}); an unclean stop is not detected for this index", marker.display());
         }
-        Ok(Self { collection, dir: Some(dir.to_path_buf()) })
+        Ok(Self { collection: std::sync::RwLock::new(Some(collection)), dir: Some(dir.to_path_buf()) })
+    }
+
+    /// The directory the index lives in (None for an index opened without one).
+    pub fn dir(&self) -> Option<&Path> {
+        self.dir.as_deref()
+    }
+
+    fn with_col<R>(&self, f: impl FnOnce(&Collection) -> R) -> Result<R> {
+        let guard = self.collection.read().unwrap_or_else(|p| p.into_inner());
+        let col = guard.as_ref().ok_or_else(|| anyhow!("vector index closed: its rebuild could not reopen it"))?;
+        Ok(f(col))
     }
 
     /// Upsert (supersede) one record's vectors - the (uri, scope) slot - one per body window.
@@ -413,7 +458,7 @@ impl ZvecIndex {
     pub fn upsert_chunks(&self, uri: &str, scope: &str, vectors: &[Vec<f32>]) -> Result<()> {
         // Best-effort clear the full chunk range so a shrink leaves no orphans.
         let stale: Vec<String> = (0..MAX_CHUNKS).map(|i| chunk_pk(uri, scope, i)).collect();
-        let _ = self.collection.delete(&stale.iter().map(|s| s.as_str()).collect::<Vec<_>>());
+        let _ = self.with_col(|c| c.delete(&stale.iter().map(|s| s.as_str()).collect::<Vec<_>>()))?;
         let mut docs = Vec::with_capacity(vectors.len());
         for (i, v) in vectors.iter().take(MAX_CHUNKS).enumerate() {
             let mut doc = Doc::new().map_err(ze)?;
@@ -423,7 +468,7 @@ impl ZvecIndex {
             docs.push(doc);
         }
         let refs: Vec<&Doc> = docs.iter().collect();
-        self.collection.insert(&refs).map_err(ze)?;
+        self.with_col(|c| c.insert(&refs))?.map_err(ze)?;
         Ok(())
     }
 
@@ -437,7 +482,7 @@ impl ZvecIndex {
     /// writes between flushes, which a power-off can still tear; the open guards against that
     /// (`torn_reason`, quarantine, rebuild from the database).
     pub fn flush(&self) -> Result<()> {
-        self.collection.flush().map_err(ze)?;
+        self.with_col(|c| c.flush())?.map_err(ze)?;
         if let Some(dir) = &self.dir {
             if let Err(e) = sync_tree(dir) {
                 eprintln!("dmem: vector index {} flushed but not synced ({e})", dir.display());
@@ -450,7 +495,65 @@ impl ZvecIndex {
     /// invalidation that leaves the slot without a live row). Best-effort idempotent.
     pub fn remove(&self, uri: &str, scope: &str) -> Result<()> {
         let pks: Vec<String> = (0..MAX_CHUNKS).map(|i| chunk_pk(uri, scope, i)).collect();
-        let _ = self.collection.delete(&pks.iter().map(|s| s.as_str()).collect::<Vec<_>>());
+        let _ = self.with_col(|c| c.delete(&pks.iter().map(|s| s.as_str()).collect::<Vec<_>>()))?;
+        Ok(())
+    }
+
+    /// Rebuild the index with the vectors of `keep` only, the (uri, scope) records still in
+    /// the database, and swap it in. A purge needs this: zvec's delete only marks a vector
+    /// deleted, and neither a flush nor `optimize` takes it, or the record's uri, out of the
+    /// files (the `rebuild_erases_what_delete_and_optimize_keep` test shows it). Vectors are
+    /// copied from this index as they are, so nothing is embedded again.
+    ///
+    /// The new collection is built in `<name>.rebuild` beside this one. Under the write lock,
+    /// this one moves to `<name>.purged`, the new one takes its place and is opened, and the
+    /// old files are deleted. A stop in between is finished by `finish_interrupted_rebuild`
+    /// on the next open.
+    pub fn rebuild_keeping(&self, keep: &[(String, String)]) -> Result<()> {
+        let dir = self.dir.clone().ok_or_else(|| anyhow!("this vector index has no directory to rebuild in"))?;
+        let (new, old) = rebuild_paths(&dir);
+        let mut guard = self.collection.write().unwrap_or_else(|p| p.into_inner());
+        let current = guard.as_ref().ok_or_else(|| anyhow!("vector index closed: its rebuild could not reopen it"))?;
+        if new.exists() {
+            std::fs::remove_dir_all(&new)?;
+        }
+        {
+            let fresh = open_collection(&new)?;
+            for batch in keep.chunks(16) {
+                let pks: Vec<String> =
+                    batch.iter().flat_map(|(uri, scope)| (0..MAX_CHUNKS).map(move |i| chunk_pk(uri, scope, i))).collect();
+                let found = current.fetch(&pks.iter().map(|s| s.as_str()).collect::<Vec<_>>()).map_err(ze)?;
+                let mut docs = Vec::with_capacity(found.len());
+                for d in &found {
+                    let (Some(pk), Some(uri), Some(v)) =
+                        (d.get_pk(), d.get_string("uri").map_err(ze)?, d.get_vector_f32("embedding").map_err(ze)?)
+                    else {
+                        continue;
+                    };
+                    let mut doc = Doc::new().map_err(ze)?;
+                    doc.set_pk(pk);
+                    doc.add_string("uri", &uri).map_err(ze)?;
+                    doc.add_vector_f32("embedding", &v).map_err(ze)?;
+                    docs.push(doc);
+                }
+                if !docs.is_empty() {
+                    fresh.insert(&docs.iter().collect::<Vec<_>>()).map_err(ze)?;
+                }
+            }
+            fresh.flush().map_err(ze)?;
+        }
+        sync_tree(&new)?;
+        // Closed before the new one opens at the same path: zvec's id map (RocksDB) refuses a
+        // second open of a path this process still has locked, even once it is renamed.
+        current.flush().map_err(ze)?;
+        drop(guard.take());
+        std::fs::rename(&dir, &old)?;
+        std::fs::rename(&new, &dir)?;
+        *guard = Some(Collection::open(&dir.to_string_lossy(), None).map_err(ze)?);
+        std::fs::remove_dir_all(&old)?;
+        if let Some(parent) = dir.parent() {
+            std::fs::File::open(parent)?.sync_all()?;
+        }
         Ok(())
     }
 
@@ -475,7 +578,7 @@ impl ZvecIndex {
             .output_fields(&["uri"])
             .build()
             .map_err(ze)?;
-        let results = self.collection.query(&q).map_err(ze)?;
+        let results = self.with_col(|c| c.query(&q))?.map_err(ze)?;
         let mut seen = std::collections::HashSet::new();
         let mut out = Vec::new();
         for r in &results {
@@ -743,5 +846,118 @@ mod tests {
         idx.upsert_chunks(uri, "", std::slice::from_ref(&v)).expect("upsert long daimon uri");
         let hits = pairs(idx.search(&v, 5).expect("search"));
         assert_eq!(hits.first().map(|(s, _)| s.as_str()), Some(uri), "got {:?}", hits);
+    }
+}
+
+#[cfg(test)]
+mod erase_tests {
+    use super::*;
+
+    /// Every file under `dir` whose bytes contain `needle`.
+    fn files_with(dir: &Path, needle: &[u8]) -> Vec<String> {
+        let mut hits = Vec::new();
+        for e in std::fs::read_dir(dir).unwrap().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                hits.extend(files_with(&p, needle));
+            } else if std::fs::read(&p).is_ok_and(|b| b.windows(needle.len()).any(|w| w == needle)) {
+                hits.push(p.display().to_string());
+            }
+        }
+        hits
+    }
+
+    fn files(dir: &Path) -> Vec<std::path::PathBuf> {
+        let mut v = Vec::new();
+        for e in std::fs::read_dir(dir).unwrap().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                v.extend(files(&p));
+            } else {
+                v.push(p);
+            }
+        }
+        v
+    }
+
+    fn unit(seed: usize) -> Vec<f32> {
+        let raw: Vec<f32> = (0..DIM).map(|i| ((i as f32 + 1.0) * (seed as f32 + 1.3)).sin().abs() + 0.01).collect();
+        let n = raw.iter().map(|x| x * x).sum::<f32>().sqrt();
+        raw.iter().map(|x| x / n).collect()
+    }
+
+    /// The reason a purge rebuilds the index: zvec's delete, flush and `optimize` leave an
+    /// erased record's uri in the files. If a zvec release erases on optimize, the first half
+    /// fails, and the rebuild may be revisited. The rebuild must leave no file of the old
+    /// index and no trace of the erased uri, and keep every other vector as it was.
+    #[test]
+    fn rebuild_erases_what_delete_and_optimize_keep() {
+        let base = std::env::temp_dir().join(format!("dmerase-{}-{}", std::process::id(), crate::entry::now_ms()));
+        let dir = base.join("t");
+        let idx = ZvecIndex::open(&dir).unwrap();
+        let gone = "daimon://knowledge/org-q/person-erase-me/area";
+        for k in 0..30 {
+            idx.upsert_chunks(&format!("daimon://keep/{k}"), if k % 2 == 0 { "" } else { "room" }, &[unit(k)]).unwrap();
+        }
+        idx.upsert_chunks(gone, "", &[unit(999), unit(998)]).unwrap();
+        idx.flush().unwrap();
+        assert!(!files_with(&dir, gone.as_bytes()).is_empty(), "control: the uri is in the files before the delete");
+
+        idx.remove(gone, "").unwrap();
+        idx.with_col(|c| c.optimize()).unwrap().unwrap();
+        idx.flush().unwrap();
+        assert!(
+            !files_with(&dir, gone.as_bytes()).is_empty(),
+            "zvec now erases a deleted record on optimize: the rebuild in rebuild_keeping may no longer be needed"
+        );
+
+        let before = files(&dir);
+        let keep: Vec<(String, String)> =
+            (0..30).map(|k| (format!("daimon://keep/{k}"), if k % 2 == 0 { String::new() } else { "room".into() })).collect();
+        idx.rebuild_keeping(&keep).unwrap();
+
+        assert_eq!(files_with(&dir, gone.as_bytes()), Vec::<String>::new(), "the erased uri is in no file of the rebuilt index");
+        for f in &before {
+            let still = f.exists() && !f.ends_with("LOCK") && std::fs::read(f).is_ok_and(|b| b.windows(gone.len()).any(|w| w == gone.as_bytes()));
+            assert!(!still, "an old file still holds the uri: {}", f.display());
+        }
+        let (new, old) = rebuild_paths(&dir);
+        assert!(!new.exists() && !old.exists(), "no rebuild leftovers");
+        let none = idx.with_col(|c| c.fetch(&[chunk_pk(gone, "", 0).as_str()])).unwrap().unwrap();
+        assert!(none.is_empty(), "the erased record cannot be fetched");
+        for (k, (uri, scope)) in keep.iter().enumerate() {
+            let d = idx.with_col(|c| c.fetch(&[chunk_pk(uri, scope, 0).as_str()])).unwrap().unwrap();
+            assert_eq!(d.len(), 1, "kept record {uri} in scope {scope:?}");
+            assert_eq!(d[0].get_vector_f32("embedding").unwrap().unwrap(), unit(k), "kept vector unchanged");
+        }
+        let hit = idx.search(&unit(7), 1).unwrap();
+        assert_eq!(hit[0].uri, "daimon://keep/7", "the rebuilt index searches");
+        // Writes go to the new collection, and it survives a close and reopen.
+        idx.upsert_chunks("daimon://after/rebuild", "", &[unit(500)]).unwrap();
+        drop(idx);
+        let again = ZvecIndex::open(&dir).unwrap();
+        assert_eq!(again.search(&unit(500), 1).unwrap()[0].uri, "daimon://after/rebuild");
+        drop(again);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn an_interrupted_rebuild_is_finished_and_its_old_files_deleted() {
+        let base = std::env::temp_dir().join(format!("dmerase2-{}-{}", std::process::id(), crate::entry::now_ms()));
+        let dir = base.join("t");
+        let (new, old) = rebuild_paths(&dir);
+        // Stopped between the two renames: the old index aside, the new one complete.
+        drop(ZvecIndex::open(&new).unwrap());
+        std::fs::remove_file(dirty_marker(&new)).ok();
+        std::fs::create_dir_all(old.join("0")).unwrap();
+        std::fs::write(old.join("0/scalar.0.ipc"), b"daimon://erased").unwrap();
+        finish_interrupted_rebuild(&dir).unwrap();
+        assert!(dir.exists() && !new.exists() && !old.exists());
+        drop(ZvecIndex::open(&dir).unwrap());
+        // Stopped while building: the index still in place, a partial new one beside it.
+        std::fs::create_dir_all(new.join("0")).unwrap();
+        finish_interrupted_rebuild(&dir).unwrap();
+        assert!(dir.exists() && !new.exists());
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

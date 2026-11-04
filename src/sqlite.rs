@@ -620,6 +620,125 @@ impl SqliteStore {
         conn.execute("INSERT INTO entries_fts(idref, text) VALUES (?1, ?2)", params![new_id, fts_text])?;
         Ok(())
     }
+
+    /// Erase, at rest, every record whose namespace is one of `prefixes` or lies under one
+    /// (`purge_prefix` says what a prefix is): every version, live or retracted, in every
+    /// scope, with its full-text row, and the edges and signals of each uri left with no row.
+    /// Unlike `forget`, nothing of it is kept: no lineage, no history.
+    ///
+    /// Deleting rows is not enough to say the text is gone from the file: a deleted row's
+    /// page goes to the free list with its bytes in it, a full-text delete only marks the
+    /// tokens deleted in index segments (an earlier `forget` left such tokens too), and the
+    /// write-ahead log still holds the pages as they were. So after the delete the full-text
+    /// index is rebuilt from what is left, the database is rewritten (VACUUM, with
+    /// secure_delete on) and the log is checkpointed and truncated. `<db>.purge-pending`
+    /// is written before the delete and removed only when all of that is done, so a purge
+    /// that stopped part-way (a busy log, a crash) is finished by the next call, even one
+    /// that matches nothing. Vectors are the caller's (`LocalMemory::purge`).
+    pub fn purge_namespaces(&self, prefixes: &[String]) -> Result<Purged> {
+        let prefixes = prefixes.iter().map(|p| purge_prefix(p)).collect::<Result<Vec<_>>>()?;
+        let mut sel = self.conn.prepare(
+            "SELECT id, uri FROM entries WHERE namespace=?1 OR substr(namespace, 1, length(?1) + 1) = ?1 || '/'",
+        )?;
+        let mut rows = Vec::new();
+        for p in &prefixes {
+            for row in sel.query_map(params![p], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))? {
+                rows.push(row?);
+            }
+        }
+        drop(sel);
+        self.erase_rows(rows)
+    }
+
+    /// Erase at rest every record version whose scope is exactly `scope`, as `purge_namespaces`
+    /// does for a namespace. Rows of the same uri in other scopes (global included) stay, and
+    /// so do the uri's edges and signals while any of them is left. The global scope (`''`) is
+    /// refused: it is not one audience's memory.
+    pub fn purge_scope(&self, scope: &str) -> Result<Purged> {
+        anyhow::ensure!(!scope.is_empty(), "the global scope cannot be purged by scope");
+        let mut sel = self.conn.prepare("SELECT id, uri FROM entries WHERE scope=?1")?;
+        let rows = sel
+            .query_map(params![scope], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(sel);
+        self.erase_rows(rows)
+    }
+
+    /// The erase behind both purges: delete the rows (id, uri), then rewrite the file.
+    fn erase_rows(&self, rows: Vec<(i64, String)>) -> Result<Purged> {
+        let pending = self.conn.path().filter(|p| !p.is_empty()).map(|p| std::path::PathBuf::from(format!("{p}.purge-pending")));
+        let mut ids = std::collections::BTreeSet::new();
+        let mut uris = std::collections::BTreeSet::new();
+        for (id, uri) in rows {
+            ids.insert(id);
+            uris.insert(uri);
+        }
+        let resume = pending.as_ref().is_some_and(|p| p.exists());
+        if ids.is_empty() && !resume {
+            return Ok(Purged::default());
+        }
+        if let Some(p) = &pending {
+            std::fs::write(p, "a purge erased records here; the file is rewritten before this goes\n")
+                .with_context(|| format!("write {}", p.display()))?;
+        }
+        self.conn.execute_batch("PRAGMA secure_delete=ON")?;
+        let erased = (|| -> Result<()> {
+            let tx = self.conn.unchecked_transaction()?;
+            let id_list = serde_json::to_string(&ids)?;
+            tx.execute("DELETE FROM entries_fts WHERE idref IN (SELECT value FROM json_each(?1))", params![id_list])?;
+            tx.execute("DELETE FROM entries WHERE id IN (SELECT value FROM json_each(?1))", params![id_list])?;
+            for uri in &uris {
+                // A uri still held elsewhere (another scope, or a namespace it once had) is
+                // still a node: its edges and signals stay.
+                if !tx.query_row("SELECT EXISTS (SELECT 1 FROM entries WHERE uri=?1)", params![uri], |r| r.get::<_, bool>(0))? {
+                    tx.execute("DELETE FROM edges WHERE from_uri=?1 OR to_uri=?1", params![uri])?;
+                    tx.execute("DELETE FROM signals WHERE uri=?1", params![uri])?;
+                }
+            }
+            tx.commit()?;
+            self.conn.execute_batch("INSERT INTO entries_fts(entries_fts) VALUES('rebuild'); VACUUM;")?;
+            let (busy, _, _): (i64, i64, i64) =
+                self.conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+            anyhow::ensure!(busy == 0, "the write-ahead log is in use by another reader; the purge finishes on the next call");
+            Ok(())
+        })();
+        let _ = self.conn.execute_batch("PRAGMA secure_delete=OFF");
+        erased?;
+        if let Some(p) = &pending {
+            std::fs::remove_file(p).with_context(|| format!("remove {}", p.display()))?;
+        }
+        Ok(Purged { versions: ids.len(), uris: uris.into_iter().collect() })
+    }
+
+    /// Every (uri, scope) a row of this store holds, retracted rows included: the records
+    /// whose vectors a rebuilt index keeps.
+    pub fn record_slots(&self) -> Result<Vec<(String, String)>> {
+        let mut stmt = self.conn.prepare("SELECT DISTINCT uri, scope FROM entries")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+}
+
+/// What `SqliteStore::purge_namespaces` erased: how many record versions, and the uris they
+/// held (sorted).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Purged {
+    pub versions: usize,
+    pub uris: Vec<String>,
+}
+
+/// Check and normalise a purge prefix. It names whole namespace segments: `a/b` erases the
+/// namespace `a/b` and everything under `a/b/`, never `a/bc`. A trailing `/` changes nothing.
+/// Refused: an empty prefix, a leading `/`, and an empty, `.` or `..` segment.
+pub fn purge_prefix(p: &str) -> Result<String> {
+    let p = p.trim_end_matches('/');
+    anyhow::ensure!(!p.is_empty(), "a purge prefix must name at least one namespace segment");
+    anyhow::ensure!(!p.starts_with('/'), "a purge prefix must not start with '/': {p}");
+    anyhow::ensure!(
+        p.split('/').all(|s| !s.is_empty() && s != "." && s != ".."),
+        "a purge prefix must not have an empty, '.' or '..' segment: {p}"
+    );
+    Ok(p.to_string())
 }
 
 impl MemoryStore for SqliteStore {
@@ -1670,6 +1789,159 @@ mod tests {
         assert_eq!(s.neighbors_scored(&[(hub.uri.clone(), 1.0)], 1, 3, 0.5).unwrap().len(), 3, "limit caps nodes");
         assert!(s.neighbors_scored(&[(hub.uri.clone(), 1.0)], 0, 10, 0.5).unwrap().is_empty(), "depth 0 -> nothing");
         assert!(s.neighbors_scored(&[], 2, 10, 0.5).unwrap().is_empty(), "no seeds -> nothing");
+    }
+
+    #[test]
+    fn a_purge_prefix_is_whole_segments() {
+        assert_eq!(purge_prefix("knowledge/o/p/").unwrap(), "knowledge/o/p");
+        assert_eq!(purge_prefix("kmeta/o/p/area").unwrap(), "kmeta/o/p/area");
+        assert_eq!(purge_prefix("a_%b").unwrap(), "a_%b", "LIKE wildcards are plain characters");
+        for bad in ["", "/", "//", "/a", "a//b", "a/./b", "a/../b", ".."] {
+            assert!(purge_prefix(bad).is_err(), "{bad:?} is refused");
+        }
+    }
+
+    /// Every file of the store (the database with its -wal and -shm) holding `needle`.
+    fn store_files_with(s: &SqliteStore, needle: &str) -> Vec<String> {
+        let db = s.conn.path().unwrap().to_string();
+        [db.clone(), format!("{db}-wal"), format!("{db}-shm")]
+            .into_iter()
+            .filter(|f| std::fs::read(f).is_ok_and(|b| b.windows(needle.len()).any(|w| w == needle.as_bytes())))
+            .collect()
+    }
+
+    #[test]
+    fn purge_erases_whole_segments_every_version_and_scope_and_the_graph() {
+        let s = mem_store();
+        let area = mk(Kind::Memory, "kmeta/o/p/area", "chunk", "in area");
+        let area2 = mk(Kind::Memory, "kmeta/o/p/area2", "chunk", "in area2, a sibling that shares the prefix text");
+        let below = mk(Kind::Memory, "kmeta/o/p/area/sub", "deep", "under area");
+        let pct = mk(Kind::Memory, "kmeta/o/p%", "pct", "a name with a LIKE wildcard");
+        for e in [&area, &area2, &below, &pct] {
+            s.put(e).unwrap();
+        }
+        // A second version, a retracted one, and the same uri held by a room scope.
+        s.put(&mk(Kind::Memory, "kmeta/o/p/area", "chunk", "in area, edited")).unwrap();
+        let mut scoped = mk(Kind::Memory, "kmeta/o/p/area", "chunk", "the room's copy");
+        scoped.scope = "room".into();
+        s.put(&scoped).unwrap();
+        s.forget(&below.uri).unwrap();
+        // Edges both ways between an erased and a kept record, signals on the erased one.
+        s.link(&area.uri, &area2.uri, "links").unwrap();
+        s.link(&area2.uri, &area.uri, "informed").unwrap();
+        s.link(&area2.uri, &pct.uri, "links").unwrap();
+        s.bump_signal(&area.uri, 1).unwrap();
+
+        let rows = |uri: &str| -> usize {
+            s.conn.query_row("SELECT COUNT(*) FROM entries WHERE uri=?1", params![uri], |r| r.get::<_, i64>(0)).unwrap() as usize
+        };
+        let (a_rows, b_rows) = (rows(&area.uri), rows(&below.uri));
+        assert!(a_rows >= 3 && b_rows >= 1, "control: both versions, the room's row and the retracted row exist");
+        let out = s.purge_namespaces(&["kmeta/o/p/area/".into()]).unwrap();
+        assert_eq!(out.versions, a_rows + b_rows, "every row of both uris, every version and scope");
+        assert_eq!(out.uris, {
+            let mut u = vec![area.uri.clone(), below.uri.clone()];
+            u.sort();
+            u
+        });
+        for uri in [&area.uri, &below.uri] {
+            let n: i64 = s.conn.query_row("SELECT COUNT(*) FROM entries WHERE uri=?1", params![uri], |r| r.get(0)).unwrap();
+            assert_eq!(n, 0, "no version of {uri} is left, history included");
+        }
+        assert_eq!(s.history(&area2.uri, 10).unwrap().len(), 1, "area2 is not under area/");
+        assert_eq!(s.history(&pct.uri, 10).unwrap().len(), 1);
+        let edges = s.all_edges(100).unwrap();
+        assert_eq!(edges.len(), 1, "only the edge between two kept records is left");
+        assert_eq!((edges[0].from_uri.as_str(), edges[0].to_uri.as_str()), (area2.uri.as_str(), pct.uri.as_str()));
+        let sig: i64 = s.conn.query_row("SELECT COUNT(*) FROM signals WHERE uri=?1", params![area.uri], |r| r.get(0)).unwrap();
+        assert_eq!(sig, 0);
+        assert!(s.recall("area", 10).unwrap().iter().all(|e| e.uri != area.uri));
+
+        // Safe to send twice; `%` and `_` are literal, so "kmeta/o/p%" erases only itself.
+        assert_eq!(s.purge_namespaces(&["kmeta/o/p/area".into()]).unwrap(), Purged::default());
+        assert_eq!(s.purge_namespaces(&["kmeta/o/p%".into()]).unwrap().versions, 1);
+        assert_eq!(s.history(&area2.uri, 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn purged_text_is_in_no_file_of_the_store_afterwards() {
+        let s = mem_store();
+        let gone = mk(Kind::Memory, "knowledge/o/person-q", "secret", "zq7currentbody nothing else");
+        s.put(&gone).unwrap();
+        // An earlier version, closed long before the purge: its full-text tokens were only
+        // marked deleted by that close.
+        s.put(&mk(Kind::Memory, "knowledge/o/person-q", "secret", "zq7oldversion")).unwrap();
+        s.put(&mk(Kind::Memory, "knowledge/o/person-q", "secret", "zq7currentbody again")).unwrap();
+        s.put(&mk(Kind::Memory, "knowledge/o/other", "kept", "zq7keptbody")).unwrap();
+        for needle in ["zq7currentbody", "zq7oldversion", "person-q"] {
+            assert!(!store_files_with(&s, needle).is_empty(), "control: {needle} is on disk before the purge");
+        }
+        let rows: i64 = s.conn.query_row("SELECT COUNT(*) FROM entries WHERE namespace='knowledge/o/person-q'", [], |r| r.get(0)).unwrap();
+        let out = s.purge_namespaces(&["knowledge/o/person-q".into()]).unwrap();
+        assert_eq!(out.versions, rows as usize);
+        for needle in ["zq7currentbody", "zq7oldversion", "person-q"] {
+            assert_eq!(store_files_with(&s, needle), Vec::<String>::new(), "{needle} is erased from every file");
+        }
+        assert!(!store_files_with(&s, "zq7keptbody").is_empty(), "what was kept is still there");
+        assert_eq!(s.recall("zq7keptbody", 5).unwrap().len(), 1, "and still found by keyword");
+        let db = s.conn.path().unwrap().to_string();
+        assert!(!std::path::Path::new(&format!("{db}.purge-pending")).exists());
+    }
+
+    #[test]
+    fn an_unfinished_purge_is_finished_by_the_next_call_even_one_matching_nothing() {
+        let s = mem_store();
+        s.put(&mk(Kind::Memory, "a", "x", "zq8body")).unwrap();
+        let db = s.conn.path().unwrap().to_string();
+        let marker = format!("{db}.purge-pending");
+        std::fs::write(&marker, "").unwrap();
+        assert_eq!(s.purge_namespaces(&["nothing/here".into()]).unwrap(), Purged::default());
+        assert!(!std::path::Path::new(&marker).exists(), "the rewrite ran and the marker went");
+        assert_eq!(s.history(&make_uri("a", Kind::Memory, "x"), 5).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn purge_scope_erases_one_scope_and_leaves_the_same_uri_elsewhere() {
+        let s = mem_store();
+        let ch = "channel:s1/c1";
+        let in_scope = |ns: &str, title: &str, body: &str, scope: &str| {
+            let mut e = mk(Kind::Memory, ns, title, body);
+            e.scope = scope.into();
+            e
+        };
+        // One uri held globally, by this Channel and by another; one held by this Channel only.
+        let shared = mk(Kind::Memory, "resources/workspace", "plan", "the global plan");
+        s.put(&shared).unwrap();
+        s.put(&in_scope("resources/workspace", "plan", "zq11 channel copy of the plan", ch)).unwrap();
+        s.put(&in_scope("resources/workspace", "plan", "the other channel's copy", "channel:s1/c2")).unwrap();
+        let only = in_scope("notes", "standup", "zq11 said only in this channel", ch);
+        s.put(&only).unwrap();
+        s.put(&in_scope("notes", "standup", "zq11 edited later", ch)).unwrap();
+        let other = mk(Kind::Memory, "notes", "kept", "zq11keptbody");
+        s.put(&other).unwrap();
+        s.link(&shared.uri, &other.uri, "links").unwrap();
+        s.link(&only.uri, &other.uri, "links").unwrap();
+        assert!(!store_files_with(&s, "zq11 said only").is_empty(), "control");
+
+        assert!(s.purge_scope("").is_err(), "the global scope is refused");
+        let rows: i64 = s.conn.query_row("SELECT COUNT(*) FROM entries WHERE scope=?1", params![ch], |r| r.get(0)).unwrap();
+        let out = s.purge_scope(ch).unwrap();
+        assert_eq!(out.versions, rows as usize);
+        assert_eq!(out.uris.len(), 2);
+        let scopes = |uri: &str| -> Vec<String> {
+            let mut st = s.conn.prepare("SELECT DISTINCT scope FROM entries WHERE uri=?1 ORDER BY scope").unwrap();
+            st.query_map(params![uri], |r| r.get::<_, String>(0)).unwrap().map(|r| r.unwrap()).collect()
+        };
+        assert_eq!(scopes(&shared.uri), vec!["".to_string(), "channel:s1/c2".into()], "global and the other Channel stay");
+        assert!(scopes(&only.uri).is_empty(), "the Channel-only record is gone, every version");
+        let edges = s.all_edges(100).unwrap();
+        assert_eq!(edges.len(), 1, "the shared uri is still a node and keeps its edge; the erased one's edge goes");
+        assert_eq!(edges[0].from_uri, shared.uri);
+        for needle in ["zq11 said only", "zq11 edited later", "zq11 channel copy"] {
+            assert_eq!(store_files_with(&s, needle), Vec::<String>::new(), "{needle} is erased from every file");
+        }
+        assert!(!store_files_with(&s, "the other channel's copy").is_empty() && !store_files_with(&s, "zq11keptbody").is_empty());
+        assert_eq!(s.purge_scope(ch).unwrap(), Purged::default(), "safe to send twice");
     }
 
     #[test]

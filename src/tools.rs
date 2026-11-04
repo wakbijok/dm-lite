@@ -746,6 +746,10 @@ fn open_vector_index(
     require_vectors: bool,
     defer_backfill: bool,
 ) -> Result<Option<crate::zvec_index::ZvecIndex>> {
+    // A purge's rebuild that a stop interrupted: its old files hold what the purge erased.
+    if let Err(e) = crate::zvec_index::finish_interrupted_rebuild(vdir) {
+        eprintln!("dmem: vector index {}: could not finish an interrupted rebuild ({e:#})", vdir.display());
+    }
     // Never hand zvec a torn index: its native open dies with SIGSEGV on an empty manifest,
     // and a process that crashes opening a tenant crashes on every restart. Move it aside
     // (nothing is deleted) and start a fresh one, which the backfill below fills from the
@@ -1794,6 +1798,56 @@ impl LocalMemory {
         Ok(n)
     }
 
+    /// Erase at rest every record whose namespace is one of `prefixes` or lies under one,
+    /// in every scope, with its full-text entry, edges and vectors (`SqliteStore::purge_namespaces`
+    /// says what is erased from the database). The vector index is rebuilt without them, since
+    /// a vector delete leaves the record in the index files. Full-tenant writers only: erasure
+    /// is never by scope.
+    ///
+    /// `<index>.purge-pending` beside the vector index is written before the records go and
+    /// removed after the rebuild, so a call that failed part-way is finished by the next one,
+    /// even one that matches nothing.
+    pub fn purge(&self, prefixes: &[String]) -> Result<crate::sqlite::Purged> {
+        anyhow::ensure!(self.mutation_scope()?.is_none(), "a purge needs a full-tenant identity, not a scoped one");
+        for p in prefixes {
+            crate::sqlite::purge_prefix(p)?;
+        }
+        self.purge_with(|store| store.purge_namespaces(prefixes))
+    }
+
+    /// Erase at rest every record version in exactly `scope` (`SqliteStore::purge_scope`),
+    /// with its vectors; the same uri in other scopes stays. The operator's call
+    /// (`/admin/purge_scope`), so no identity check here; the global scope is refused.
+    pub fn purge_scope(&self, scope: &str) -> Result<crate::sqlite::Purged> {
+        anyhow::ensure!(!scope.is_empty(), "the global scope cannot be purged by scope");
+        self.purge_with(|store| store.purge_scope(scope))
+    }
+
+    /// Run a store purge between the vector index's pending marker and its rebuild.
+    fn purge_with(&self, erase: impl FnOnce(&SqliteStore) -> Result<crate::sqlite::Purged>) -> Result<crate::sqlite::Purged> {
+        #[cfg(feature = "zvec")]
+        let marker = self.vindex.as_ref().and_then(|v| v.dir()).map(|d| {
+            let name = d.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            d.with_file_name(format!("{name}.purge-pending"))
+        });
+        #[cfg(feature = "zvec")]
+        let resume = marker.as_ref().is_some_and(|m| m.exists());
+        #[cfg(feature = "zvec")]
+        if let Some(m) = &marker {
+            std::fs::write(m, "a purge erased records; the vector index is rebuilt before this goes\n")
+                .map_err(|e| anyhow!("write {}: {e}", m.display()))?;
+        }
+        let out = erase(&self.store)?;
+        #[cfg(feature = "zvec")]
+        if let (Some(vindex), Some(m)) = (&self.vindex, &marker) {
+            if out.versions > 0 || resume {
+                vindex.rebuild_keeping(&self.store.record_slots()?)?;
+            }
+            std::fs::remove_file(m).map_err(|e| anyhow!("remove {}: {e}", m.display()))?;
+        }
+        Ok(out)
+    }
+
     /// Which recall path is active (truthful: reflects whether zvec actually loaded).
     pub fn recall_mode(&self) -> &'static str {
         #[cfg(feature = "zvec")]
@@ -2201,6 +2255,14 @@ impl Memory {
             Memory::Local(l) => l.forget(uri),
             #[cfg(feature = "client")]
             Memory::Remote(r) => r.forget(uri),
+        }
+    }
+    /// Erase at rest every record under the namespace prefixes: (versions, records) erased.
+    pub fn purge(&self, prefixes: &[String]) -> Result<(usize, usize)> {
+        match self {
+            Memory::Local(l) => l.purge(prefixes).map(|p| (p.versions, p.uris.len())),
+            #[cfg(feature = "client")]
+            Memory::Remote(r) => r.purge(prefixes),
         }
     }
     pub fn persona(&self) -> Result<Vec<Entry>> {

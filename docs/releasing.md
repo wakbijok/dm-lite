@@ -115,9 +115,28 @@ Commit as `release: X.Y.Z - ...`.
 
 ## 3. Build
 
-On the release machine, a Linux x86_64 host with glibc at least as old as the oldest host the
-archive should run on (the binary needs the glibc of its build host; the 0.3.8 binary needs
-2.39):
+**In a container (the default).** On any Linux x86_64 host with Docker, from a clean checkout
+of the release commit:
+
+```sh
+scripts/build-release-container.sh --lib-dir /path/to/the/directory/holding/libzvec_c_api.so
+```
+
+It builds the image in `contrib/release-builder` (Ubuntu 24.04 by digest, so glibc 2.39; Rust
+1.99.1 with `rust-src`) and runs the commands below in it, with the checkout mounted read-only
+at `/dm-lite`, `CARGO_HOME=/cargo` and a fresh target directory on the host (printed at the end,
+default `/var/tmp/dmem-build.XXXXXX`). Inside, the remapped directories already have the names
+the remapping gives them, so the host's own paths cannot reach the binary, and the binary does
+not depend on the host's glibc. Its build of 0.4.3 on a glibc 2.41 host gave the same bytes as
+the hand build on a 2.39 host, archive and signature included. To build a tag older than the
+script, check the tag out in a worktree and run the script from the newer checkout: the image
+comes from the script's own checkout, the sources from the current directory. Move
+`RUST_VERSION` in the Dockerfile, or the base image digest, only as a decision of its own: the
+same commit then gives another binary.
+
+**By hand.** On the release machine, a Linux x86_64 host with glibc at least as old as the
+oldest host the archive should run on (the binary needs the glibc of its build host; the 0.3.8
+binary needs 2.39):
 
 ```sh
 export CARGO_TARGET_DIR=$(mktemp -d /var/tmp/dmem-build.XXXXXX)     # fresh: nothing left over

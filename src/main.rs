@@ -175,6 +175,15 @@ enum Cmd {
     Forget {
         uri: String,
     },
+    /// Erase at rest every record under a namespace (and everything below it): every version,
+    /// its full-text entry, vectors and edges. Nothing is kept, not even history. Needs a
+    /// full-tenant identity.
+    Purge {
+        /// A namespace prefix of whole segments (`a/b` erases `a/b` and `a/b/...`, not `a/bc`).
+        /// Repeat for several.
+        #[arg(long = "namespace", required = true)]
+        namespaces: Vec<String>,
+    },
     /// Link two records (the graph layer): from -[rel]-> to.
     Link {
         from: String,
@@ -436,6 +445,10 @@ enum AdminCmd {
     Revoke { target: String },
     /// Suspend a tenant and revoke its tokens.
     Rm { tenant: String },
+    /// Erase a suspended tenant at rest: its database, vector index and tokens.
+    PurgeTenant { tenant: String },
+    /// Erase at rest every record of exactly one scope in a tenant (never the global scope).
+    PurgeScope { tenant: String, scope: String },
 }
 
 #[derive(Subcommand)]
@@ -712,6 +725,11 @@ fn run() -> Result<()> {
             println!("stored {}", uri);
             Ok(())
         }
+        Cmd::Purge { namespaces } => {
+            let (versions, records) = Memory::open()?.purge(&namespaces)?;
+            println!("erased {records} record{} ({versions} version{})", if records == 1 { "" } else { "s" }, if versions == 1 { "" } else { "s" });
+            Ok(())
+        }
         Cmd::Forget { uri } => {
             let n = Memory::open()?.forget(&uri)?;
             if n == 0 {
@@ -898,6 +916,17 @@ fn run() -> Result<()> {
                 AdminCmd::Rm { tenant } => {
                     rc.admin_rm(&tenant)?;
                     println!("removed tenant {tenant}");
+                }
+                AdminCmd::PurgeScope { tenant, scope } => {
+                    let (versions, records) = rc.admin_purge_scope(&tenant, &scope)?;
+                    println!("erased {records} record{} ({versions} version{}) of scope {scope} in {tenant}", if records == 1 { "" } else { "s" }, if versions == 1 { "" } else { "s" });
+                }
+                AdminCmd::PurgeTenant { tenant } => {
+                    if rc.admin_purge_tenant(&tenant)? {
+                        println!("erased tenant {tenant}");
+                    } else {
+                        println!("tenant {tenant} was already erased");
+                    }
                 }
             }
             Ok(())

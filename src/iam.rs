@@ -427,6 +427,30 @@ impl Iam {
         self.conn.execute("UPDATE tokens SET revoked=1 WHERE tenant=?1", params![t])?;
         Ok(())
     }
+
+    /// A tenant's status (`active`, `suspended`, `purged`), or None for a tenant IAM does not
+    /// know.
+    pub fn tenant_status(&self, tenant: &str) -> Result<Option<String>> {
+        let t = crate::config::canonical_tenant(tenant);
+        let mut stmt = self.conn.prepare("SELECT status FROM tenants WHERE tenant=?1")?;
+        let mut rows = stmt.query(params![t])?;
+        Ok(match rows.next()? {
+            Some(r) => Some(r.get(0)?),
+            None => None,
+        })
+    }
+
+    /// After a tenant's data is erased: its tokens are deleted (not just revoked) and its row
+    /// stays as `purged`, a record with no data that the tenant was erased. Creating the
+    /// tenant again starts an empty one with new tokens.
+    pub fn mark_purged(&self, tenant: &str) -> Result<()> {
+        let t = crate::config::canonical_tenant(tenant);
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM tokens WHERE tenant=?1", params![t])?;
+        tx.execute("UPDATE tenants SET status='purged' WHERE tenant=?1", params![t])?;
+        tx.commit()?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

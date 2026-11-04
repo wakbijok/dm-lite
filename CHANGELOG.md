@@ -3,6 +3,53 @@
 Notable changes to dm-lite (`dmem`). Releases up to and including 0.3.6 are
 described on [GitHub Releases](https://github.com/wakbijok/dm-lite/releases).
 
+## 0.4.4 - 2026-11-04
+
+Erasure at rest. Until now nothing was erased from disk: `forget` retracts a record but keeps
+its history, and `admin rm` suspends a tenant and revokes its tokens but leaves its data.
+
+### Added
+
+- **`POST /purge` and `dmem purge --namespace <prefix>`** erase, in the caller's tenant, every
+  record whose namespace is a prefix or lies under one. That covers every version, live or
+  retracted, in every scope, with its full-text entry, vectors, edges (from other records too)
+  and access signals. Nothing is kept, not even history.
+  - A prefix names whole segments: `a/b` erases `a/b` and `a/b/...`, never `a/bc`. A trailing
+    `/` changes nothing, and `%` and `_` are plain characters. Empty prefixes, a leading `/`,
+    and empty, `.` or `..` segments are refused (400).
+  - Full-tenant tokens with no agent identity only (403 otherwise): erasure is never by scope.
+  - Answers `{"purged": <record versions>, "records": <distinct records>}`. It is safe to send
+    twice: a repeat answers 0. 503 while the tenant's vector backfill runs.
+  - At rest: rows are deleted with `secure_delete` on, the full-text index is rebuilt from
+    what is left (so tokens of records forgotten earlier go too), the database is rewritten
+    (VACUUM) and its write-ahead log checkpointed and truncated. zvec's delete and `optimize`
+    leave a deleted record in the index files, so the tenant's vector index is rebuilt with
+    the remaining vectors (copied, not embedded again) and the old files are deleted.
+  - Markers (`<db>.purge-pending`, `<index>.purge-pending`) make a purge that stopped
+    part-way finish on the next call, even one that matches nothing. An index rebuild
+    interrupted by a stop is finished, and its old files deleted, when the index next opens.
+- **`POST /admin/purge_tenant` and `dmem admin purge_tenant <tenant>`** erase a tenant that
+  `admin rm` suspended. That covers its database with its -wal and -shm, its vector index with
+  its markers, any index copy a torn open or a rebuild set aside, and its tokens (deleted, not
+  just revoked). The tenant stays listed as `purged`, with no data; creating it again starts
+  an empty tenant with new tokens.
+  - 409 while the tenant is active, 404 for an unknown tenant, 503 while a request or a
+    vector backfill still holds it. A repeat answers 200 `{"purged": false}`.
+- **`POST /admin/purge_scope` and `dmem admin purge_scope <tenant> <scope>`** erase, in one
+  tenant, every record version whose scope is exactly that scope, as `/purge` does for a
+  namespace. Rows of the same uri in other scopes stay, and so do its edges while any is left.
+  - Admin only: an adapter may retract within the scopes it asserts, but erasing cannot be
+    undone. The global scope (`""`) is refused (400).
+  - Answers `{"purged": <record versions>, "records": <distinct records>}`. A repeat answers 0.
+    404 for an unknown tenant, 503 while its vector backfill runs.
+- `/capabilities` reports `"purge": true` and `"purge_scope": true`. For the asking token it
+  also reports `"purge_allowed"` (whether `/purge` accepts it), `"agent"` (its agent identity,
+  or null) and `"tenant"`.
+
+Erased means erased from dm-lite's own files. Copies outside its data directory (backups,
+volume snapshots) and the storage below it (a copy-on-write filesystem keeps old blocks until
+it reuses them) are the operator's.
+
 ## 0.4.3 - 2026-10-27
 
 A build fix for 0.4.2 on macOS and Windows. Linux behaviour is unchanged.
