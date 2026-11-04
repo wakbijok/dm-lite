@@ -129,10 +129,10 @@ A client without `--scope` works against either server version.
 
 ### Rollout
 
-1. Upgrade the servers first (dmem.vps, khd-ai), then the clients. A 0.3.7 client refuses `--scope` against an older server.
+1. Upgrade every server first, then the clients. A 0.3.7 client refuses `--scope` against an older server.
 2. On the first start, watch the log for `re-keying the vector index per scope` and `vector index ready` for each tenant. A client with a short timeout may fail its first request to a tenant that is still migrating.
 3. Turn on the E6 policy for a tenant (`workspace`) only after every client that writes to it runs 0.3.7 and names its scope. Older clients can still read a policy tenant but can no longer write to it.
-4. Rollback: an older dmem writes scoped saves into the global vector slot again and does not see the per-scope slots, and nothing detects that afterwards. After running an older dmem on the same data, delete each `<tenant>.scope-slots` marker before starting 0.3.7 again, so the migration re-runs. The same step belongs in the dmem.vps and khd-ai rollback runbooks.
+4. Rollback: an older dmem writes scoped saves into the global vector slot again and does not see the per-scope slots, and nothing detects that afterwards. After running an older dmem on the same data, delete each `<tenant>.scope-slots` marker before starting 0.3.7 again, so the migration re-runs. The same step belongs in each server's rollback runbook.
 
 ## daimon-hub partition tests against this build
 
