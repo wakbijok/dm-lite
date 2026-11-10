@@ -42,7 +42,8 @@ pub fn valid_id(id: &str) -> bool {
 /// case-insensitive). Handles `https://user:token@host/path.git`, `ssh://git@host:22/path`,
 /// and the scp form `git@host:path.git`. None for a local path or anything unparseable.
 pub fn normalize_remote(url: &str) -> Option<String> {
-    let url = url.trim();
+    // A query or fragment is never part of the name, and can carry a token (`?private_token=`).
+    let url = url.trim().split(['?', '#']).next().unwrap_or_default();
     let (host, path) = if let Some((scheme, rest)) = url.split_once("://") {
         if scheme.eq_ignore_ascii_case("file") {
             return None;
@@ -91,10 +92,20 @@ pub fn detect(dir: &Path) -> Option<String> {
     detect_git(dir)
 }
 
+/// `git -C dir`, for reads only. The repository is whatever the agent opened, so its config is
+/// untrusted: `core.fsmonitor` names a command that an index read would run, so it is switched
+/// off, and no optional lock is taken on the index. A read that compares file content also
+/// switches off the repository's filter drivers (see `work_state`).
+fn git_in(dir: &Path) -> Command {
+    let mut cmd = Command::new("git");
+    cmd.args(["-c", "core.fsmonitor=false", "-C"]).arg(dir).env("GIT_OPTIONAL_LOCKS", "0");
+    cmd
+}
+
 /// The git half of `detect`: the `origin` remote, else the first remote, normalized.
 fn detect_git(dir: &Path) -> Option<String> {
     let git = |args: &[&str]| -> Option<String> {
-        let out = Command::new("git").arg("-C").arg(dir).args(args).output().ok()?;
+        let out = git_in(dir).args(args).output().ok()?;
         out.status.success().then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
     };
     let url = git(&["config", "--get", "remote.origin.url"]).filter(|u| !u.is_empty()).or_else(|| {
@@ -148,7 +159,7 @@ pub fn file_context(path: &Path, cwd: Option<&Path>) -> Option<FileContext> {
     let path = if path.is_absolute() { path.to_path_buf() } else { cwd?.join(path) };
     let dir = path.parent()?;
     let dir = std::fs::canonicalize(dir).ok()?;
-    let out = Command::new("git").arg("-C").arg(&dir).args(["rev-parse", "--show-toplevel"]).output().ok()?;
+    let out = git_in(&dir).args(["rev-parse", "--show-toplevel"]).output().ok()?;
     if !out.status.success() {
         return None;
     }
@@ -260,7 +271,7 @@ pub struct WorkState {
 /// The work state of the repository holding `dir`; None outside a git work tree.
 pub fn work_state(dir: &Path) -> Option<WorkState> {
     let git = |args: &[&str]| -> Option<String> {
-        let out = Command::new("git").arg("-C").arg(dir).args(args).output().ok()?;
+        let out = git_in(dir).args(args).output().ok()?;
         out.status.success().then(|| String::from_utf8_lossy(&out.stdout).trim_end().to_string())
     };
     let root = git(&["rev-parse", "--show-toplevel"])?;
@@ -280,17 +291,47 @@ pub fn work_state(dir: &Path) -> Option<WorkState> {
         // No upstream: every commit not on any remote is unpushed.
         None => (0, git(&["rev-list", "--count", "HEAD", "--not", "--remotes"]).and_then(|n| n.parse().ok()).unwrap_or(0)),
     };
+    // Branches by their full names: a short name is the repository's to choose and can read as
+    // an option (`--output=<file>`); `refs/heads/...` never starts with `-`.
+    let current = git(&["symbolic-ref", "-q", "HEAD"]).unwrap_or_default();
     let mut local_only = Vec::new();
-    for b in git(&["for-each-ref", "--format=%(refname:short)", "refs/heads"]).unwrap_or_default().lines() {
-        if b == branch {
+    for full in git(&["for-each-ref", "--format=%(refname)", "refs/heads"]).unwrap_or_default().lines() {
+        let Some(name) = full.strip_prefix("refs/heads/") else { continue };
+        if full == current {
             continue;
         }
-        let n: usize = git(&["rev-list", "--count", b, "--not", "--remotes"]).and_then(|n| n.parse().ok()).unwrap_or(0);
+        let n: usize = git(&["rev-list", "--count", full, "--not", "--remotes"]).and_then(|n| n.parse().ok()).unwrap_or(0);
         if n > 0 {
-            local_only.push((b.to_string(), n));
+            local_only.push((name.to_string(), n));
         }
     }
-    let dirty = git(&["status", "--porcelain", "--untracked-files=normal"]).map(|s| s.lines().filter(|l| !l.is_empty()).count()).unwrap_or(0);
+    // Comparing the work tree with the index passes changed files through the repository's
+    // clean filters, commands its config names. Every filter driver it configures is switched
+    // off for that comparison (reading the config runs nothing). The overrides go through the
+    // environment, key and value apart: a driver name may hold `=`, which `-c key=value` would
+    // split at.
+    let keys = git(&["config", "--name-only", "-z", "--get-regexp", r"^filter\..*\.(clean|process)$"]).unwrap_or_default();
+    let neutral: Vec<String> = keys.split('\0').filter(|k| !k.is_empty()).map(str::to_string).collect();
+    let git_neutral = |args: &[&str]| -> Option<String> {
+        let mut cmd = git_in(dir);
+        cmd.env("GIT_CONFIG_COUNT", neutral.len().to_string());
+        for (i, key) in neutral.iter().enumerate() {
+            cmd.env(format!("GIT_CONFIG_KEY_{i}"), key).env(format!("GIT_CONFIG_VALUE_{i}"), "");
+        }
+        let out = cmd.args(args).output().ok()?;
+        out.status.success().then(|| String::from_utf8_lossy(&out.stdout).trim_end().to_string())
+    };
+    // A git older than 2.31 ignores GIT_CONFIG_COUNT. Then a driver still reads back with its
+    // command, and only the index is compared with HEAD (staged files), never the work tree.
+    let neutralized = neutral.iter().all(|k| git_neutral(&["config", "--get", k]).is_some_and(|v| v.is_empty()));
+    let worktree: &[&str] = if neutralized { &["diff-index", "--name-only", "HEAD", "--"] } else { &["diff-index", "--cached", "--name-only", "HEAD", "--"] };
+    let mut changed = std::collections::BTreeSet::new();
+    let tracked = git_neutral(worktree).or_else(|| git(&["ls-files", "--cached"]));
+    let untracked = git(&["ls-files", "--others", "--exclude-standard"]);
+    for list in [tracked, untracked].into_iter().flatten() {
+        changed.extend(list.lines().filter(|l| !l.is_empty()).map(str::to_string));
+    }
+    let dirty = changed.len();
     Some(WorkState { repo, branch, upstream, ahead, behind, local_only, dirty })
 }
 
@@ -353,6 +394,15 @@ mod tests {
     fn credentials_never_reach_the_id() {
         let id = normalize_remote("https://arif:supersecret@git.example.org/g/r.git").unwrap();
         assert!(!id.contains("supersecret") && !id.contains("arif"), "{id}");
+        for url in [
+            "https://git.example.org/g/r.git?private_token=supersecret",
+            "https://git.example.org/g/r?private_token=supersecret#main",
+            "https://git.example.org/g/r.git#supersecret",
+            "git@git.example.org:g/r.git?x=supersecret",
+        ] {
+            assert_eq!(normalize_remote(url).as_deref(), Some("git.example.org/g/r"), "{url}");
+        }
+        assert_eq!(normalize_remote("https://git.example.org?private_token=supersecret"), None);
     }
 
     #[test]
@@ -496,6 +546,78 @@ mod tests {
             assert_eq!(w.repo, "repo", "no normalizable remote: the folder name");
         }
         assert_eq!(work_state(&base), None, "outside a work tree");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // Its branch names are untrusted too: a ref named `refs/heads/--output=<file>` given to git
+    // by its short name is an option, and rev-list truncates that file.
+    #[test]
+    fn a_branch_named_like_an_option_is_counted_and_writes_nothing() {
+        let base = std::env::temp_dir().join(format!("dmrefopt-{}-{}", std::process::id(), crate::entry::now_ms()));
+        let repo = base.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let target = base.join("plan.txt");
+        std::fs::write(&target, "precious").unwrap();
+        let g = |args: &[&str]| Command::new("git").arg("-C").arg(&repo).args(args)
+            .env("GIT_AUTHOR_NAME", "t").env("GIT_AUTHOR_EMAIL", "t@t").env("GIT_COMMITTER_NAME", "t").env("GIT_COMMITTER_EMAIL", "t@t")
+            .output().map(|o| o.status.success()).unwrap_or(false);
+        let hostile = format!("refs/heads/--output={}", target.display());
+        let ok = g(&["init", "-q", "-b", "main"])
+            && g(&["commit", "-q", "--allow-empty", "-m", "one"])
+            && g(&["update-ref", &hostile, "HEAD"]);
+        if ok {
+            let w = work_state(&repo).expect("a work tree");
+            assert_eq!(std::fs::read_to_string(&target).unwrap(), "precious", "the branch name was taken as an option");
+            let name = hostile.strip_prefix("refs/heads/").unwrap().to_string();
+            assert_eq!(w.local_only, vec![(name, 1)], "still counted, under its own name");
+            assert_eq!(w.branch, "main");
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // The session start reads the state of whatever repository the agent opens, so its config
+    // is untrusted: neither a core.fsmonitor command nor a clean filter in it may run.
+    #[cfg(unix)]
+    #[test]
+    fn a_hostile_repository_config_runs_no_command() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("dmfsmon-{}-{}", std::process::id(), crate::entry::now_ms()));
+        let repo = base.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let script = |name: &str, body: &str| {
+            let p = base.join(name);
+            std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            p
+        };
+        let (fs_ran, filter_ran) = (base.join("fsmonitor-ran"), base.join("filter-ran"));
+        let fsmonitor = script("fsmonitor.sh", &format!("touch '{}'", fs_ran.display()));
+        let clean = script("clean.sh", &format!("touch '{}'; cat", filter_ran.display()));
+        let g = |args: &[&str]| Command::new("git").arg("-C").arg(&repo).args(args)
+            .env("GIT_AUTHOR_NAME", "t").env("GIT_AUTHOR_EMAIL", "t@t").env("GIT_COMMITTER_NAME", "t").env("GIT_COMMITTER_EMAIL", "t@t")
+            .output().map(|o| o.status.success()).unwrap_or(false);
+        // Two drivers: a plain name, and one with `=`, which a `-c key=value` override splits at.
+        std::fs::write(repo.join(".gitattributes"), "*.txt filter=evil\n*.md filter=x=y\n").unwrap();
+        std::fs::write(repo.join("tracked.txt"), "one\n").unwrap();
+        std::fs::write(repo.join("tracked.md"), "one\n").unwrap();
+        let ok = g(&["init", "-q", "-b", "main"])
+            && g(&["remote", "add", "origin", "git@h.example:team/repo.git"])
+            && g(&["add", "."])
+            && g(&["commit", "-q", "-m", "one"])
+            && g(&["config", "core.fsmonitor", fsmonitor.to_str().unwrap()])
+            && g(&["config", "filter.evil.clean", clean.to_str().unwrap()])
+            && g(&["config", "filter.x=y.clean", clean.to_str().unwrap()]);
+        if ok {
+            // changed files: a work-tree comparison would pass them through their filters
+            std::fs::write(repo.join("tracked.txt"), "two\n").unwrap();
+            std::fs::write(repo.join("tracked.md"), "two\n").unwrap();
+            std::fs::write(repo.join("new.txt"), "x").unwrap();
+            let w = work_state(&repo).expect("still a work tree");
+            assert_eq!(w.dirty, 3, "{w:?}");
+            assert!(file_context(&repo.join("new.txt"), None).is_some());
+            assert!(!fs_ran.exists(), "the repository's core.fsmonitor command ran");
+            assert!(!filter_ran.exists(), "the repository's clean filter ran");
+        }
         let _ = std::fs::remove_dir_all(&base);
     }
 

@@ -3,6 +3,28 @@
 Notable changes to dm-lite (`dmem`). Releases up to and including 0.3.6 are
 described on [GitHub Releases](https://github.com/wakbijok/dm-lite/releases).
 
+## 0.5.1 - 2026-11-10
+
+### Security
+
+- **A remote's query or fragment is no longer part of the project id.** An `origin` such as
+  `https://host/g/repo.git?private_token=...` put the token into the id, so into the
+  `project:` tag of every save and the `X-DM-Project` header. The id now ends before the first
+  `?` or `#`.
+- **A repository's config runs no command when dmem reads its state.** The session-start work
+  state ran `git status` in whatever repository the agent opened, and that repository's config
+  can name commands git runs on a read: `core.fsmonitor`, and the clean filter of any filter
+  driver, which git runs on a changed file to compare it with the index. dmem's git reads now
+  switch `core.fsmonitor` off and take no optional index lock (`GIT_OPTIONAL_LOCKS=0`). The
+  uncommitted-file count no longer uses `git status`: it switches off every filter driver the
+  repository configures before it compares the work tree. A git older than 2.31 cannot take
+  those overrides, so with such a git only staged files are counted.
+- **A branch name is never read as an option.** The work state counted each local branch by its
+  short name, so a branch named `--output=<file>` (made with `git update-ref
+  refs/heads/--output=<file>`) reached `git rev-list` as an option, and opening that repository
+  truncated the file. Since 0.5.0. Branches are now passed by their full `refs/heads/...` name,
+  which never starts with `-`.
+
 ## 0.5.0 - 2026-11-10
 
 ### Added
