@@ -480,7 +480,7 @@ pub(crate) fn handle(mem: &Memory, instructions: &Option<String>, req: &Value) -
 }
 
 pub fn serve() -> Result<()> {
-    let mem = Memory::open()?;
+    let mem = Memory::open_in_project()?;
     // Persona/protocols are stable for the process lifetime, so render the instructions field
     // once rather than paying a (possibly remote) persona round-trip on every initialize. If
     // persona is empty or the backing store is unreachable at startup, the field is omitted and

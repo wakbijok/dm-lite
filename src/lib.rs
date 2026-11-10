@@ -15,6 +15,7 @@ pub mod entry;
 pub mod fence;
 pub mod hooks;
 pub mod mcp;
+pub mod project;
 pub mod metrics;
 pub mod render;
 pub mod sqlite;

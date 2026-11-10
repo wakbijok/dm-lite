@@ -478,6 +478,8 @@ enum HookCmd {
     UserPromptSubmit { prompt: Vec<String> },
     /// SessionEnd: nudge to capture uncaptured decisions before the session ends.
     SessionEnd,
+    /// PreToolUse (edit tools): inject what memory holds about the file about to change.
+    PreToolUse,
 }
 
 fn main() {
@@ -525,24 +527,25 @@ fn run() -> Result<()> {
                 hooks::user_prompt_submit(arg, hermes, raw)
             }
             HookCmd::SessionEnd => hooks::session_end(raw),
+            HookCmd::PreToolUse => hooks::pre_tool_use(raw),
         },
         Cmd::LogDecision { title, context, decision, rationale, namespace } => {
-            let uri = Memory::open()?.log_decision(&title, &context, &decision, &rationale, &namespace)?;
+            let uri = Memory::open_in_project()?.log_decision(&title, &context, &decision, &rationale, &namespace)?;
             println!("stored {}", uri);
             Ok(())
         }
         Cmd::LogLesson { title, lesson, namespace } => {
-            let uri = Memory::open()?.log_lesson(&title, &lesson, &namespace)?;
+            let uri = Memory::open_in_project()?.log_lesson(&title, &lesson, &namespace)?;
             println!("stored {}", uri);
             Ok(())
         }
         Cmd::LogIncident { title, impact, resolution, namespace } => {
-            let uri = Memory::open()?.log_incident(&title, &impact, &resolution, &namespace)?;
+            let uri = Memory::open_in_project()?.log_incident(&title, &impact, &resolution, &namespace)?;
             println!("stored {}", uri);
             Ok(())
         }
         Cmd::Remember { text, namespace, valid_from, valid_to } => {
-            let uri = Memory::open()?.remember(&text, &namespace, valid_from, valid_to)?;
+            let uri = Memory::open_in_project()?.remember(&text, &namespace, valid_from, valid_to)?;
             println!("stored {}", uri);
             Ok(())
         }
@@ -557,7 +560,7 @@ fn run() -> Result<()> {
         }
         Cmd::Recall { query, limit, as_of, valid_at, expand, full } => {
             let q = query.join(" ");
-            let m = Memory::open()?;
+            let m = Memory::open_in_project()?;
             let graph = if as_of.is_some() || valid_at.is_some() {
                 let now = entry::now_ms();
                 let sys = as_of.unwrap_or(now);
@@ -711,17 +714,17 @@ fn run() -> Result<()> {
             Ok(())
         }
         Cmd::AddReminder { title, text, namespace } => {
-            let uri = Memory::open()?.add_reminder(&title, &text, &namespace)?;
+            let uri = Memory::open_in_project()?.add_reminder(&title, &text, &namespace)?;
             println!("stored {}", uri);
             Ok(())
         }
         Cmd::LogRunbook { title, steps, namespace } => {
-            let uri = Memory::open()?.log_runbook(&title, &steps, &namespace)?;
+            let uri = Memory::open_in_project()?.log_runbook(&title, &steps, &namespace)?;
             println!("stored {}", uri);
             Ok(())
         }
         Cmd::LogConvention { title, rule, namespace } => {
-            let uri = Memory::open()?.log_convention(&title, &rule, &namespace)?;
+            let uri = Memory::open_in_project()?.log_convention(&title, &rule, &namespace)?;
             println!("stored {}", uri);
             Ok(())
         }

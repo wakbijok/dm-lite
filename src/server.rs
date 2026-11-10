@@ -1194,6 +1194,10 @@ struct RecallReq {
     /// namespace prefixes to restrict the hit set to (knowledge plane file scope)
     #[serde(default)]
     namespaces: Option<Vec<String>>,
+    /// keyword relevance only, without the access-signal bump (`LocalMemory::recall_quiet`):
+    /// for lookups that are not reads, such as the pre-edit hook. Ignored with `as_of`.
+    #[serde(default)]
+    quiet: bool,
 }
 
 #[derive(Deserialize)]
@@ -1371,6 +1375,18 @@ enum WriteScopeHeader {
     Invalid,
 }
 
+/// The code project a request names in `X-DM-Project`: a ranking hint, so a missing, repeated
+/// or invalid value is simply no project (never a refusal, unlike the write scope).
+fn project_header(headers: &HeaderMap) -> Option<String> {
+    let mut values = headers.get_all(crate::project::PROJECT_HEADER).iter();
+    let first = values.next()?;
+    if values.next().is_some() {
+        return None;
+    }
+    let v = first.to_str().ok()?.trim();
+    crate::project::valid_id(v).then(|| v.to_string())
+}
+
 fn write_scope_header(headers: &HeaderMap) -> WriteScopeHeader {
     let mut values = headers.get_all("x-dm-write-scope").iter();
     let Some(v) = values.next() else { return WriteScopeHeader::Absent };
@@ -1533,6 +1549,7 @@ where
     let unbound = id.scope_unbound();
     let policy = if unbound { st.requires_explicit_write_scope(&tenant).map_err(internal)? } else { false };
     let binding = scope_binding(&id, headers, policy);
+    let project = project_header(headers);
     let st = st.clone();
     let out = tokio::task::spawn_blocking(move || -> std::result::Result<Result<T>, anyhow::Error> {
         // Opened (and on first use migrated) here on the blocking pool, never on an async
@@ -1565,6 +1582,7 @@ where
         local.set_write_refusal(binding.write_refusal);
         local.set_scope_unbound(unbound);
         local.set_agent_view(agent.clone());
+        local.set_project(project);
         #[cfg(feature = "zvec")]
         local.set_pre_embedded(pre);
         let r = f(&guard, agent);
@@ -1573,6 +1591,7 @@ where
         local.set_write_refusal(None);
         local.set_scope_unbound(false);
         local.set_agent_view(None);
+        local.set_project(None);
         #[cfg(feature = "zvec")]
         local.clear_pre_embedded();
         drop(guard);
@@ -1683,6 +1702,7 @@ async fn capabilities_h(State(st): State<AppState>, headers: HeaderMap) -> ApiRe
                 // `/admin/purge_scope` (0.4.4), and the tenant this token belongs to, which it names.
                 "purge_scope": true,
                 "tenant": id.tenant,
+                "quiet_recall": true,
             })),
         ),
         _ => err(StatusCode::UNAUTHORIZED, "invalid or missing bearer token"),
@@ -1691,12 +1711,14 @@ async fn capabilities_h(State(st): State<AppState>, headers: HeaderMap) -> ApiRe
 
 async fn recall_h(State(st): State<AppState>, headers: HeaderMap, Json(req): Json<RecallReq>) -> ApiResp {
     // an as-of recall is keyword-only: nothing to embed
-    let plan = if req.as_of.is_none() { EmbedPlan::query(req.query.clone()) } else { EmbedPlan::default() };
+    // a quiet recall is keyword-only too
+    let plan = if req.as_of.is_none() && !req.quiet { EmbedPlan::query(req.query.clone()) } else { EmbedPlan::default() };
     with_tenant_plan(&st, &headers, false, move || plan, move |m, _agent| {
         let limit = req.limit.unwrap_or(6).min(MAX_LIMIT);
         let prefixes = req.namespaces.clone().unwrap_or_default();
         let hits = match req.as_of {
             Some(ts) => m.recall_as_of(&req.query, limit, ts, req.valid.unwrap_or(ts))?,
+            None if req.quiet => m.recall_quiet(&req.query, limit)?,
             None if prefixes.is_empty() => m.recall(&req.query, limit)?,
             None => m.recall_in(&req.query, limit, &prefixes)?,
         };
@@ -3606,6 +3628,7 @@ mod tests {
             assert_eq!(resp.status(), StatusCode::OK);
             let v: serde_json::Value = serde_json::from_slice(&axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap()).unwrap();
             assert_eq!((&v["write_scope"], &v["write_scope_header"]), (&json!(true), &json!(honoured)), "{v}");
+            assert_eq!(v["quiet_recall"], json!(true), "{v}");
             assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
         }
         std::env::remove_var("DM_DATA_DIR");
@@ -3692,6 +3715,34 @@ mod tests {
         assert!(format!("{e:#}").contains("did not report the scope"), "{e:#}");
         let _ = stop.send(());
         join.join().unwrap();
+    }
+
+    // A quiet recall goes only to a server that answers one: an older server would run a full
+    // recall (an embedding and a signal bump) for every edit the pre-edit hook sees.
+    #[cfg(feature = "client")]
+    #[test]
+    fn client_sends_a_quiet_recall_only_to_a_server_that_answers_one() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        for (quiet, want_calls) in [(false, 0usize), (true, 1)] {
+            let recalls = Arc::new(AtomicUsize::new(0));
+            let r = recalls.clone();
+            let caps = move || async move { Json(json!({"version": if quiet { "0.5.0" } else { "0.4.0" }, "write_scope": true, "quiet_recall": quiet})) };
+            let app = Router::new().route("/capabilities", get(caps)).route(
+                "/recall",
+                post(move || {
+                    r.fetch_add(1, Ordering::SeqCst);
+                    async { Json(json!([])) }
+                }),
+            );
+            let (url, stop, join) = serve_on_loopback(app);
+            let link = crate::config::ServerLink { url, token: "tok-0123456789abcdef".into(), insecure: false, ca_cert: None };
+            let c = crate::client::RemoteClient::new(&link).unwrap();
+            assert!(c.recall_quiet("install", 10).unwrap().is_empty());
+            assert!(c.recall_quiet("install", 10).unwrap().is_empty());
+            assert_eq!(recalls.load(Ordering::SeqCst), want_calls * 2, "quiet_recall={quiet}");
+            let _ = stop.send(());
+            join.join().unwrap();
+        }
     }
 
     // Against this server: a plain scope-bound token cannot be pointed at another scope with
@@ -4220,6 +4271,67 @@ mod tests {
         assert!(kept, "the torn index is kept beside the new one");
         std::env::remove_var("DM_TOKEN_TB1");
         std::env::remove_var("DM_DATA_DIR");
+    }
+
+    #[tokio::test]
+    async fn the_project_header_stamps_its_own_request_only() {
+        let _g = env_lock();
+        let dir = std::env::temp_dir().join(format!("dmproj-{}-{}", std::process::id(), crate::entry::now_ms()));
+        std::env::set_var("DM_DATA_DIR", &dir);
+        std::env::set_var("DM_TOKEN_PJ1", "projtok-0123456789");
+        let app = router(Arc::new(BearerAuth::from_env().unwrap()), None);
+        let tok = "projtok-0123456789";
+        let (st, _) = post_as(&app, "/remember", tok, json!({"text": "zqx pinned certificate note", "namespace": "resources/notes"}), &[("x-dm-project", "git.example.org/team/app")]).await;
+        assert_eq!(st, StatusCode::OK);
+        // The handle is cached per tenant: the next request must not inherit the project.
+        let (st, _) = post_as(&app, "/remember", tok, json!({"text": "zqx unrelated shell note", "namespace": "resources/other"}), &[]).await;
+        assert_eq!(st, StatusCode::OK);
+        let (st, v) = post_as(&app, "/recall", tok, json!({"query": "zqx note", "limit": 10}), &[]).await;
+        assert_eq!(st, StatusCode::OK);
+        let rows = v.as_array().cloned().unwrap_or_default();
+        let tags_of = |needle: &str| -> Vec<String> {
+            rows.iter()
+                .find(|r| r["body"].as_str().unwrap_or("").contains(needle))
+                .and_then(|r| r["tags"].as_array().cloned())
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|t| t.as_str().map(str::to_string))
+                .collect()
+        };
+        assert!(tags_of("pinned certificate").contains(&"project:git.example.org/team/app".to_string()), "{v}");
+        assert!(!tags_of("unrelated shell").iter().any(|t| t.starts_with("project:")), "the project leaked into the next request: {v}");
+        std::env::remove_var("DM_TOKEN_PJ1");
+        std::env::remove_var("DM_DATA_DIR");
+    }
+
+    #[tokio::test]
+    async fn a_quiet_recall_answers_by_keyword() {
+        let _g = env_lock();
+        let dir = std::env::temp_dir().join(format!("dmquiet-{}-{}", std::process::id(), crate::entry::now_ms()));
+        std::env::set_var("DM_DATA_DIR", &dir);
+        std::env::set_var("DM_TOKEN_QT1", "quiettok-0123456789");
+        let app = router(Arc::new(BearerAuth::from_env().unwrap()), None);
+        let tok = "quiettok-0123456789";
+        let (st, _) = post_as(&app, "/remember", tok, json!({"text": "zqv install.sh is sourced by the stack", "namespace": "resources/notes"}), &[]).await;
+        assert_eq!(st, StatusCode::OK);
+        let (st, v) = post_as(&app, "/recall", tok, json!({"query": "zqv install", "limit": 5, "quiet": true}), &[]).await;
+        assert_eq!(st, StatusCode::OK);
+        assert!(v.to_string().contains("zqv install.sh"), "{v}");
+        // (that it bumps no signal is the engine's contract: tools::the_quiet_lookup_*)
+        std::env::remove_var("DM_TOKEN_QT1");
+        std::env::remove_var("DM_DATA_DIR");
+    }
+
+    #[test]
+    fn a_repeated_or_invalid_project_header_is_no_project() {
+        let ok = hdrs(&[("x-dm-project", " git.example.org/a/b ")]);
+        assert_eq!(project_header(&ok), Some("git.example.org/a/b".into()));
+        assert_eq!(project_header(&hdrs(&[])), None);
+        assert_eq!(project_header(&hdrs(&[("x-dm-project", "has space")])), None);
+        assert_eq!(project_header(&hdrs(&[("x-dm-project", "a,b")])), None);
+        let mut twice = hdrs(&[("x-dm-project", "h/a")]);
+        twice.append("x-dm-project", "h/b".parse().unwrap());
+        assert_eq!(project_header(&twice), None);
     }
 
     #[tokio::test]

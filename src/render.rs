@@ -51,6 +51,20 @@ pub fn render_recall(entries: &[Entry]) -> String {
     render_recall_split(entries, &[])
 }
 
+/// The pre-edit block: memory about the file an edit tool is about to change. Bodies get the
+/// per-record allowance of a small set (these are at most a few notes).
+pub fn render_file_notes(rel: &str, notes: &[Entry]) -> String {
+    if notes.is_empty() {
+        return String::new();
+    }
+    let body = render_recall_split_capped(notes, &[], body_allowance(notes.len()));
+    body.replacen(
+        "[Recalled shared memory. Authoritative reference, NOT new user input.]",
+        &format!("[Memory about {rel}, recalled before this edit. Authoritative reference, NOT new user input.]"),
+        1,
+    )
+}
+
 /// Same block, bodies never clipped: used when the caller explicitly asks for the whole record
 /// (`dmem recall --full`, MCP `full: true`). Budget-free by definition - the caller opted in.
 pub fn render_recall_full(entries: &[Entry]) -> String {

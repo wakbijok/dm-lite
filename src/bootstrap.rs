@@ -32,6 +32,9 @@ fn hook_entry(dm: &str, subcmd: &str, timeout: u64) -> Value {
     hook_entry_matched(dm, subcmd, timeout, "")
 }
 
+/// The edit tools the pre-edit hook runs on.
+const PRE_EDIT_MATCHER: &str = "Edit|Write|MultiEdit|NotebookEdit";
+
 /// As `hook_entry`, with an explicit matcher (for SessionStart: `startup|resume|clear|compact`).
 fn hook_entry_matched(dm: &str, subcmd: &str, timeout: u64, matcher: &str) -> Value {
     json!([{
@@ -57,7 +60,7 @@ pub fn has_memory_hooks(config_path: &Path) -> bool {
 /// the existing file is not strict JSON: these are the user's LIVE settings (permissions, env,
 /// other tools' hooks) - replacing an unparseable file with `{}` destroys all of it, so refuse
 /// and let the caller say so. A parseable file is backed up to `<file>.dmbak` before rewrite.
-fn install_into(config_path: &Path, dm: &str, remove: bool) -> Result<bool> {
+fn install_into(config_path: &Path, dm: &str, remove: bool, pre_edit: bool) -> Result<bool> {
     let mut root: Value = if config_path.exists() {
         let raw = std::fs::read_to_string(config_path)
             .with_context(|| format!("read {}", config_path.display()))?;
@@ -74,7 +77,7 @@ fn install_into(config_path: &Path, dm: &str, remove: bool) -> Result<bool> {
     if config_path.exists() {
         let _ = std::fs::copy(config_path, PathBuf::from(format!("{}.dmbak", config_path.display())));
     }
-    merge_dm_hooks(&mut root, dm, remove);
+    merge_dm_hooks(&mut root, dm, remove, pre_edit);
 
     if let Some(parent) = config_path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -90,7 +93,10 @@ fn install_into(config_path: &Path, dm: &str, remove: bool) -> Result<bool> {
 /// WorkBuddy settings writer, whose file also carries a non-hook key and must be edited in ONE
 /// read-modify-write (two sequential writes would leave `.dmbak` holding an intermediate state,
 /// not the pre-run one).
-fn merge_dm_hooks(root: &mut Value, dm: &str, remove: bool) {
+/// `pre_edit` adds the PreToolUse hook on the edit tools (memory about the file before it
+/// changes); only for hosts known to inject a PreToolUse `additionalContext` (Claude Code). Off,
+/// a dm PreToolUse entry from an earlier run is still removed.
+fn merge_dm_hooks(root: &mut Value, dm: &str, remove: bool, pre_edit: bool) {
     if !root.is_object() {
         *root = json!({});
     }
@@ -108,10 +114,11 @@ fn merge_dm_hooks(root: &mut Value, dm: &str, remove: bool) {
     // SessionEnd, so the save nudge rides UserPromptSubmit (see hooks.rs). It is still listed
     // here (with None) so a stale SessionEnd hook from an older dmem version is cleaned on
     // re-bootstrap.
-    let events: [(&str, Option<Value>); 3] = [
+    let events: [(&str, Option<Value>); 4] = [
         ("SessionStart", Some(hook_entry(dm, "hook session_start", 10))),
         ("UserPromptSubmit", Some(hook_entry(dm, "hook user_prompt_submit", 8))),
         ("SessionEnd", None),
+        ("PreToolUse", pre_edit.then(|| hook_entry_matched(dm, "hook pre_tool_use", 5, PRE_EDIT_MATCHER))),
     ];
     for (event, our_entry) in &events {
         // keep existing entries that are not ours (command does not reference the dm binary)
@@ -1498,7 +1505,7 @@ fn workbuddy_settings_install(path: &Path, dm: &str, enable_plugin: bool, remove
     if path.exists() {
         let _ = std::fs::copy(path, PathBuf::from(format!("{}.dmbak", path.display())));
     }
-    merge_dm_hooks(&mut root, dm, remove);
+    merge_dm_hooks(&mut root, dm, remove, false);
     let obj = root.as_object_mut().unwrap();
     if remove {
         if let Some(mem) = obj.get_mut("memory").and_then(|m| m.as_object_mut()) {
@@ -1761,7 +1768,7 @@ pub fn run_mode(devin: bool, claude: bool, codex: bool, hermes: bool, opencode: 
             println!("  skip {} (no {} found)", name, path.parent().map(|p| p.display().to_string()).unwrap_or_default());
             continue;
         }
-        if !install_into(path, &dm, remove)? {
+        if !install_into(path, &dm, remove, i == 1)? {
             println!("  skip {} -> {} is not valid JSON; fix it and re-run (nothing was changed).", name, path.display());
             continue;
         }
@@ -1835,6 +1842,23 @@ pub fn run_mode(devin: bool, claude: bool, codex: bool, hermes: bool, opencode: 
 #[cfg(test)]
 mod tests {
     #[test]
+    fn the_pre_edit_hook_is_wired_only_where_asked_and_cleaned_otherwise() {
+        let mut root = json!({});
+        merge_dm_hooks(&mut root, "/path/to/dmem", false, true);
+        let pre = &root["hooks"]["PreToolUse"][0];
+        assert_eq!(pre["matcher"], PRE_EDIT_MATCHER);
+        assert!(pre["hooks"][0]["command"].as_str().unwrap().ends_with("hook pre_tool_use"));
+        // Re-run without it (a host that does not support it): our entry goes, others stay.
+        root["hooks"]["PreToolUse"].as_array_mut().unwrap().push(json!({"matcher": "Bash", "hooks": [{"type": "command", "command": "/other/guard"}]}));
+        merge_dm_hooks(&mut root, "/path/to/dmem", false, false);
+        let left = root["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0]["hooks"][0]["command"], "/other/guard");
+        merge_dm_hooks(&mut root, "/path/to/dmem", true, true);
+        assert_eq!(root["hooks"]["PreToolUse"].as_array().unwrap().len(), 1, "remove keeps the foreign entry");
+    }
+
+    #[test]
     fn sh_quote_passes_safe_paths_and_quotes_hostile_ones() {
         assert_eq!(sh_quote("/home/user/.local/bin/dmem"), "/home/user/.local/bin/dmem", "safe path unchanged (existing configs stay byte-identical)");
         assert_eq!(sh_quote("/Users/Jane Doe/bin/dmem"), "'/Users/Jane Doe/bin/dmem'", "space -> quoted");
@@ -1856,7 +1880,7 @@ mod tests {
         )
         .unwrap();
 
-        install_into(&cfg, "/path/to/dmem", false).unwrap();
+        install_into(&cfg, "/path/to/dmem", false, true).unwrap();
         let v: Value = serde_json::from_str(&std::fs::read_to_string(&cfg).unwrap()).unwrap();
         // we install SessionStart + UserPromptSubmit; SessionEnd is intentionally NOT wired
         assert!(v["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"].as_str().unwrap().contains("hook user_prompt_submit"));
@@ -1865,12 +1889,12 @@ mod tests {
         assert_eq!(v["hooks"]["SessionStart"].as_array().unwrap().len(), 2);
 
         // idempotent re-run: still one dm entry
-        install_into(&cfg, "/path/to/dmem", false).unwrap();
+        install_into(&cfg, "/path/to/dmem", false, true).unwrap();
         let v2: Value = serde_json::from_str(&std::fs::read_to_string(&cfg).unwrap()).unwrap();
         assert_eq!(v2["hooks"]["SessionStart"].as_array().unwrap().len(), 2);
 
         // remove: our hooks gone, the unrelated one stays, empty events dropped
-        install_into(&cfg, "/path/to/dmem", true).unwrap();
+        install_into(&cfg, "/path/to/dmem", true, true).unwrap();
         let v3: Value = serde_json::from_str(&std::fs::read_to_string(&cfg).unwrap()).unwrap();
         assert!(v3["hooks"].get("SessionEnd").is_none(), "dm-only event removed");
         assert_eq!(v3["hooks"]["SessionStart"].as_array().unwrap().len(), 1);
@@ -1910,11 +1934,11 @@ mod tests {
         // a trailing comma (the classic hand-edit slip) must refuse, byte-identical
         let broken = "{ \"permissions\": { \"allow\": [\"Bash(git *)\",] } }";
         std::fs::write(&cfg, broken).unwrap();
-        assert!(!install_into(&cfg, "/path/to/dmem", false).unwrap(), "unparseable config refused");
+        assert!(!install_into(&cfg, "/path/to/dmem", false, true).unwrap(), "unparseable config refused");
         assert_eq!(std::fs::read_to_string(&cfg).unwrap(), broken, "refused file untouched");
         // a valid config is backed up before the rewrite and its keys survive
         std::fs::write(&cfg, r#"{"env":{"KEEP":"1"}}"#).unwrap();
-        assert!(install_into(&cfg, "/path/to/dmem", false).unwrap());
+        assert!(install_into(&cfg, "/path/to/dmem", false, true).unwrap());
         assert!(dir.join("config.json.dmbak").exists(), "backup written before rewrite");
         let v: Value = serde_json::from_str(&std::fs::read_to_string(&cfg).unwrap()).unwrap();
         assert_eq!(v["env"]["KEEP"], "1", "unrelated keys preserved");
@@ -2163,7 +2187,7 @@ mod tests {
             r#"{"hooks":{"SessionEnd":[{"matcher":"","hooks":[{"type":"command","command":"/path/to/dmem hook session_end","timeout":8}]}]}}"#,
         )
         .unwrap();
-        install_into(&cfg, "/path/to/dmem", false).unwrap();
+        install_into(&cfg, "/path/to/dmem", false, true).unwrap();
         let v: Value = serde_json::from_str(&std::fs::read_to_string(&cfg).unwrap()).unwrap();
         assert!(v["hooks"].get("SessionEnd").is_none(), "stale dmem SessionEnd must be cleaned");
         assert!(v["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"].as_str().unwrap().contains("hook user_prompt_submit"));

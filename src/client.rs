@@ -22,6 +22,12 @@ pub struct RemoteClient {
     /// Whether the server honours `write_scope` for this token, asked once before the first
     /// write that carries it (`GET /capabilities`); Err holds why not.
     scope_probe: std::sync::OnceLock<std::result::Result<(), String>>,
+    /// Sent as `X-DM-Project` on every request when set: the code project this invocation
+    /// works in (`project::detect`). A ranking hint for the server; an older server ignores it.
+    project: Option<String>,
+    /// Whether the server answers `quiet` recalls (`quiet_recall` in `GET /capabilities`, 0.5.0
+    /// on), asked once.
+    quiet_probe: std::sync::OnceLock<bool>,
 }
 
 /// A server older than 0.3.7 ignores `X-DM-Write-Scope` from a full-tenant token, so a scoped
@@ -89,6 +95,8 @@ impl RemoteClient {
             http,
             write_scope: None,
             scope_probe: std::sync::OnceLock::new(),
+            project: None,
+            quiet_probe: std::sync::OnceLock::new(),
         })
     }
 
@@ -111,11 +119,22 @@ impl RemoteClient {
         Ok(self)
     }
 
+    pub fn set_project(&mut self, project: Option<String>) {
+        self.project = project.filter(|p| crate::project::valid_id(p));
+    }
+
+    pub fn project(&self) -> Option<&str> {
+        self.project.as_deref()
+    }
+
     /// POST and return the status and body text, whatever the status.
     fn send_post(&self, path: &str, body: &Value) -> Result<(reqwest::StatusCode, String)> {
         let mut req = self.http.post(format!("{}{}", self.base, path)).bearer_auth(&self.token);
         if let Some(ws) = &self.write_scope {
             req = req.header("x-dm-write-scope", ws.as_str());
+        }
+        if let Some(p) = &self.project {
+            req = req.header(crate::project::PROJECT_HEADER, p.as_str());
         }
         let resp = req
             .json(body)
@@ -305,6 +324,23 @@ impl RemoteClient {
 
     pub fn recall(&self, query: &str, limit: usize) -> Result<Vec<Entry>> {
         self.list("/recall", json!({ "query": query, "limit": limit }))
+    }
+    /// A quiet recall, only from a server that answers one: an older server ignores the flag
+    /// and runs a full recall (an embedding, and a signal bump), which a lookup on every edit
+    /// must not cost. Against such a server this returns nothing.
+    pub fn recall_quiet(&self, query: &str, limit: usize) -> Result<Vec<Entry>> {
+        if !*self.quiet_probe.get_or_init(|| self.probe_quiet()) {
+            return Ok(Vec::new());
+        }
+        self.list("/recall", json!({ "query": query, "limit": limit, "quiet": true }))
+    }
+
+    fn probe_quiet(&self) -> bool {
+        let Ok(resp) = self.http.get(format!("{}/capabilities", self.base)).bearer_auth(&self.token).send() else {
+            return false;
+        };
+        resp.status().is_success()
+            && resp.json::<Value>().ok().and_then(|v| v.get("quiet_recall").and_then(|x| x.as_bool())) == Some(true)
     }
     pub fn recall_as_of(&self, query: &str, limit: usize, as_of_ms: i64, valid_ms: i64) -> Result<Vec<Entry>> {
         // Carry BOTH bitemporal axes over the wire so remote as-of matches local (the server

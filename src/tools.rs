@@ -47,6 +47,11 @@ pub struct LocalMemory {
     /// hide other agents' `agents/<b>/...` trees, writes into another agent's tree are
     /// rejected, and mutations require a visible target. None = agent-less (full legacy).
     agent_view: Option<String>,
+    /// The code project this request works in (`project::detect`): stamped on every save as a
+    /// `project:<id>` tag and given a bounded recall boost. A ranking hint, never an access
+    /// rule. Local mode: from the working directory; server mode: per request from the
+    /// client's `X-DM-Project` header, reset after it. None = no project (exactly as before).
+    project: Option<String>,
     /// Why this request has no write scope, when the reason is not simply a read-only token
     /// (server mode, per request): the tenant requires an explicit write scope the request did
     /// not name (`EXPLICIT_WRITE_SCOPE_REQUIRED`), or an adapter asserted a write scope its
@@ -1044,6 +1049,7 @@ impl LocalMemory {
                 store,
                 write_scope,
                 agent_view: None,
+                project: None,
                 write_refusal: None,
                 scope_unbound: false,
                 vindex,
@@ -1057,7 +1063,7 @@ impl LocalMemory {
             if config::require_vectors() {
                 return Err(VectorIndexRequired("this dmem build has no vector index (keyword-only)".into()).into());
             }
-            Self { store, write_scope, agent_view: None, write_refusal: None, scope_unbound: false }
+            Self { store, write_scope, agent_view: None, project: None, write_refusal: None, scope_unbound: false }
         };
         Ok(m)
     }
@@ -1097,6 +1103,16 @@ impl LocalMemory {
     pub fn set_agent_view(&mut self, agent: Option<String>) {
         self.agent_view = agent.clone();
         self.store.set_agent_view(agent);
+    }
+
+    /// Bind this handle to the code project its caller works in (see the `project` field).
+    /// An id `project::valid_id` refuses is treated as no project.
+    pub fn set_project(&mut self, project: Option<String>) {
+        self.project = project.filter(|p| crate::project::valid_id(p));
+    }
+
+    pub fn project(&self) -> Option<&str> {
+        self.project.as_deref()
     }
 
     /// Hand this request's pre-computed embeddings to the engine (server mode, per request,
@@ -1343,6 +1359,7 @@ impl LocalMemory {
         // another agent's agents/<b>/... namespace - attribution is a tag, this is the authz.
         self.guard_agent_namespace(namespace)?;
         stamp_author(&mut tags, author);
+        crate::project::stamp(&mut tags, self.project.as_deref());
         let uri = make_uri(namespace, kind, title);
         let mut e = Entry::new_now(
             uri.clone(),
@@ -1644,7 +1661,7 @@ impl LocalMemory {
                 continue;
             }
             let (ac, la) = sigs.get(&signal_key(&e.uri, &e.scope)).copied().unwrap_or((0, 0));
-            let s = rrf * signal_boost(e.importance, ac, la, now);
+            let s = rrf * signal_boost(e.importance, ac, la, now) * crate::project::boost(&e.tags, self.project.as_deref());
             scored.push((e, s));
         }
         scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -1740,7 +1757,8 @@ impl LocalMemory {
     }
 
     /// Re-rank keyword hits by their FTS order (base = 1/(1+rank)), gently nudged by the
-    /// runtime-signal multiplier (<=1.25x). The base dominates at the top, so a clearly
+    /// runtime-signal multiplier (<=1.25x) and the current-project multiplier
+    /// (`project::BOOST`). The base dominates at the top, so a clearly
     /// higher-ranked hit is not displaced; adjacent items at deeper ranks may reorder.
     fn rescore_keyword(&self, hits: Vec<Entry>, limit: usize) -> Vec<Entry> {
         let now = now_ms();
@@ -1752,12 +1770,20 @@ impl LocalMemory {
             .map(|(i, e)| {
                 let base = 1.0 / (1.0 + i as f64);
                 let (ac, la) = sigs.get(&signal_key(&e.uri, &e.scope)).copied().unwrap_or((0, 0));
-                let s = base * signal_boost(e.importance, ac, la, now);
+                let s = base * signal_boost(e.importance, ac, la, now) * crate::project::boost(&e.tags, self.project.as_deref());
                 (e, s)
             })
             .collect();
         scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         one_per_uri(scored, self.write_scope.as_deref()).into_iter().take(limit).collect()
+    }
+
+    /// Keyword recall by FTS relevance over the current slice, with the reader's visibility
+    /// gates, and nothing else: no vector channel, no relevance floor, no rescoring and no
+    /// access-signal bump. For lookups that are not reads (the pre-edit hook asks about every
+    /// file an agent changes), so they neither inflate the signals nor pay for an embedding.
+    pub fn recall_quiet(&self, query: &str, limit: usize) -> Result<Vec<Entry>> {
+        Ok(self.store.recall_scored(query, limit)?.into_iter().map(|(e, _)| e).collect())
     }
 
     /// Best-effort: bump the access signals for the recalled set in one transaction.
@@ -2158,6 +2184,7 @@ impl LocalMemory {
                 store,
                 write_scope: Some(String::new()),
                 agent_view: None,
+                project: None,
                 write_refusal: None,
                 scope_unbound: false,
                 vindex: None,
@@ -2168,7 +2195,7 @@ impl LocalMemory {
         }
         #[cfg(not(feature = "zvec"))]
         {
-            Self { store, write_scope: Some(String::new()), agent_view: None, write_refusal: None, scope_unbound: false }
+            Self { store, write_scope: Some(String::new()), agent_view: None, project: None, write_refusal: None, scope_unbound: false }
         }
     }
 
@@ -2203,6 +2230,33 @@ impl Memory {
             return Ok(Memory::Remote(client));
         }
         Ok(Memory::Local(LocalMemory::open()?))
+    }
+
+    /// `open`, bound to the code project of the working directory (`project::detect_cwd`):
+    /// what the MCP server, the hooks and the CLI's save and recall commands use, so their
+    /// saves are stamped with the project and their recall ranks it first.
+    pub fn open_in_project() -> Result<Self> {
+        let mut m = Self::open()?;
+        m.set_project(crate::project::detect_cwd());
+        Ok(m)
+    }
+
+    /// Bind the project this handle's saves and recalls carry (see `LocalMemory::set_project`;
+    /// a remote client sends it as `X-DM-Project`).
+    pub fn set_project(&mut self, project: Option<String>) {
+        match self {
+            Memory::Local(l) => l.set_project(project),
+            #[cfg(feature = "client")]
+            Memory::Remote(r) => r.set_project(project),
+        }
+    }
+
+    pub fn project(&self) -> Option<&str> {
+        match self {
+            Memory::Local(l) => l.project(),
+            #[cfg(feature = "client")]
+            Memory::Remote(r) => r.project(),
+        }
     }
 
     /// Open a specific LOCAL tenant (the server is always local-backed; never remote).
@@ -2419,6 +2473,15 @@ impl Memory {
             Memory::Local(l) => l.recall_expanded_split(query, limit, depth),
             #[cfg(feature = "client")]
             Memory::Remote(r) => r.recall_expanded_split(query, limit, depth),
+        }
+    }
+    /// See `LocalMemory::recall_quiet`. A remote client asks with `quiet: true`; a server older
+    /// than 0.5.0 ignores the flag and answers a normal recall (which bumps signals).
+    pub fn recall_quiet(&self, query: &str, limit: usize) -> Result<Vec<Entry>> {
+        match self {
+            Memory::Local(l) => l.recall_quiet(query, limit),
+            #[cfg(feature = "client")]
+            Memory::Remote(r) => r.recall_quiet(query, limit),
         }
     }
     pub fn recall_expanded_graph(&self, query: &str, limit: usize, depth: usize) -> Result<RecallGraph> {
@@ -2984,6 +3047,75 @@ mod tests {
         let m = LocalMemory::for_test(tmp_store());
         assert!(open_vector_index(&m.store, &vdir, &*m.embedder, false, true).unwrap().is_some());
         assert!(!backfill_marker(&vdir).exists());
+    }
+
+    #[test]
+    fn a_save_in_a_project_is_stamped_and_one_outside_is_not() {
+        let mut m = LocalMemory::for_test(tmp_store());
+        m.set_project(Some("git.example.org/team/app".into()));
+        let uri = m.remember("the deploy script must not be edited while it runs", "resources/notes", None, None, None).unwrap();
+        let e = m.store.get(&uri).unwrap().unwrap();
+        assert!(e.tags.contains(&"project:git.example.org/team/app".to_string()), "{:?}", e.tags);
+        m.set_project(None);
+        let other = m.remember("a note written outside any repository", "resources/notes", None, None, None).unwrap();
+        let e = m.store.get(&other).unwrap().unwrap();
+        assert!(!e.tags.iter().any(|t| t.starts_with("project:")), "no project, no tag: {:?}", e.tags);
+        m.set_project(Some("has space".into()));
+        assert_eq!(m.project(), None, "an invalid id is no project");
+    }
+
+    #[test]
+    fn typed_saves_carry_the_project_too() {
+        let mut m = LocalMemory::for_test(tmp_store());
+        m.set_project(Some("h/team/app".into()));
+        let uri = m.log_decision("Use tabs in the signed comment", "ctx", "tab", "upgrade splits on tabs", "dm/conv", None).unwrap();
+        let e = m.store.get(&uri).unwrap().unwrap();
+        assert!(e.tags.contains(&"decision".to_string()) && e.tags.contains(&"project:h/team/app".to_string()), "{:?}", e.tags);
+    }
+
+    #[test]
+    fn the_quiet_lookup_finds_the_file_in_a_busy_store_and_bumps_nothing() {
+        // The live-store failure: 60 important records sharing the generic terms crowded out
+        // the one record naming the file when the lookup ordered by importance.
+        let m = LocalMemory::for_test(tmp_store());
+        for i in 0..60 {
+            m.import_record(Kind::Protocol, "agent/protocol", &format!("dm-lite protocol rule {i}"), "dm-lite lite docs rule every agent follows").unwrap();
+        }
+        let target = m
+            .remember("dm-lite: docs/releasing.md now names the maintainer generically", "resources/dm-lite", None, None, None)
+            .unwrap();
+        let ctx = crate::project::FileContext { project: Some("h/daimon/dm-lite".into()), repo_name: Some("dm-lite".into()), rel: "docs/releasing.md".into() };
+        let hits = m.recall_quiet(&crate::project::file_query(&ctx), 40).unwrap();
+        let picked: Vec<&Entry> = hits
+            .iter()
+            .filter(|e| {
+                let text = format!("{}\n{}\n{}", e.title, e.body, e.tags.join(" "));
+                crate::project::belongs(&e.tags, &text, &ctx) && crate::project::mentions_file(&text, &ctx.rel)
+            })
+            .collect();
+        assert_eq!(picked.iter().map(|e| e.uri.as_str()).collect::<Vec<_>>(), vec![target.as_str()]);
+        let keys: Vec<String> = hits.iter().map(|e| signal_key(&e.uri, &e.scope)).collect();
+        let sigs = m.store.read_signals(&keys).unwrap();
+        assert!(sigs.values().all(|(count, _)| *count == 0), "a quiet lookup bumps no access signal: {sigs:?}");
+    }
+
+    #[cfg(feature = "zvec")]
+    #[test]
+    fn hybrid_recall_puts_the_current_projects_record_first_and_still_returns_the_other() {
+        let text = "release checklist: sign the archive and verify it before upload";
+        for (first, second) in [("h/team/one", "h/team/two"), ("h/team/two", "h/team/one")] {
+            let mut m = LocalMemory::for_test_vec(tmp_store(), &tmp_vdir());
+            m.set_project(Some(first.into()));
+            m.remember(text, "resources/a", None, None, None).unwrap();
+            m.set_project(Some(second.into()));
+            m.remember(text, "resources/b", None, None, None).unwrap();
+            for want in [first, second] {
+                m.set_project(Some(want.into()));
+                let hits = m.recall("release checklist sign verify archive", 6).unwrap();
+                assert_eq!(hits.len(), 2, "the other project's record still comes through");
+                assert!(hits[0].tags.contains(&format!("project:{want}")), "{want} first: {:?}", hits.iter().map(|h| &h.tags).collect::<Vec<_>>());
+            }
+        }
     }
 
     #[cfg(feature = "zvec")]

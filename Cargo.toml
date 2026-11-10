@@ -1,6 +1,6 @@
 [package]
 name = "dm-lite"
-version = "0.4.4"
+version = "0.5.0"
 edition = "2021"
 authors = ["Muhammad Arif (wakbijok)"]
 description = "Memory for Hermes, Codex, Claude Code, OpenCode, Devin, and any MCP agent. daimon-memory v2: one-binary typed memory engine with hybrid recall"
@@ -42,7 +42,7 @@ client = ["dep:reqwest", "dep:rustls"]
 dist = ["zvec", "candle", "server", "wizard", "self-update", "client", "ui"]
 
 [dependencies]
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

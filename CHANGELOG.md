@@ -3,6 +3,65 @@
 Notable changes to dm-lite (`dmem`). Releases up to and including 0.3.6 are
 described on [GitHub Releases](https://github.com/wakbijok/dm-lite/releases).
 
+## 0.5.0 - 2026-11-10
+
+### Added
+
+- **Project-aware memory.** dmem now knows which code project a session works in: the git
+  `origin` remote of its working directory, normalized to `host/path` (credentials, port and
+  `.git` dropped, lowercased), so every checkout of a repository on every machine names the same
+  project. A directory without a git remote has no project.
+  - Saves from the MCP server, the hooks and the CLI's save commands are stamped with a
+    `project:<host/path>` tag. Bulk imports (`dmem migrate`) and entities are not.
+  - Recall from the same places gives the current project's records a bounded boost (x1.2):
+    they come first among hits of the same match strength, and other projects' and untagged
+    records still come through.
+  - The hooks take the project from the event's `cwd`; the MCP server and the CLI from their
+    own working directory.
+  - A remote client sends the project as `X-DM-Project`; the server binds it for that request
+    only. An older server ignores the header; an invalid or repeated one is no project.
+  - The project is a ranking hint, never an access rule: scope remains the only partition.
+  - `DM_PROJECT=off` turns it off; `DM_PROJECT=<id>` names the project outright.
+- **Memory before an edit (Claude Code).** `dmem bootstrap --claude` adds a `PreToolUse` hook on
+  Edit, Write, MultiEdit and NotebookEdit (`dmem hook pre_tool_use`). Before a file changes, it
+  injects up to 3 records of that file's project that name its path, or a folder of it that is
+  not generic (`deploy/` counts, `src/` does not). A record saved before project awareness counts
+  when it names the repository.
+  - Each record is shown once per session.
+  - Nothing to say means no output.
+  - It never approves or denies the edit.
+  - The lookup is keyword-only and does not bump the access signals, because an edit is not a read.
+    It uses the new `quiet` recall (`POST /recall` with `"quiet": true`): FTS relevance with
+    the reader's visibility, and no vectors, floor, rescoring or signal bump. The server
+    advertises it as `quiet_recall` in `GET /capabilities`, and a client sends a quiet recall
+    only to a server that does: against an older server, which would run a full recall, the
+    pre-edit hook stays silent.
+  - Devin and WorkBuddy do not get the hook; a dm entry left there by an earlier run is removed.
+- **A work-state line at session start.** Inside a git repository, the SessionStart block ends
+  with one line from local git (no fetch). It names:
+  - the branch;
+  - commits not pushed to its upstream (or on no remote, without one);
+  - commits behind as of the last fetch;
+  - other local branches with commits no remote has;
+  - uncommitted files.
+
+  A development checkout can be lost, and the remote is the copy. `DM_PROJECT=off` drops the
+  line.
+
+### Fixed
+
+- **A hook run by hand no longer waits for input.** The hooks read the host's event from
+  stdin; started from a terminal, they now skip that instead of waiting for end of input.
+
+### Security
+
+- **SQLite 3.54.1** (rusqlite 0.41, libsqlite3-sys 0.39.1), for CVE-2026-119375
+  (RUSTSEC-2026-0459). SQLite before 3.54.0 could return uninitialized page-cache memory when
+  it opened a database together with a `-wal` file of another page size, so a crafted pair of
+  files could make queries return stale bytes from the process's memory. dmem keeps its data
+  directory owner-only, so only a party that can already write there could plant such a pair.
+  No code changed.
+
 ## 0.4.4 - 2026-11-04
 
 Erasure at rest. Until now nothing was erased from disk: `forget` retracts a record but keeps

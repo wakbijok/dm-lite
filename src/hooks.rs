@@ -39,6 +39,10 @@ fn emit(event: &str, text: &str, hermes: bool, raw: bool) {
 /// debug capture) and the parsed value. Callers pull fields off the parsed result.
 fn read_stdin() -> (String, Option<serde_json::Value>) {
     let mut raw = String::new();
+    // A hook run by hand from a terminal has no event to read: do not wait for one.
+    if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        return (raw, None);
+    }
     if std::io::stdin().read_to_string(&mut raw).is_err() {
         return (raw, None);
     }
@@ -78,6 +82,7 @@ fn debug_log(event: &str, hermes: bool, raw_stdin: &str, prompt: &str, first_tur
 /// 10,000-char hook-stdout cap (see render::SESSION_BUDGET; over the cap CC persists the block to
 /// a file and injects only a ~2KB preview, dropping the protocols from live context).
 pub fn session_start(hermes: bool, raw: bool) -> Result<()> {
+    let (_, input) = read_stdin();
     let m = Memory::open()?;
     let persona = m.persona().unwrap_or_default();
     let reminders = m.reminders(5).unwrap_or_default();
@@ -88,8 +93,27 @@ pub fn session_start(hermes: bool, raw: bool) -> Result<()> {
     } else {
         render::render_session(&persona, &reminders)
     };
+    let text = match work_state_line(input.as_ref()) {
+        Some(line) if !text.trim().is_empty() => format!("{text}\n{line}"),
+        Some(line) => line,
+        None => text,
+    };
     emit("SessionStart", &text, hermes, raw);
     Ok(())
+}
+
+/// The session-start work-state line for the session's repository (the event's `cwd`, else
+/// the hook's own working directory); None outside a repository or with `DM_PROJECT=off`.
+fn work_state_line(v: Option<&serde_json::Value>) -> Option<String> {
+    if std::env::var(crate::project::PROJECT_ENV).is_ok_and(|p| ["off", "0", "none", "false"].iter().any(|o| p.trim().eq_ignore_ascii_case(o))) {
+        return None;
+    }
+    let cwd = v.and_then(|v| v.get("cwd")).and_then(|c| c.as_str()).map(str::trim).filter(|c| !c.is_empty());
+    let dir = match cwd {
+        Some(d) => std::path::PathBuf::from(d),
+        None => std::env::current_dir().ok()?,
+    };
+    crate::project::work_state(&dir).map(|w| w.line())
 }
 
 /// Quiet window after which an unsaved session looks like uncaptured work worth nudging.
@@ -149,6 +173,17 @@ fn prompt_from_hook_input(v: &serde_json::Value, hermes: bool) -> Option<String>
     None
 }
 
+/// The project the hook's session works in: the event's `cwd` (Claude Code, Codex and the
+/// Cowork plugin send the session's working directory with every event), else the hook
+/// process's own working directory.
+fn project_from_hook_input(v: Option<&serde_json::Value>) -> Option<String> {
+    let cwd = v.and_then(|v| v.get("cwd")).and_then(|c| c.as_str()).map(str::trim).filter(|c| !c.is_empty());
+    match cwd {
+        Some(dir) => crate::project::detect(std::path::Path::new(dir)),
+        None => crate::project::detect_cwd(),
+    }
+}
+
 fn first_turn_from_hook_input(v: &serde_json::Value) -> bool {
     v.pointer("/extra/is_first_turn")
         .or_else(|| v.get("is_first_turn"))
@@ -174,7 +209,8 @@ pub fn user_prompt_submit(arg: Option<String>, hermes: bool, raw: bool) -> Resul
         debug_log("user_prompt_submit", hermes, &raw_in, &prompt, first_turn, 0);
         return Ok(());
     }
-    let m = Memory::open()?;
+    let mut m = Memory::open()?;
+    m.set_project(project_from_hook_input(input.as_ref()));
     let mut blocks: Vec<String> = Vec::new();
     // Persona/protocols are NOT injected here for Hermes: they live in SOUL.md (the always-on
     // system prompt, written by `dmem bootstrap --hermes`), so identity survives session resume
@@ -225,9 +261,131 @@ pub fn user_prompt_submit(arg: Option<String>, hermes: bool, raw: bool) -> Resul
     Ok(())
 }
 
+/// The most records one pre-edit injection carries: a few precise notes, not a recall block.
+const PRE_EDIT_MAX: usize = 3;
+
+/// The file an edit tool is about to change: `tool_input.file_path` (Edit, Write, MultiEdit),
+/// else `tool_input.notebook_path` (NotebookEdit).
+fn edited_file(v: &serde_json::Value) -> Option<String> {
+    ["/tool_input/file_path", "/tool_input/notebook_path"]
+        .iter()
+        .find_map(|p| v.pointer(p).and_then(|x| x.as_str()).map(str::trim).filter(|s| !s.is_empty()).map(str::to_string))
+}
+
+/// Where this session's already-shown pre-edit notes are listed (one uri per line), so a record
+/// is injected once per session, not on every edit of the file. None without a session id.
+fn seen_path(v: &serde_json::Value) -> Option<std::path::PathBuf> {
+    let sid = v.get("session_id")?.as_str()?;
+    let safe: String = sid.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_').take(80).collect();
+    (!safe.is_empty()).then(|| std::env::temp_dir().join(format!("dmem-pre-edit-{safe}.seen")))
+}
+
+/// PreToolUse on the edit tools: before a file changes, inject what memory holds about that
+/// file - records of its project that name its path or a distinctive folder of it. Precise or
+/// silent: nothing about the file means no output, and the tool call proceeds untouched (no
+/// permission decision is ever made here). Fails open: any error injects nothing.
+pub fn pre_tool_use(raw: bool) -> Result<()> {
+    let (raw_in, input) = read_stdin();
+    let Some(v) = input else { return Ok(()) };
+    let Some(file) = edited_file(&v) else { return Ok(()) };
+    let cwd = v.get("cwd").and_then(|c| c.as_str()).map(std::path::Path::new);
+    let Some(ctx) = crate::project::file_context(std::path::Path::new(&file), cwd) else { return Ok(()) };
+    if ctx.project.is_none() {
+        return Ok(());
+    }
+    let mut m = match Memory::open() {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("dmem hook: pre-edit memory unavailable ({e:#}); injecting nothing");
+            return Ok(());
+        }
+    };
+    m.set_project(ctx.project.clone());
+    // Keyword relevance without the access-signal bump: an edit is not a read, so it must not
+    // inflate the signals recall ranks by. (Not the as-of path: that one orders by importance
+    // and matches any term as a substring, so busy stores fill the window with persona records.)
+    let hits = m.recall_quiet(&crate::project::file_query(&ctx), 40).unwrap_or_else(|e| {
+        eprintln!("dmem hook: pre-edit recall failed ({e:#}); injecting nothing");
+        Vec::new()
+    });
+    let seen_file = seen_path(&v);
+    let seen: std::collections::HashSet<String> =
+        seen_file.as_ref().and_then(|p| std::fs::read_to_string(p).ok()).map(|s| s.lines().map(str::to_string).collect()).unwrap_or_default();
+    let notes: Vec<crate::entry::Entry> = hits
+        .into_iter()
+        .filter(|e| !seen.contains(&e.uri))
+        .filter(|e| {
+            let text = format!("{}\n{}\n{}", e.title, e.body, e.tags.join(" "));
+            crate::project::belongs(&e.tags, &text, &ctx) && crate::project::mentions_file(&text, &ctx.rel)
+        })
+        .take(PRE_EDIT_MAX)
+        .collect();
+    if notes.is_empty() {
+        debug_log("pre_tool_use", false, &raw_in, &ctx.rel, false, 0);
+        return Ok(());
+    }
+    if let Some(p) = &seen_file {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
+            for e in &notes {
+                let _ = writeln!(f, "{}", e.uri);
+            }
+        }
+    }
+    let text = render::render_file_notes(&ctx.rel, &notes);
+    debug_log("pre_tool_use", false, &raw_in, &ctx.rel, false, text.len());
+    emit("PreToolUse", &text, false, raw);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_edited_file_comes_from_file_path_or_notebook_path() {
+        let edit = serde_json::json!({"tool_name": "Edit", "tool_input": {"file_path": "/r/src/a.rs", "old_string": "x"}});
+        assert_eq!(edited_file(&edit), Some("/r/src/a.rs".into()));
+        let nb = serde_json::json!({"tool_name": "NotebookEdit", "tool_input": {"notebook_path": "/r/n.ipynb"}});
+        assert_eq!(edited_file(&nb), Some("/r/n.ipynb".into()));
+        assert_eq!(edited_file(&serde_json::json!({"tool_name": "Bash", "tool_input": {"command": "ls"}})), None);
+        assert_eq!(edited_file(&serde_json::json!({"tool_input": {"file_path": "  "}})), None);
+    }
+
+    #[test]
+    fn the_seen_list_is_per_session_and_path_safe() {
+        let a = seen_path(&serde_json::json!({"session_id": "abc-123"})).unwrap();
+        let b = seen_path(&serde_json::json!({"session_id": "def-456"})).unwrap();
+        assert_ne!(a, b);
+        let hostile = seen_path(&serde_json::json!({"session_id": "../../etc/passwd"})).unwrap();
+        assert_eq!(hostile.parent().unwrap(), std::env::temp_dir(), "no traversal out of the temp dir");
+        assert!(seen_path(&serde_json::json!({})).is_none());
+        assert!(seen_path(&serde_json::json!({"session_id": "///"})).is_none());
+    }
+
+    #[test]
+    fn pre_edit_output_is_an_additional_context_with_no_permission_decision() {
+        let out = format_output("PreToolUse", "note", false, false).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["hookSpecificOutput"]["hookEventName"], "PreToolUse");
+        assert_eq!(v["hookSpecificOutput"]["additionalContext"], "note");
+        assert!(v["hookSpecificOutput"].get("permissionDecision").is_none(), "never approves or denies the edit");
+    }
+
+    #[test]
+    fn the_events_cwd_names_the_project() {
+        let base = std::env::temp_dir().join(format!("dmhookproj-{}-{}", std::process::id(), crate::entry::now_ms()));
+        let repo = base.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let git = |args: &[&str]| std::process::Command::new("git").arg("-C").arg(&repo).args(args).output().map(|o| o.status.success()).unwrap_or(false);
+        if git(&["init", "-q"]) && git(&["remote", "add", "origin", "https://u:secret@git.example.org/Team/App.git"]) && std::env::var(crate::project::PROJECT_ENV).is_err() {
+            let v = serde_json::json!({"prompt": "x", "cwd": repo.to_str().unwrap()});
+            assert_eq!(project_from_hook_input(Some(&v)), Some("git.example.org/team/app".into()));
+            let outside = serde_json::json!({"prompt": "x", "cwd": base.to_str().unwrap()});
+            assert_eq!(project_from_hook_input(Some(&outside)), None);
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     #[test]
     fn nudges_when_nothing_saved_or_stale() {
