@@ -100,24 +100,31 @@ EOF
 }
 ALL_COMMANDS='setup serve service upgrade login ui bootstrap'
 
+# The release RUNPATH, as build.rs sets it: beside the binary, then ../lib.
+RUNPATH_ARGS=(-C 'link-arg=-Wl,-rpath,$ORIGIN' -C 'link-arg=-Wl,-rpath,$ORIGIN/../lib')
+
 # build NAME VERSION_TEXT HELP_COMMANDS [PATH_STRING [EXTRA_LINK_ARG]]
 build() {
     main_rs "$2" "$3" "${4:-}" >"$1.rs"
     local extra=()
     [[ -z ${5:-} ]] || extra=(-C "link-arg=$5")
     rustc --edition 2021 -C strip=debuginfo "${REMAP[@]}" -L . -l dylib=zvec_c_api \
-        -C 'link-arg=-Wl,-rpath,$ORIGIN' "${extra[@]}" "$1.rs" -o "$1" 2>/dev/null
+        "${RUNPATH_ARGS[@]}" "${extra[@]}" "$1.rs" -o "$1" 2>/dev/null
 }
 build good "$VERSION" "$ALL_COMMANDS"
 build bad-runpath "$VERSION" "$ALL_COMMANDS" "" -Wl,-rpath,/opt/build/target/release/build/zvec-prebuilt
 build bad-path "$VERSION" "$ALL_COMMANDS" /home/builder/.cargo/registry/src/x/lib.rs
 build bad-version 0.0.1 "$ALL_COMMANDS"
+# what 0.5.1 shipped: beside the binary only, so a bin/ + lib/ install cannot find the library
+main_rs "$VERSION" "$ALL_COMMANDS" >origin-only.rs
+rustc --edition 2021 -C strip=debuginfo "${REMAP[@]}" -L . -l dylib=zvec_c_api \
+    -C 'link-arg=-Wl,-rpath,$ORIGIN' origin-only.rs -o bad-origin-only 2>/dev/null
 build bad-no-upgrade "$VERSION" "setup serve service login ui"
 # no zvec dependency: a build without the native library
 cat >plain.rs <<EOF
 fn main() { if std::env::args().nth(1).as_deref() == Some("--version") { println!("dmem $VERSION"); } }
 EOF
-rustc --edition 2021 -C strip=debuginfo "${REMAP[@]}" -C 'link-arg=-Wl,-rpath,$ORIGIN' plain.rs -o bad-no-zvec 2>/dev/null
+rustc --edition 2021 -C strip=debuginfo "${REMAP[@]}" "${RUNPATH_ARGS[@]}" plain.rs -o bad-no-zvec 2>/dev/null
 printf 'not an elf file\n' >bad-text
 cat >lib2.rs <<'EOF'
 #[no_mangle]
@@ -129,8 +136,8 @@ rustc --edition 2021 -C strip=debuginfo "${REMAP[@]}" --crate-type cdylib -C lin
 for f in good libzvec_c_api.so; do
     readelf -d "$f" >/dev/null || { echo "cannot build the stand-in $f"; exit 1; }
 done
-assert_eq "the stand-in binary has RUNPATH \$ORIGIN" \
-    "$(readelf -d good | sed -n 's/.*(RUNPATH).*\[\(.*\)\]$/\1/p')" '$ORIGIN'
+assert_eq "the stand-in binary has RUNPATH \$ORIGIN:\$ORIGIN/../lib" \
+    "$(readelf -d good | sed -n 's/.*(RUNPATH).*\[\(.*\)\]$/\1/p')" '$ORIGIN:$ORIGIN/../lib'
 ./good --version >/dev/null || { echo "the stand-in binary does not run"; exit 1; }
 
 # --- a throwaway repository from the files the script reads -----------------------------
@@ -261,7 +268,8 @@ try() { # try BINARY LIB OUTDIR
     (cd "$T/a/repo" && "$SCRIPT" --binary "$1" --lib "$2" --out "$3")
 }
 L=$T/fx/libzvec_c_api.so
-expect_refusal "refuses a binary with an added RUNPATH" 'RUNPATH is \[$ORIGIN:/opt/build' try "$T/fx/bad-runpath" "$L" "$T/o1"
+expect_refusal "refuses a binary with an added RUNPATH" 'RUNPATH is \[$ORIGIN:$ORIGIN/../lib:/opt/build' try "$T/fx/bad-runpath" "$L" "$T/o1"
+expect_refusal "refuses a binary whose RUNPATH is \$ORIGIN only (0.5.1)" 'RUNPATH is \[$ORIGIN\], not exactly' try "$T/fx/bad-origin-only" "$L" "$T/o1b"
 expect_refusal "refuses a binary that embeds a build path" "embeds a build path" try "$T/fx/bad-path" "$L" "$T/o2"
 expect_refusal "refuses a binary of another version" "says 'dmem 0.0.1'" try "$T/fx/bad-version" "$L" "$T/o3"
 expect_refusal "refuses a binary without the upgrade command" "no 'upgrade' command" try "$T/fx/bad-no-upgrade" "$L" "$T/o4"

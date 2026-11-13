@@ -69,6 +69,38 @@ class SignPassesTheComment(unittest.TestCase):
         )
 
 
+class VerifyOutput(unittest.TestCase):
+    comment = sr.trusted_comment(NAME, "v0.3.9")
+
+    def test_reads_the_comment_from_stderr_as_rsign2_0_6_prints_it(self):
+        err = "Signature and comment signature verified\nTrusted comment: " + self.comment + "\n"
+        self.assertTrue(sr.carries_comment("", err, self.comment))
+
+    def test_reads_the_comment_from_stdout_as_older_rsign_prints_it(self):
+        self.assertTrue(sr.carries_comment("Trusted comment: " + self.comment + "\n", "", self.comment))
+
+    def test_refuses_another_file_or_a_longer_comment(self):
+        other = sr.trusted_comment(MAC, "v0.3.9")
+        self.assertFalse(sr.carries_comment("", "Trusted comment: " + other + "\n", self.comment))
+        self.assertFalse(sr.carries_comment("", "Trusted comment: " + self.comment + "\textra\n", self.comment))
+
+    def test_rsign_on_this_host_agrees(self):
+        import shutil, subprocess
+        rsign = shutil.which("rsign")
+        if not rsign:
+            self.skipTest("no rsign")
+        with tempfile.TemporaryDirectory() as d:
+            subprocess.run([rsign, "generate", "-W", "-f", "-p", "t.pub", "-s", "t.key"], cwd=d,
+                           capture_output=True, check=True)
+            with open(os.path.join(d, NAME), "wb") as fh:
+                fh.write(b"archive bytes")
+            subprocess.run([rsign, "sign", "-W", "-s", "t.key", "-x", NAME + ".minisig", "-t", self.comment, NAME],
+                           cwd=d, capture_output=True, check=True)
+            v = subprocess.run([rsign, "verify", "-p", "t.pub", "-x", NAME + ".minisig", NAME],
+                               cwd=d, capture_output=True, text=True, check=True)
+        self.assertTrue(sr.carries_comment(v.stdout, v.stderr, self.comment), v.stdout + v.stderr)
+
+
 class PackagedBuild(unittest.TestCase):
     def make(self, d, *, commit=COMMIT, archive=b"archive bytes", listed=None, with_commit=True, with_sums=True):
         path = os.path.join(d, NAME)
@@ -127,6 +159,69 @@ class PackagedBuild(unittest.TestCase):
             with self.assertRaises(SystemExit) as cm:
                 sr.packaged_build(d, COMMIT)
         self.assertIn("no dmem-v* archive", str(cm.exception))
+
+
+MAC = "dmem-v0.3.9-aarch64-apple-darwin.tar.gz"
+WIN = "dmem-v0.3.9-x86_64-pc-windows-msvc.zip"
+
+
+def row(name, data):
+    return (name, len(data), sha(data), "someone")
+
+
+class CheckArchives(unittest.TestCase):
+    # A release since 0.4.x: the hand-built x86_64 linux archive (packaged lane) beside the
+    # workflow's other targets. The workflow also built its own linux archive, which differs.
+    rows = [row(NAME, b"hand linux"), row(MAC, b"mac"), row(WIN, b"win")]
+    packaged = {NAME: sha(b"hand linux")}
+    workflow = {NAME: sha(b"workflow linux"), MAC: sha(b"mac"), WIN: sha(b"win")}
+
+    def test_a_mixed_release_is_checked_lane_by_lane(self):
+        got = sr.check_archives(self.rows, self.packaged, self.workflow)
+        self.assertEqual(got, [(NAME, "packaged build"), (MAC, "workflow build"), (WIN, "workflow build")])
+
+    def test_the_packaged_lane_wins_for_its_archive_and_must_match_it(self):
+        rows = [row(NAME, b"workflow linux")]  # the workflow's file, where the hand build should be
+        self.assertEqual(sr.check_archives(rows, self.packaged, self.workflow), [(NAME, None)])
+
+    def test_an_archive_swapped_on_the_release_is_refused(self):
+        rows = [row(NAME, b"hand linux"), row(MAC, b"tampered mac")]
+        self.assertEqual(sr.check_archives(rows, self.packaged, self.workflow)[1], (MAC, None))
+
+    def test_an_archive_with_no_trusted_build_is_refused(self):
+        self.assertEqual(sr.check_archives([row(MAC, b"mac")], self.packaged, None), [(MAC, None)])
+        self.assertEqual(sr.check_archives([row(MAC, b"mac")], None, {}), [(MAC, None)])
+
+    def test_workflow_only_as_before(self):
+        rows = [row(MAC, b"mac"), row(WIN, b"win")]
+        self.assertEqual([lane for _, lane in sr.check_archives(rows, None, self.workflow)], ["workflow build"] * 2)
+
+
+class SumsText(unittest.TestCase):
+    def test_lists_every_archive_sorted_in_sha256sum_format(self):
+        rows = [row(WIN, b"win"), row(NAME, b"hand linux"), row(MAC, b"mac")]
+        text = sr.sums_text(rows)
+        names = [line.split("  ", 1)[1] for line in text.splitlines()]
+        self.assertEqual(names, sorted([NAME, MAC, WIN]))
+        self.assertIn(f"{sha(b'mac')}  {MAC}\n", text)
+        for line in text.splitlines():
+            self.assertRegex(line, r"^[0-9a-f]{64}  dmem-v\S+$")
+
+    def test_sha256sum_checks_it(self):
+        import subprocess
+        with tempfile.TemporaryDirectory() as d:
+            rows = []
+            for name, data in [(NAME, b"hand linux"), (MAC, b"mac")]:
+                with open(os.path.join(d, name), "wb") as fh:
+                    fh.write(data)
+                rows.append(row(name, data))
+            with open(os.path.join(d, sr.SUMS), "w") as fh:
+                fh.write(sr.sums_text(rows))
+            r = subprocess.run(["sha256sum", "-c", sr.SUMS], cwd=d, capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    def test_its_signature_is_bound_to_the_file_name(self):
+        self.assertEqual(sr.trusted_comment(sr.SUMS, "v0.3.9"), "file:SHA256SUMS\tversion:0.3.9")
 
 
 if __name__ == "__main__":

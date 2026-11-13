@@ -22,7 +22,9 @@
 # It refuses to package
 #   - a dirty git tree (untracked files included), a version with no CHANGELOG section, a
 #     Cargo.lock that does not carry the version, or a tag that is on another commit;
-#   - a binary that is not a Linux x86_64 ELF, whose RUNPATH is anything but $ORIGIN, that
+#   - a binary that is not a Linux x86_64 ELF, whose RUNPATH is anything but
+#     $ORIGIN:$ORIGIN/../lib, that does not run with an empty environment both from the archive
+#     and from a bin/ + lib/ layout, that
 #     embeds a build path under /home, /Users or /root, that is not the dist build (no
 #     libzvec_c_api dependency, or no upgrade, serve, setup, login, ui and service
 #     commands), or whose --version is not "dmem X.Y.Z" for the checkout's version;
@@ -182,9 +184,12 @@ done
 dyn=$(readelf -d "$stage/dmem")
 rpath=$(sed -n 's/.*(RPATH).*\[\(.*\)\]$/\1/p' <<<"$dyn")
 runpath=$(sed -n 's/.*(RUNPATH).*\[\(.*\)\]$/\1/p' <<<"$dyn")
-[[ -z $rpath ]] || fail "dmem has a DT_RPATH ($rpath); the archive needs a RUNPATH of exactly \$ORIGIN"
-[[ $runpath == '$ORIGIN' ]] ||
-    fail "dmem's RUNPATH is [${runpath:-none}], not exactly [\$ORIGIN]: it was built where a build directory was added to it (see docs/releasing.md: a fresh CARGO_TARGET_DIR and ZVEC_LIB_DIR)"
+# The library beside the binary first (the archive, `dmem upgrade`), then ../lib for a bin/ + lib/
+# install that runs dmem with an empty environment (the Expert pod). build.rs sets both.
+WANT_RUNPATH='$ORIGIN:$ORIGIN/../lib'
+[[ -z $rpath ]] || fail "dmem has a DT_RPATH ($rpath); the archive needs a RUNPATH of exactly $WANT_RUNPATH"
+[[ $runpath == "$WANT_RUNPATH" ]] ||
+    fail "dmem's RUNPATH is [${runpath:-none}], not exactly [$WANT_RUNPATH]: built from a commit before build.rs set both, or where a build directory was added to it (see docs/releasing.md: a fresh CARGO_TARGET_DIR and ZVEC_LIB_DIR)"
 grep -q '(NEEDED).*\[libzvec_c_api\.so\]' <<<"$dyn" ||
     fail "dmem does not need libzvec_c_api.so: it was not built with --features dist"
 soname=$(readelf -d "$stage/libzvec_c_api.so" | sed -n 's/.*(SONAME).*\[\(.*\)\]$/\1/p')
@@ -202,6 +207,15 @@ usage_text=$(run_dmem --help) || fail "dmem --help does not run"
 for c in setup serve service upgrade login ui; do
     grep -q "^  $c\( \|\$\)" <<<"$usage_text" || fail "dmem has no '$c' command: it was not built with --features dist"
 done
+
+# A bin/ + lib/ layout, probed the way daimon-engine probes it: from /, with an empty environment,
+# `--version` and `login --help`. It finds the library through $ORIGIN/../lib alone.
+layout=$work/layout
+mkdir -p "$layout/bin" "$layout/lib"
+install -m 0755 "$stage/dmem" "$layout/bin/dmem"
+install -m 0644 "$stage/libzvec_c_api.so" "$layout/lib/libzvec_c_api.so"
+(cd / && env -i "$layout/bin/dmem" --version >/dev/null && env -i "$layout/bin/dmem" login --help >/dev/null) ||
+    fail "dmem does not run from a bin/ + lib/ layout with an empty environment (RUNPATH $WANT_RUNPATH)"
 
 # --- archive -----------------------------------------------------------------
 

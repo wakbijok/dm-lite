@@ -3,6 +3,29 @@
 Notable changes to dm-lite (`dmem`). Releases up to and including 0.3.6 are
 described on [GitHub Releases](https://github.com/wakbijok/dm-lite/releases).
 
+## 0.5.2 - 2026-11-13
+
+### Security
+
+- **Repository names in the work-state line are shown as quoted ASCII.** The session-start
+  line names the repository, its branch, the upstream and the local-only branches, all chosen
+  by whoever made the repository. Each is now printable ASCII in backquotes: a control
+  character, newline, bidi override (U+202E), no-break space or backquote becomes `?`, and a
+  name longer than 64 characters is cut with `…`. A branch name could otherwise start a line
+  of its own in the agent's context, or show different text on screen from what it is.
+
+### Fixed
+
+- **The Linux release binary runs from a `bin/` + `lib/` install.** Its RUNPATH is now
+  `$ORIGIN:$ORIGIN/../lib` (it was `$ORIGIN`): the library beside the binary still wins, as the
+  archive and `dmem upgrade` lay it out, and a `bin/dmem` with `lib/libzvec_c_api.so` now finds
+  it with an empty environment, which is how the Expert deployment runs it. Until now that
+  install needed a custom build. `scripts/package-release.sh` checks both: it refuses any other
+  RUNPATH and runs `env -i bin/dmem --version` and `login --help` from a `bin/` + `lib/` layout.
+- **`scripts/build-release-container.sh` honours `CARGO_BUILD_JOBS`.** It passes it into the
+  container and caps the container at that many CPUs (`docker run --cpus`); before, the build
+  inside used every CPU of the host whatever the caller set.
+
 ## 0.5.1 - 2026-11-10
 
 ### Security

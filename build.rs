@@ -3,8 +3,11 @@
 // without help the binary fails at runtime with "Library not loaded". We add an rpath to the
 // executable's own directory so shipping the native lib NEXT TO the binary makes it
 // self-contained, per-OS:
-//   macOS:  @executable_path     Linux: $ORIGIN     Windows: no rpath (the loader searches
-// the exe's own directory for DLLs automatically; ship zvec_c_api.dll beside dmem.exe).
+//   macOS:  @executable_path     Linux: $ORIGIN, then $ORIGIN/../lib     Windows: no rpath (the
+// loader searches the exe's own directory for DLLs automatically; ship zvec_c_api.dll beside
+// dmem.exe). On Linux the library beside the binary wins, as the release archive and `dmem
+// upgrade` lay it out; $ORIGIN/../lib is for a bin/ + lib/ install (the Expert pod), which runs
+// dmem with an empty environment, so LD_LIBRARY_PATH cannot help.
 fn main() {
     if std::env::var("CARGO_FEATURE_ZVEC").is_err() {
         return;
@@ -19,6 +22,10 @@ fn main() {
 
     // resolve relative to the binary itself (ship the native lib alongside dmem)
     println!("cargo:rustc-link-arg=-Wl,-rpath,{origin}");
+    if origin == "$ORIGIN" {
+        // the linker joins repeated -rpath in order: RUNPATH [$ORIGIN:$ORIGIN/../lib]
+        println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN/../lib");
+    }
 
     // also let it run straight from `cargo run`/tests in-tree: rpath the zvec-sys prebuilt
     // output dir if found. OUT_DIR is .../target/<profile>/build/dm-lite-XXXX/out; the native

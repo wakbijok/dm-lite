@@ -12,17 +12,22 @@ Run it from a dm-lite clone on the machine that holds the release key. It:
      - every archive on the release is byte-identical to its trusted build, so a file
        uploaded or swapped by hand, or built from another commit, is caught. The trusted
        build is a successful run of the release workflow that built that exact commit
-       (its build artifact), or, with --packaged DIR, the output directory of
-       scripts/package-release.sh on this machine for that commit (its COMMIT and
-       SHA256SUMS files, and the archives themselves, unchanged since it wrote them);
+       (its build artifact). With --packaged DIR, an archive that the output directory of
+       scripts/package-release.sh on this machine holds for that commit (its COMMIT and
+       SHA256SUMS files, and the archives themselves, unchanged since it wrote them) is
+       checked against that directory instead, and every other archive still against the
+       workflow run: a release carrying the hand-built x86_64 linux archive beside the
+       workflow's other targets is checked lane by lane;
      - that tag's src/upgrade.rs trusts the key you are signing with;
-  2. shows each archive with its sha256, asks you to confirm, then asks for the key
-     passphrase ONCE;
+  2. shows each archive with its sha256 and lane, asks you to confirm, then asks for the
+     key passphrase ONCE;
   3. signs every archive with rsign, with the trusted comment `file:<archive>`, a TAB,
      `version:X.Y.Z` (what scripts/package-release.sh prints for a hand signature; `dmem
-     upgrade` needs the file field and splits the comment on tabs), verifies each
-     signature with the public key and the comment, and uploads the .minisig files to
-     the release.
+     upgrade` needs the file field and splits the comment on tabs), and verifies each
+     signature with the public key and the comment;
+  4. writes SHA256SUMS over every archive on the release (from the checked files), signs
+     it the same way (`file:SHA256SUMS`), and uploads the .minisig files, then SHA256SUMS
+     with its .minisig, which replace the SHA256SUMS already on the release.
 
 The passphrase is typed into rsign through a private pseudo-terminal with echo off.
 It is never written to disk, argv, or a child's environment, and it is forgotten
@@ -135,9 +140,17 @@ def sign(rsign, key, work, name, secret, comment):
         raise RuntimeError(f"rsign sign failed: {text.strip()[-300:]}")
 
 
+def carries_comment(stdout, stderr, comment):
+    """Does `rsign verify` output show this exact trusted comment? rsign2 0.6 prints its
+    result on stderr, earlier versions on stdout, so both are read."""
+    return f"Trusted comment: {comment}" in (stdout + "\n" + stderr).splitlines()
+
+
 def tree_check(tag, remote, commit):
-    """(ok, message): does the GitHub tag's commit carry the upstream tag's exact tree?"""
-    ref = f"refs/remotes/{remote}/tags/{tag}"
+    """(ok, message): does the GitHub tag's commit carry the upstream tag's exact tree?
+    `remote` is a remote name or a URL. The GitHub tag goes to a private ref, never into
+    refs/tags, which holds the upstream tags."""
+    ref = f"refs/sign-release/github-tags/{tag}"
     try:
         run(["git", "fetch", "-q", "--no-tags", remote, f"+refs/tags/{tag}:{ref}"])
         fetched = run(["git", "rev-parse", f"{ref}^{{commit}}"]).strip()
@@ -208,6 +221,29 @@ def packaged_build(directory, commit):
     return f"packaged by scripts/package-release.sh ({directory})", digests
 
 
+def check_archives(rows, packaged, workflow):
+    """[(name, lane or None)] for `rows` of (name, size, sha256, uploader): an archive the
+    packaged build holds must match it; any other must match the workflow build. None when
+    the archive matches neither (or its lane has no build to check against)."""
+    out = []
+    for name, _, digest, _ in rows:
+        if packaged is not None and name in packaged:
+            out.append((name, "packaged build" if packaged[name] == digest else None))
+        elif workflow is not None and workflow.get(name) == digest:
+            out.append((name, "workflow build"))
+        else:
+            out.append((name, None))
+    return out
+
+
+SUMS = "SHA256SUMS"
+
+
+def sums_text(rows):
+    """SHA256SUMS over every archive in `rows`, in the format `sha256sum -c` reads, by name."""
+    return "".join(f"{digest}  {name}\n" for name, _, digest, _ in sorted(rows))
+
+
 def main():
     ap = argparse.ArgumentParser(description="Sign a dm-lite GitHub release (human step).")
     ap.add_argument("tag")
@@ -218,8 +254,8 @@ def main():
     ap.add_argument("--no-upload", action="store_true", help="sign and verify only; keep the files")
     ap.add_argument("--clobber", action="store_true", help="replace .minisig files already on the release")
     ap.add_argument("--packaged", metavar="DIR",
-                    help="trust the archives scripts/package-release.sh wrote into DIR for this tag's commit, "
-                         "not a release workflow run's build artifact")
+                    help="trust the archives scripts/package-release.sh wrote into DIR for this tag's commit; "
+                         "every other archive is still checked against the release workflow run")
     a = ap.parse_args()
 
     if not TAG_RE.fullmatch(a.tag):
@@ -258,62 +294,74 @@ def main():
 
         commit = gh_api(f"repos/{a.repo}/commits/{a.tag}")["sha"]
         same_code, code_msg = tree_check(a.tag, a.remote, commit)
+        packaged, workflow, labels = None, None, []
         if a.packaged:
-            build_label, built = packaged_build(os.path.abspath(a.packaged), commit)
-            trusted_build = "packaged build"
-        else:
-            run_id, built = workflow_build(a.repo, a.tag, commit, work)
-            build_label, trusted_build = f"release workflow run {run_id}", "workflow build"
+            # The hand lane packages the upstream tag's commit. GitHub carries a snapshot commit
+            # of the same tree (tree_check proves that), so the packaged COMMIT is checked
+            # against the upstream tag, not against the GitHub commit.
+            try:
+                upstream = run(["git", "rev-parse", f"refs/tags/{a.tag}^{{commit}}"]).strip()
+            except subprocess.CalledProcessError:
+                die(f"no upstream tag {a.tag} in this clone (fetch it from GitLab first)")
+            label, packaged = packaged_build(os.path.abspath(a.packaged), upstream)
+            labels.append(label)
+        if any(packaged is None or name not in packaged for name, *_ in rows):
+            run_id, workflow = workflow_build(a.repo, a.tag, commit, work)
+            labels.append(f"release workflow run {run_id}")
 
         print(f"\nRelease {a.repo} {a.tag} (commit {commit[:10]}): {len(rows)} archive(s)")
-        bad = []
-        for name, size, digest, who in rows:
-            match = built.get(name) == digest
-            if not match:
-                bad.append(name)
+        checked = check_archives(rows, packaged, workflow)
+        bad = [name for name, lane in checked if lane is None]
+        for (name, size, digest, who), (_, lane) in zip(rows, checked):
             print(f"  {name}  {size} bytes  sha256 {digest}  by {who}  "
-                  + (f"= {trusted_build}" if match else f"<- DOES NOT MATCH the {trusted_build}"))
-        print(f"Build:  {build_label}")
+                  + (f"= {lane}" if lane else "<- DOES NOT MATCH its trusted build"))
+        print(f"Build:  {'; '.join(labels)}")
         print(f"Code:   {code_msg}")
         print(f"Key:    {key_id} ({a.pub})")
         print(f"Trust:  this tag's src/upgrade.rs {'trusts' if trusted else 'does NOT trust'} that key")
         if not same_code:
             die("the GitHub tag's code is not the upstream tag's code; not signing")
         if bad:
-            die(f"{len(bad)} archive(s) differ from the {trusted_build}; not signing")
+            die(f"{len(bad)} archive(s) differ from their trusted build; not signing")
         if not trusted:
             die("this tag's src/upgrade.rs does not trust the key; upgraders would reject the signatures")
         if have_sigs and not a.clobber and not a.no_upload:
             die(f"the release already has {len(have_sigs)} .minisig file(s); rerun with --clobber to replace them")
+        with open(os.path.join(work, SUMS), "w") as fh:
+            fh.write(sums_text(rows))
+        print(f"Sums:   {SUMS} over all {len(rows)} archive(s), signed too; it replaces the release's {SUMS}")
         if input("\nSign these archives? [y/N] ").strip().lower() not in ("y", "yes"):
             die("aborted; nothing signed")
 
         secret = getpass.getpass(f"Passphrase for key {key_id}: ")
         try:
-            for name, *_ in rows:
+            for name in [n for n, *_ in rows] + [SUMS]:
                 comment = trusted_comment(name, a.tag)
                 sign(rsign, a.key, work, name, secret, comment)
                 v = subprocess.run([rsign, "verify", "-p", a.pub, "-x", name + ".minisig", name],
                                    cwd=work, env=CHILD_ENV, capture_output=True, text=True, timeout=60)
                 if v.returncode != 0:
                     die(f"{name}: signature did not verify: {(v.stdout + v.stderr).strip()[-300:]}")
-                if f"Trusted comment: {comment}" not in v.stdout:
+                if not carries_comment(v.stdout, v.stderr, comment):
                     die(f"{name}: the signature does not carry the trusted comment {comment!r}")
                 print(f"  signed + verified  {name}")
         finally:
             del secret
 
         sigs = [os.path.join(work, n + ".minisig") for n, *_ in rows]
+        sums = [os.path.join(work, SUMS), os.path.join(work, SUMS + ".minisig")]
         if a.no_upload:
             out = os.path.abspath(f"minisig-{a.tag}")
             os.makedirs(out, exist_ok=True)
-            for s in sigs:
+            for s in sigs + sums:
                 shutil.copy2(s, out)
-            print(f"\nSignatures kept in {out} (not uploaded).")
+            print(f"\nSignatures and {SUMS} kept in {out} (not uploaded).")
             return
         cmd = ["gh", "release", "upload", a.tag, "-R", a.repo, *sigs] + (["--clobber"] if a.clobber else [])
         subprocess.run(cmd, check=True)
-        print(f"\nUploaded {len(sigs)} signature(s) to {a.repo} {a.tag}.")
+        # SHA256SUMS is made here from the checked archives, so it always replaces the old one.
+        subprocess.run(["gh", "release", "upload", a.tag, "-R", a.repo, *sums, "--clobber"], check=True)
+        print(f"\nUploaded {len(sigs)} signature(s), {SUMS} and its signature to {a.repo} {a.tag}.")
     except PermissionError as e:
         die(str(e))
     except subprocess.CalledProcessError as e:

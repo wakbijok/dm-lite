@@ -18,11 +18,16 @@ entry, because `dmem upgrade` and the README's `tar xzf` look for `dmem` there. 
 | Member | What it is |
 |---|---|
 | `dmem` | the binary, built with `--features dist` |
-| `libzvec_c_api.so` | the native vector library, beside the binary (its RUNPATH is `$ORIGIN`) |
+| `libzvec_c_api.so` | the native vector library, beside the binary (its RUNPATH is `$ORIGIN:$ORIGIN/../lib`: beside it first, then `../lib` for a `bin/` + `lib/` install) |
 | `LICENSE`, `NOTICE` | the project licence and the notices NOTICE carries (zvec, Apache Arrow, AWS-LC) |
 | `THIRD-PARTY-aws-lc.txt` | the AWS-LC licence text, the licence file of the locked `aws-lc-sys` |
 | `THIRD_PARTY_LICENSES.md` | the licence text of every Rust crate compiled into the `dist` build (scope below) |
 | `README.md` | the README |
+
+The binary loads `libzvec_c_api.so` from its own directory first, then from `../lib`. Do not
+install `dmem` into a `bin/` whose sibling `lib/` someone else can write: whoever can write
+that `lib/` can put a library in front of the binary. `~/.local/bin` (beside `~/.local/lib`)
+and `/usr/local/bin` (beside a root-owned `/usr/local/lib`) are fine.
 
 Every archive is signed with the daimon series release key, id `CD4359A138D28837`, public key
 `RWQ3iNI4oVlDzaiCJtUwwBiPjx2dcWaDHxh00Pw0lQbluZ1V33c0+gyR` (compiled into `dmem` in
@@ -119,8 +124,14 @@ Commit as `release: X.Y.Z - ...`.
 of the release commit:
 
 ```sh
-scripts/build-release-container.sh --lib-dir /path/to/the/directory/holding/libzvec_c_api.so
+CARGO_BUILD_JOBS=8 nice -n 10 timeout 2h \
+    scripts/build-release-container.sh --lib-dir /path/to/the/directory/holding/libzvec_c_api.so
 ```
+
+On a shared host such as izudev, set `CARGO_BUILD_JOBS`: the script passes it into the
+container and caps the container at that many CPUs. `nice` alone does not slow the build,
+because the container's processes belong to dockerd, not to the shell that started them. The
+job count does not change the binary.
 
 It builds the image in `contrib/release-builder` (Ubuntu 24.04 by digest, so glibc 2.39; Rust
 1.99.1 with `rust-src`) and runs the commands below in it, with the checkout mounted read-only
@@ -175,7 +186,8 @@ scripts/package-release.sh --binary $CARGO_TARGET_DIR/release/dmem \
 
 It refuses a dirty tree (untracked files included), a version with no changelog section, a tag
 on another commit, an existing archive, a binary that is not a 64-bit x86-64 ELF, whose RUNPATH
-is not exactly `$ORIGIN`, that embeds a path under `/home`, `/Users` or `/root`, that is not the
+is not exactly `$ORIGIN:$ORIGIN/../lib`, that does not run with an empty environment from a
+`bin/` + `lib/` layout (`--version` and `login --help` from `/`, as daimon-engine probes it), that embeds a path under `/home`, `/Users` or `/root`, that is not the
 `dist` build (it must need `libzvec_c_api.so` and have the `setup`, `serve`, `service`,
 `upgrade`, `login` and `ui` commands) or whose `--version` is not `dmem X.Y.Z`, an AWS-LC text
 or notice that is not current, and a library whose soname is not `libzvec_c_api.so`. It then
@@ -288,9 +300,20 @@ Check that the release page lists the three files and that a download of the arc
 only to GitLab is not seen by it. On an installer-managed host `dmem upgrade` refuses anyway
 (see [managed-install.md](managed-install.md)); the installer takes the archive, the `.minisig`
 and `SHA256SUMS` from the GitLab release. Publishing to GitHub is a separate decision: if the maintainer
-makes it, push the tag there, upload the archive, and run `contrib/sign-release.py vX.Y.Z
---packaged DIR`, which signs each archive on the GitHub release with the comment above and
-uploads the signatures.
+makes it, push the tag there and let the release workflow build its four targets. When the run
+has finished, replace its x86_64 linux archive with this one (`gh release upload --clobber`),
+then the maintainer runs:
+
+```sh
+contrib/sign-release.py vX.Y.Z --packaged DIR --remote https://github.com/wakbijok/dm-lite.git --clobber
+```
+
+It checks each archive against its own lane: the x86_64 linux archive against `DIR`, whose
+COMMIT must be the upstream tag's commit, and the other targets against the workflow run of
+the GitHub tag. It signs all four with the comment above, writes `SHA256SUMS` over all four and
+signs it too, and uploads the signatures, `SHA256SUMS` and `SHA256SUMS.minisig`. `--clobber`
+replaces the x86_64 linux `.minisig` already uploaded; the signature is the same key's. Without
+a signature for its own target, `dmem upgrade` on that platform refuses the release.
 
 ## 9. After the release
 
