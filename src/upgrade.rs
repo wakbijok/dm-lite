@@ -167,7 +167,7 @@ fn target() -> &'static str {
     }
 }
 
-fn http() -> Result<reqwest::blocking::Client> {
+pub(crate) fn http() -> Result<reqwest::blocking::Client> {
     Ok(crate::tls::http_builder()
         .user_agent(concat!("dmem/", env!("CARGO_PKG_VERSION")))
         .timeout(std::time::Duration::from_secs(300))

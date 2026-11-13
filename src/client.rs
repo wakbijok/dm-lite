@@ -53,6 +53,26 @@ start the server with `--tls-san <public hostname>` so the cert covers the name 
 const TLS_TRUST_HINT: &str = "; the server certificate is not trusted: pin it with `dmem login <url> --ca-cert <cert.pem>`; \
 the server cert itself must not be a CA and must name this host in a subjectAltName (see README, Security model)";
 
+/// Hint appended when the server (or the proxy in front of it) refuses the handshake because
+/// this client sent no client certificate, or one it does not accept.
+const CLIENT_CERT_HINT: &str = "; the server wants a client certificate: set [server].client_cert and client_key \
+(`dmem login <url> --client-cert <cert.pem> --client-key <key.pem>`; `dmem doctor` shows what is configured)";
+
+/// Walk an error's source chain looking for a TLS alert that means the client certificate was
+/// missing or refused. Alerts reach the client as `received fatal alert: <name>`; with TLS 1.3 the
+/// client finishes its handshake first, so this arrives on the first read, deeper in the chain.
+fn is_client_cert_rejected(e: &dyn std::error::Error) -> bool {
+    let mut cur: Option<&dyn std::error::Error> = Some(e);
+    while let Some(err) = cur {
+        let s = err.to_string();
+        if s.contains("received fatal alert") && ["CertificateRequired", "BadCertificate", "UnknownCA", "CertificateUnknown"].iter().any(|a| s.contains(a)) {
+            return true;
+        }
+        cur = err.source();
+    }
+    false
+}
+
 /// Walk an error's source chain looking for a rustls/webpki certificate-trust failure.
 fn is_tls_trust_error(e: &dyn std::error::Error) -> bool {
     let mut cur: Option<&dyn std::error::Error> = Some(e);
@@ -69,7 +89,13 @@ fn is_tls_trust_error(e: &dyn std::error::Error) -> bool {
 /// Wrap a transport error with the request label, keeping the source chain (so `main`'s `{:#}`
 /// still walks reqwest -> connect -> rustls) and adding the pinning hint when it is a trust failure.
 fn send_context(e: reqwest::Error, what: String) -> anyhow::Error {
-    let hint = if is_tls_trust_error(&e) { TLS_TRUST_HINT } else { "" };
+    let hint = if is_client_cert_rejected(&e) {
+        CLIENT_CERT_HINT
+    } else if is_tls_trust_error(&e) {
+        TLS_TRUST_HINT
+    } else {
+        ""
+    };
     anyhow::Error::new(e).context(format!("{what}{hint}"))
 }
 
@@ -87,6 +113,11 @@ impl RemoteClient {
             let pem = std::fs::read(ca).map_err(|e| anyhow!("read ca_cert {ca}: {e}"))?;
             let cert = reqwest::Certificate::from_pem(&pem).map_err(|e| anyhow!("parse ca_cert: {e}"))?;
             b = b.add_root_certificate(cert);
+        }
+        // The client certificate (second factor beside the token): both files or neither, checked
+        // and loaded once. Only this client carries it; `upgrade::http` builds its own.
+        if let Some((cert, key)) = crate::clientcert::pair(link.client_cert.as_deref(), link.client_key.as_deref())? {
+            b = b.identity(crate::clientcert::load(cert, key)?.identity);
         }
         let http = b.build().context("build http client")?;
         Ok(Self {
@@ -125,6 +156,12 @@ impl RemoteClient {
 
     pub fn project(&self) -> Option<&str> {
         self.project.as_deref()
+    }
+
+    /// `send_post` for the tests of other modules (the client certificate's).
+    #[cfg(test)]
+    pub(crate) fn send_post_for_test(&self, path: &str, body: &Value) -> Result<(reqwest::StatusCode, String)> {
+        self.send_post(path, body)
     }
 
     /// POST and return the status and body text, whatever the status.
@@ -502,7 +539,9 @@ impl RemoteClient {
 
 /// `dmem login`: write the `[server]` block into the config (preserving other keys), 0600. The
 /// block is rebuilt from scratch, so a legacy `insecure` key does not survive a re-login.
-pub fn login(url: &str, token: &str, ca_cert: Option<String>) -> Result<()> {
+pub fn login(url: &str, token: &str, ca_cert: Option<String>, client_cert: Option<String>, client_key: Option<String>) -> Result<()> {
+    // Both or neither, before anything is written; the paths are stored, never the contents.
+    crate::clientcert::pair(client_cert.as_deref(), client_key.as_deref())?;
     let path = crate::config::config_path().ok_or_else(|| anyhow!("could not resolve a config dir"))?;
     if let Some(p) = path.parent() {
         std::fs::create_dir_all(p)?;
@@ -516,6 +555,10 @@ pub fn login(url: &str, token: &str, ca_cert: Option<String>) -> Result<()> {
     server.insert("token".into(), toml::Value::String(token.to_string()));
     if let Some(ca) = ca_cert {
         server.insert("ca_cert".into(), toml::Value::String(ca));
+    }
+    if let (Some(c), Some(k)) = (client_cert.filter(|s| !s.trim().is_empty()), client_key.filter(|s| !s.trim().is_empty())) {
+        server.insert("client_cert".into(), toml::Value::String(c));
+        server.insert("client_key".into(), toml::Value::String(k));
     }
     doc.insert("server".into(), toml::Value::Table(server));
     // 0600 from creation (the config holds the bearer token); atomic temp+rename, no chmod window.
@@ -549,7 +592,7 @@ mod tests {
 
     #[test]
     fn insecure_link_is_refused_with_the_fix_spelled_out() {
-        let link = ServerLink { url: "https://x".into(), token: "t".into(), insecure: true, ca_cert: None };
+        let link = ServerLink { url: "https://x".into(), token: "t".into(), insecure: true, ca_cert: None, client_cert: None, client_key: None };
         let err = RemoteClient::new(&link).err().expect("insecure must be refused");
         let msg = format!("{err:#}");
         assert!(msg.contains("no longer honoured"), "{msg}");
@@ -558,7 +601,7 @@ mod tests {
 
     #[test]
     fn verified_link_builds() {
-        let link = ServerLink { url: "https://x/".into(), token: "t".into(), insecure: false, ca_cert: None };
+        let link = ServerLink { url: "https://x/".into(), token: "t".into(), insecure: false, ca_cert: None, client_cert: None, client_key: None };
         let c = RemoteClient::new(&link).expect("plain verified client");
         assert_eq!(c.base, "https://x", "trailing slash trimmed");
     }
@@ -568,7 +611,7 @@ mod tests {
     #[test]
     fn client_offers_the_pq_hybrid_first() {
         let groups = crate::tls::tests::offered_groups(|url| {
-            let link = ServerLink { url, token: "t".into(), insecure: false, ca_cert: None };
+            let link = ServerLink { url, token: "t".into(), insecure: false, ca_cert: None, client_cert: None, client_key: None };
             let _ = RemoteClient::new(&link).unwrap().send_post("/recall", &json!({}));
         });
         assert_eq!(groups.first(), Some(&rustls::NamedGroup::X25519MLKEM768), "{groups:?}");
@@ -577,7 +620,7 @@ mod tests {
 
     #[test]
     fn write_scope_must_travel_as_a_header_or_is_refused() {
-        let link = ServerLink { url: "https://x".into(), token: "t".into(), insecure: false, ca_cert: None };
+        let link = ServerLink { url: "https://x".into(), token: "t".into(), insecure: false, ca_cert: None, client_cert: None, client_key: None };
         let c = RemoteClient::new(&link).unwrap();
         assert!(c.write_scope.is_none(), "no scope named: no header, as before");
         let c = RemoteClient::new(&link).unwrap().with_write_scope(Some(String::new())).unwrap();

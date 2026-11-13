@@ -7,6 +7,8 @@ pub mod bootstrap;
 #[cfg(feature = "client")]
 pub mod client;
 #[cfg(feature = "client")]
+pub mod clientcert;
+#[cfg(feature = "client")]
 pub mod migrate;
 pub mod config;
 pub mod embedder;

@@ -2559,8 +2559,26 @@ async fn serve_tls<S>(
 where
     S: std::future::Future<Output = ()>,
 {
+    let listener = std::net::TcpListener::bind(sock).map_err(|e| anyhow::anyhow!("serve (tls): bind {sock}: {e}"))?;
+    serve_tls_on(listener, cfg, app, stop, grace).await
+}
+
+/// `serve_tls` on a listener the caller already holds. A test that wants a free port binds port
+/// 0 and passes the listener in, so the port is never released and re-bound between choosing it
+/// and serving on it (another process could take it in that gap).
+async fn serve_tls_on<S>(
+    listener: std::net::TcpListener,
+    cfg: axum_server::tls_rustls::RustlsConfig,
+    app: Router,
+    stop: S,
+    grace: Duration,
+) -> Result<()>
+where
+    S: std::future::Future<Output = ()>,
+{
+    listener.set_nonblocking(true).map_err(|e| anyhow::anyhow!("serve (tls): {e}"))?;
     let handle = axum_server::Handle::new();
-    let server = axum_server::bind_rustls(sock, cfg).handle(handle.clone()).serve(app.into_make_service());
+    let server = axum_server::from_tcp_rustls(listener, cfg).handle(handle.clone()).serve(app.into_make_service());
     tokio::pin!(server);
     tokio::select! {
         r = &mut server => return r.map_err(|e| anyhow::anyhow!("serve (tls): {e}")),
@@ -3375,7 +3393,7 @@ mod tests {
                     .unwrap();
             })
         });
-        let link = crate::config::ServerLink { url: format!("http://{addr}"), token: full, insecure: false, ca_cert: None };
+        let link = crate::config::ServerLink { url: format!("http://{addr}"), token: full, insecure: false, ca_cert: None, client_cert: None, client_key: None };
         let client = |ws: Option<&str>| {
             crate::client::RemoteClient::new(&link).unwrap().with_write_scope(ws.map(str::to_string)).unwrap()
         };
@@ -3677,7 +3695,7 @@ mod tests {
                 Json(json!({"forgotten": 2}))
             }));
         let (url, stop, join) = serve_on_loopback(old);
-        let link = crate::config::ServerLink { url, token: "tok-0123456789abcdef".into(), insecure: false, ca_cert: None };
+        let link = crate::config::ServerLink { url, token: "tok-0123456789abcdef".into(), insecure: false, ca_cert: None, client_cert: None, client_key: None };
         let scoped = crate::client::RemoteClient::new(&link).unwrap().with_write_scope(Some("room:x".into())).unwrap();
         for e in [
             scoped.remember("a room note", "resources/notes", None, None).expect_err("refused"),
@@ -3707,7 +3725,7 @@ mod tests {
             .route("/remember", post(|| async { Json(json!({"uri": "daimon://resources/notes/memory/x", "scope": ""})) }))
             .route("/log_lesson", post(|| async { Json(json!({"uri": "daimon://agent/lessons/agent_lesson/y"})) }));
         let (url, stop, join) = serve_on_loopback(app);
-        let link = crate::config::ServerLink { url, token: "tok-0123456789abcdef".into(), insecure: false, ca_cert: None };
+        let link = crate::config::ServerLink { url, token: "tok-0123456789abcdef".into(), insecure: false, ca_cert: None, client_cert: None, client_key: None };
         let c = crate::client::RemoteClient::new(&link).unwrap().with_write_scope(Some("room:x".into())).unwrap();
         let e = c.remember("a room note", "resources/notes", None, None).expect_err("landed elsewhere");
         assert!(format!("{e:#}").contains("in scope '', not the requested 'room:x'"), "{e:#}");
@@ -3735,7 +3753,7 @@ mod tests {
                 }),
             );
             let (url, stop, join) = serve_on_loopback(app);
-            let link = crate::config::ServerLink { url, token: "tok-0123456789abcdef".into(), insecure: false, ca_cert: None };
+            let link = crate::config::ServerLink { url, token: "tok-0123456789abcdef".into(), insecure: false, ca_cert: None, client_cert: None, client_key: None };
             let c = crate::client::RemoteClient::new(&link).unwrap();
             assert!(c.recall_quiet("install", 10).unwrap().is_empty());
             assert!(c.recall_quiet("install", 10).unwrap().is_empty());
@@ -3754,7 +3772,7 @@ mod tests {
         let (dir, iam, _full, _bridge) = scope_fixture("boundc");
         let alice = iam.mint_scoped_token("boundc", "alice", None, &["user:alice".to_string()], Some("user:alice"), false).unwrap();
         let (url, stop, join) = serve_on_loopback(router(Arc::new(BearerAuth::from_env().unwrap()), Some(iam)));
-        let link = crate::config::ServerLink { url, token: alice, insecure: false, ca_cert: None };
+        let link = crate::config::ServerLink { url, token: alice, insecure: false, ca_cert: None, client_cert: None, client_key: None };
         let e = crate::client::RemoteClient::new(&link).unwrap().with_write_scope(Some("room:x".into())).unwrap()
             .remember("zq alice via scope", "resources/notes", None, None).expect_err("refused");
         assert!(format!("{e:#}").contains("bound to its own write scope"), "{e:#}");
@@ -4734,12 +4752,13 @@ mod tests {
         let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
         let (cert_pem, key_pem) = (ck.cert.pem(), ck.key_pair.serialize_pem());
         let cfg = axum_server::tls_rustls::RustlsConfig::from_pem(cert_pem.clone().into_bytes(), key_pem.into_bytes()).await.unwrap();
-        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
-        let sock: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let sock = listener.local_addr().unwrap();
+        let port = sock.port();
         let started = Arc::new(AtomicBool::new(false));
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
-        let server = tokio::spawn(serve_tls(
-            sock,
+        let server = tokio::spawn(serve_tls_on(
+            listener,
             cfg,
             slow_router(started.clone(), Duration::from_millis(1500)),
             async move {
@@ -4793,12 +4812,12 @@ mod tests {
             sans: vec![],
         };
         let cfg = tls_config("127.0.0.1:0", &opts).await.unwrap().expect("cert and key given");
-        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
-        let sock: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let sock = listener.local_addr().unwrap();
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
         let app = Router::new().route("/", get(|| async { "ok" }));
-        let server = tokio::spawn(serve_tls(
-            sock,
+        let server = tokio::spawn(serve_tls_on(
+            listener,
             cfg,
             app,
             async move {

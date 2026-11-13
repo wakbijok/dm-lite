@@ -39,6 +39,19 @@ pub fn run() -> Result<()> {
             if !ca.trim().is_empty() {
                 server.insert("ca_cert".into(), toml::Value::String(ca.trim().to_string()));
             }
+            // A client certificate (a second factor, when the server or its proxy asks for one).
+            // Paths only: the files are read at use, the key must be mode 0600 and unencrypted.
+            let cert: String = Input::with_theme(&theme)
+                .with_prompt("Client certificate PEM path (blank = none; the server or its proxy must ask for one)")
+                .allow_empty(true)
+                .interact_text()?;
+            if !cert.trim().is_empty() {
+                let key: String = Input::with_theme(&theme)
+                    .with_prompt("Client private key PEM path (mode 0600, no passphrase)")
+                    .interact_text()?;
+                server.insert("client_cert".into(), toml::Value::String(cert.trim().to_string()));
+                server.insert("client_key".into(), toml::Value::String(key.trim().to_string()));
+            }
         }
         doc.insert("server".into(), toml::Value::Table(server));
     } else {

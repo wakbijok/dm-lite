@@ -18,8 +18,8 @@ covered in `NOTICE`, and the AWS-LC licence text is in `THIRD-PARTY-aws-lc.txt`.
 
 | Licence | Crates using it |
 |---|---|
-| Apache License 2.0 (`Apache-2.0`) | 240 |
-| MIT License (`MIT`) | 87 |
+| Apache License 2.0 (`Apache-2.0`) | 249 |
+| MIT License (`MIT`) | 88 |
 | ISC License (`ISC`) | 21 |
 | Unicode License v3 (`Unicode-3.0`) | 21 |
 | BSD 3-Clause "New" or "Revised" License (`BSD-3-Clause`) | 5 |
@@ -454,7 +454,7 @@ Used by: deranged 0.5.8
 
 ### Apache License 2.0 (`Apache-2.0`)
 
-Used by: dm-lite 0.5.3, encode_unicode 1.0.0, encoding_rs 0.8.35, static_assertions 1.1.0, utf8_iter 1.0.4, zeroize 1.9.0
+Used by: dm-lite 0.5.4, encode_unicode 1.0.0, encoding_rs 0.8.35, static_assertions 1.1.0, utf8_iter 1.0.4, zeroize 1.9.0
 
 ~~~~~~~~text
 
@@ -875,7 +875,7 @@ Used by: hf-hub 0.4.3
 
 ### Apache License 2.0 (`Apache-2.0`)
 
-Used by: linux-raw-sys 0.12.1, rustix 1.1.4
+Used by: linux-raw-sys 0.12.1, rustix 1.1.6
 
 ~~~~~~~~text
 
@@ -4729,7 +4729,7 @@ limitations under the License.
 
 ### Apache License 2.0 (`Apache-2.0`)
 
-Used by: ahash 0.8.12, arc-swap 1.9.1, atomic-waker 1.1.2, base64 0.13.1, base64 0.22.1, bitflags 1.3.2, bitflags 2.13.0, cfg-if 1.0.4, core-foundation-sys 0.8.7, core-foundation 0.10.1, core-foundation 0.9.4, crossbeam-deque 0.8.6, crossbeam-epoch 0.9.20, crossbeam-utils 0.8.21, displaydoc 0.2.6, either 1.16.0, equivalent 1.0.2, errno 0.3.14, fastrand 2.4.1, filetime 0.2.29, flate2 1.1.9, fnv 1.0.7, form_urlencoded 1.2.2, hashbrown 0.17.1, heck 0.5.0, httparse 1.10.1, hyper-rustls 0.27.9, hyper-tls 0.6.0, idna 1.1.0, idna_adapter 1.2.2, indexmap 2.14.0, itertools 0.14.0, linux-raw-sys 0.12.1, log 0.4.32, mime 0.3.17, num-bigint 0.4.6, num-complex 0.4.6, num-integer 0.1.46, num-iter 0.1.45, num-rational 0.4.2, num-traits 0.2.19, num 0.4.3, num_cpus 1.17.0, once_cell 1.21.4, openssl-probe 0.2.1, percent-encoding 2.3.2, rayon-cond 0.4.0, rayon-core 1.13.0, rayon 1.12.0, regex-automata 0.4.14, regex-syntax 0.8.11, regex 1.12.4, ring 0.17.14, rustix 1.1.4, rustls-pemfile 2.2.0, rustls 0.23.46, security-framework-sys 2.17.0, security-framework 3.7.0, self-replace 1.5.0, serde_plain 1.0.2, signal-hook-registry 1.4.8, smallvec 1.15.2, socket2 0.6.4, stable_deref_trait 1.2.1, system-configuration-sys 0.6.0, system-configuration 0.7.0, tar 0.4.46, tempfile 3.27.0, unicode-normalization-alignments 0.1.12, unicode-segmentation 1.13.3, unicode-width 0.2.2, ureq 2.12.1, url 2.5.8, xattr 1.6.1
+Used by: ahash 0.8.12, arc-swap 1.9.1, asn1-rs-derive 0.6.0, asn1-rs 0.7.2, atomic-waker 1.1.2, base64 0.13.1, base64 0.22.1, bitflags 1.3.2, bitflags 2.13.0, cfg-if 1.0.4, core-foundation-sys 0.8.7, core-foundation 0.10.1, core-foundation 0.9.4, crossbeam-deque 0.8.6, crossbeam-epoch 0.9.20, crossbeam-utils 0.8.21, der-parser 10.0.0, displaydoc 0.2.6, either 1.16.0, equivalent 1.0.2, errno 0.3.14, fastrand 2.4.1, filetime 0.2.29, flate2 1.1.9, fnv 1.0.7, form_urlencoded 1.2.2, hashbrown 0.17.1, heck 0.5.0, httparse 1.10.1, hyper-rustls 0.27.9, hyper-tls 0.6.0, idna 1.1.0, idna_adapter 1.2.2, indexmap 2.14.0, itertools 0.14.0, lazy_static 1.5.1, linux-raw-sys 0.12.1, log 0.4.32, mime 0.3.17, num-bigint 0.4.6, num-complex 0.4.6, num-integer 0.1.46, num-iter 0.1.45, num-rational 0.4.2, num-traits 0.2.19, num 0.4.3, num_cpus 1.17.0, oid-registry 0.8.1, once_cell 1.21.4, openssl-probe 0.2.1, percent-encoding 2.3.2, rayon-cond 0.4.0, rayon-core 1.13.0, rayon 1.12.0, regex-automata 0.4.14, regex-syntax 0.8.11, regex 1.12.4, ring 0.17.14, rusticata-macros 4.1.0, rustix 1.1.6, rustls-pemfile 2.2.0, rustls 0.23.46, security-framework-sys 2.17.0, security-framework 3.7.0, self-replace 1.5.0, serde_plain 1.0.2, signal-hook-registry 1.4.8, smallvec 1.15.2, socket2 0.6.4, stable_deref_trait 1.2.1, system-configuration-sys 0.6.0, system-configuration 0.7.0, tar 0.4.46, tempfile 3.27.0, unicode-normalization-alignments 0.1.12, unicode-segmentation 1.13.3, unicode-width 0.2.2, ureq 2.12.1, url 2.5.8, x509-parser 0.18.1, xattr 1.6.1
 
 ~~~~~~~~text
                               Apache License
@@ -6664,7 +6664,7 @@ limitations under the License.
 
 ### Apache License 2.0 (`Apache-2.0`)
 
-Used by: zvec-sys 0.5.0, zvec 0.5.0, anyhow 1.0.104, async-trait 0.1.89, aws-lc-sys 0.45.0, candle-nn 0.8.4, candle-transformers 0.8.4, dary_heap 0.3.9, dirs-sys 0.4.1, dirs-sys 0.5.0, dirs 5.0.1, dirs 6.0.0, half 2.7.1, ident_case 1.0.1, itoa 1.0.18, libc 0.2.186, miniz_oxide 0.8.9, monostate-impl 0.1.18, monostate 0.1.18, num-conv 0.2.2, num_enum 0.7.6, num_enum_derive 0.7.6, paste 1.0.15, pin-project-lite 0.2.17, portable-atomic 1.13.1, proc-macro2 1.0.106, quote 1.0.45, rand 0.9.4, rand_chacha 0.9.0, rcgen 0.13.2, rustversion 1.0.22, ryu 1.0.23, semver 1.0.28, seq-macro 0.3.6, serde 1.0.228, serde_core 1.0.228, serde_derive 1.0.228, serde_json 1.0.150, serde_path_to_error 0.1.20, serde_urlencoded 0.7.1, syn 2.0.118, syn 3.0.10, sync_wrapper 1.0.2, thiserror-impl 1.0.69, thiserror-impl 2.0.21, thiserror 1.0.69, thiserror 2.0.21, time-core 0.1.9, time 0.3.49, ug 0.1.0, unicode-ident 1.0.24, utf8parse 0.2.2, yasna 0.5.2
+Used by: zvec-sys 0.5.0, zvec 0.5.0, anyhow 1.0.104, asn1-rs-impl 0.2.0, async-trait 0.1.89, aws-lc-sys 0.45.0, candle-nn 0.8.4, candle-transformers 0.8.4, dary_heap 0.3.9, dirs-sys 0.4.1, dirs-sys 0.5.0, dirs 5.0.1, dirs 6.0.0, half 2.7.1, ident_case 1.0.1, itoa 1.0.18, libc 0.2.186, miniz_oxide 0.8.9, monostate-impl 0.1.18, monostate 0.1.18, num-conv 0.2.2, num_enum 0.7.6, num_enum_derive 0.7.6, paste 1.0.15, pin-project-lite 0.2.17, portable-atomic 1.13.1, proc-macro2 1.0.106, quote 1.0.45, rand 0.9.4, rand_chacha 0.9.0, rcgen 0.13.2, rustversion 1.0.22, ryu 1.0.23, semver 1.0.28, seq-macro 0.3.6, serde 1.0.228, serde_core 1.0.228, serde_derive 1.0.228, serde_json 1.0.150, serde_path_to_error 0.1.20, serde_urlencoded 0.7.1, syn 2.0.118, syn 3.0.10, sync_wrapper 1.0.2, thiserror-impl 1.0.69, thiserror-impl 2.0.21, thiserror 1.0.69, thiserror 2.0.21, time-core 0.1.9, time-macros 0.2.29, time 0.3.49, ug 0.1.0, unicode-ident 1.0.24, utf8parse 0.2.2, yasna 0.5.2
 
 ~~~~~~~~text
 Apache License
@@ -8894,7 +8894,7 @@ USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 ### MIT License (`MIT`)
 
-Used by: tokio-util 0.7.18, tokio 1.52.3
+Used by: tokio-util 0.7.18, tokio 1.54.1
 
 ~~~~~~~~text
 MIT License
@@ -9179,6 +9179,36 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
+~~~~~~~~
+
+### MIT License (`MIT`)
+
+Used by: data-encoding 2.11.1
+
+~~~~~~~~text
+The MIT License (MIT)
+
+Copyright (c) 2015-2020 Julien Cretin
+Copyright (c) 2017-2020 Google Inc.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
 ~~~~~~~~
 
 ### MIT License (`MIT`)

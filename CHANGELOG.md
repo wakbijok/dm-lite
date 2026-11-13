@@ -3,6 +3,60 @@
 Notable changes to dm-lite (`dmem`). Releases up to and including 0.3.6 are
 described on [GitHub Releases](https://github.com/wakbijok/dm-lite/releases).
 
+## 0.5.4 - 2026-11-13
+
+### Added
+
+- **A TLS client certificate for the remote client (a second factor beside the token).**
+  `[server].client_cert` and `client_key` (PEM paths; `DM_CLIENT_CERT` and `DM_CLIENT_KEY`
+  override them field by field) are presented on every remote call: the CLI, the MCP tools, the
+  hooks and `dmem status`. Both or neither: half a pair is an error, never a silent token-only
+  fallback. `dmem login <url> --client-cert <pem> --client-key <pem>` (and `dmem setup`) write the
+  paths into the config; the files are not copied. `ca_cert` is unchanged and plays no part.
+  - **The key file is checked before it is read** (Unix): not a symlink (also refused if one is
+    swapped in after the check), not readable or writable by group or others, owned by the user.
+    A passphrase-protected key is refused with the fix, since a prompt would hang a hook. The key
+    and the certificate must belong together, which is checked at load, not at the first
+    request. The key bytes are held in a buffer that is wiped on drop and are never printed or
+    put in an error; errors name the path only. Copies made inside rustls and reqwest are not
+    wiped.
+  - **`dmem doctor`** (text and `--json`) shows the certificate's subject, issuer, serial and
+    expiry, a warning from 30 days out, an error when it is expired, not yet valid or lacks the
+    clientAuth key usage, and `none (token only)` when none is configured. Nothing from the key.
+    It also lists `DM_CLIENT_CERT`, `DM_CLIENT_KEY` and `DM_RECALL_FLOOR_SCOPE` when set.
+  - **A refused handshake gets a hint.** When the server or its proxy rejects the connection
+    for a missing or unknown client certificate (TLS alerts `certificate_required`,
+    `bad_certificate`, `unknown_ca`), the error says which settings to check.
+  - **`dmem upgrade` and `dmem migrate --url` never offer it** (a test pins that). `dmem serve`
+    does not ask for client certificates; enforcement is the proxy's (Caddy) job.
+  - **New direct dependencies of the `client` feature:** `x509-parser` 0.18 (no default
+    features; reads the certificate for `doctor`) and `zeroize` 1 (wipes the key buffer). They
+    bring ten new crates into `Cargo.lock` (asn1-rs, asn1-rs-derive, asn1-rs-impl,
+    data-encoding, der-parser, lazy_static, oid-registry, rusticata-macros, time-macros,
+    x509-parser). The release that ships this needs `cargo audit` and the licence notice made
+    again.
+
+### Security
+
+- **`tokio` 1.52.3 to 1.54.1 and `rustix` 1.1.4 to 1.1.6 (lock file only).** This resolves
+  RUSTSEC-2026-0386 (tokio: `AsyncFd::new` and related constructors violate I/O safety) and
+  RUSTSEC-2026-0486 (rustix: the xattr functions mark unwritten bytes as initialized when given a
+  zero-length buffer). Both were "unsound" warnings, not vulnerabilities, and dm-lite uses neither
+  API (no `AsyncFd`, no xattr call), so no released version was exploitable through them; the
+  bump keeps `cargo audit` clean of them. They applied to 0.5.0 through 0.5.3 as well. What
+  `cargo audit` still reports is the four `zip` 1.1.4 advisories already accepted (RUSTSEC-2026-0367,
+  -0368, -0369, -0429: candle never extracts an archive) and four unmaintained-crate warnings
+  (number_prefix, paste, rustls-pemfile, unsafe-libyaml).
+- **`dmem doctor` shows control characters in a client certificate's subject and issuer as `?`.**
+  The names are whatever the certificate's issuer wrote; a terminal escape sequence or a newline
+  in one could otherwise rewrite what `doctor` prints.
+
+### Fixed
+
+- A server test (`tls_negotiates_the_pq_hybrid_and_falls_back_to_x25519`) and one other chose a
+  free port by binding and releasing it, then served on it; another process could take the port
+  in between and fail the test. They now serve on a listener they keep open.
+
 ## 0.5.3 - 2026-11-13
 
 ### Fixed

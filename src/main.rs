@@ -373,6 +373,13 @@ enum Cmd {
         /// --tls-generate` writes; TLS verification itself cannot be turned off.
         #[arg(long = "ca-cert")]
         ca_cert: Option<String>,
+        /// present this client certificate (PEM path) on every call; needs --client-key. The file
+        /// is not copied: the path goes into the config.
+        #[arg(long = "client-cert", requires = "client_key")]
+        client_cert: Option<String>,
+        /// the private key (PEM path, mode 0600, no passphrase) of --client-cert
+        #[arg(long = "client-key", requires = "client_cert")]
+        client_key: Option<String>,
     },
     /// Disconnect from the remote server (clears [server]). Needs --features client.
     #[cfg(feature = "client")]
@@ -841,7 +848,7 @@ fn run() -> Result<()> {
         #[cfg(feature = "self-update")]
         Cmd::Upgrade { pre, yes } => upgrade::run(pre, yes),
         #[cfg(feature = "client")]
-        Cmd::Login { url, token, ca_cert } => {
+        Cmd::Login { url, token, ca_cert, client_cert, client_key } => {
             // Token sourcing ladder (audit High #3): flag-less env var, then an stdin prompt.
             // The positional form still works but is discouraged - it leaks via shell history
             // and process listings.
@@ -864,7 +871,7 @@ fn run() -> Result<()> {
                     }
                 },
             };
-            client::login(&url, &token, ca_cert)
+            client::login(&url, &token, ca_cert, client_cert, client_key)
         }
         #[cfg(feature = "client")]
         Cmd::Logout => client::logout(),
@@ -1045,6 +1052,16 @@ fn doctor(json: bool) -> Result<()> {
     let server_url = config::server_link().map(|l| l.url.clone());
     #[cfg(not(feature = "client"))]
     let server_url: Option<String> = None;
+    // The client certificate, as `dmem doctor` shows it: (state, text). Only certificate fields,
+    // never anything from the key file.
+    #[cfg(feature = "client")]
+    let client_cert: Option<(&'static str, String)> = config::server_link().map(|l| {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+        let r = dm_lite::clientcert::report(l.client_cert.as_deref(), l.client_key.as_deref(), now);
+        (r.state, r.line)
+    });
+    #[cfg(not(feature = "client"))]
+    let client_cert: Option<(&'static str, String)> = None;
     let mode = if server_url.is_some() { "remote client" } else { "embedded" };
     // A remote client never loads the embedder: recall/save go over HTTPS and the server embeds.
     // The embedder section below is capability info for serve/embedded/air-gapped use only.
@@ -1077,7 +1094,7 @@ fn doctor(json: bool) -> Result<()> {
     } else {
         "degraded: placeholder embedder (DM_REQUIRE_MODEL=0)".to_string()
     };
-    let env: Vec<(&str, String)> = ["HF_HOME", "HUGGINGFACE_HUB_CACHE", "HF_HUB_OFFLINE", "DM_REQUIRE_MODEL", "DM_CANDLE_MODEL", "DM_M2V_MODEL", "DM_CANDLE_F16", "DM_ENDPOINT", "DM_RECALL_FLOOR", "DM_RECALL_EXPAND"]
+    let env: Vec<(&str, String)> = ["HF_HOME", "HUGGINGFACE_HUB_CACHE", "HF_HUB_OFFLINE", "DM_REQUIRE_MODEL", "DM_CANDLE_MODEL", "DM_M2V_MODEL", "DM_CANDLE_F16", "DM_ENDPOINT", "DM_CLIENT_CERT", "DM_CLIENT_KEY", "DM_RECALL_FLOOR", "DM_RECALL_FLOOR_SCOPE", "DM_RECALL_EXPAND"]
         .iter()
         .filter_map(|k| std::env::var(k).ok().map(|v| (*k, v)))
         .collect();
@@ -1087,6 +1104,7 @@ fn doctor(json: bool) -> Result<()> {
             "version": env!("CARGO_PKG_VERSION"),
             "mode": mode,
             "server": server_url,
+            "client_cert": client_cert.as_ref().map(|(state, detail)| serde_json::json!({ "state": state, "detail": detail })),
             "tenant": tenant,
             "store": store,
             "embedder": d.name,
@@ -1110,6 +1128,10 @@ fn doctor(json: bool) -> Result<()> {
     println!("mode        : {mode}");
     if let Some(u) = &server_url {
         println!("server      : {u}");
+    }
+    if let Some((state, line)) = &client_cert {
+        let mark = match *state { "warn" => " [warning]", "error" => " [ERROR]", _ => "" };
+        println!("client cert : {line}{mark}");
     }
     println!("tenant      : {tenant}");
     if let Some(s) = &store {

@@ -31,6 +31,13 @@ pub struct ServerLink {
     pub insecure: bool,
     /// Trust a specific CA / self-signed cert (PEM path) instead of the system roots.
     pub ca_cert: Option<String>,
+    /// The client certificate (PEM path, may include the issuing chain) and its private key
+    /// (PEM path) presented on every remote call. Both or neither; `DM_CLIENT_CERT` and
+    /// `DM_CLIENT_KEY` override them field by field. See `clientcert`.
+    #[serde(default)]
+    pub client_cert: Option<String>,
+    #[serde(default)]
+    pub client_key: Option<String>,
 }
 
 static CONFIG: OnceLock<Config> = OnceLock::new();
@@ -139,6 +146,8 @@ pub fn server_link() -> Option<&'static ServerLink> {
             resolve_server_link(
                 std::env::var("DM_ENDPOINT").ok().filter(|s| !s.trim().is_empty()),
                 std::env::var("DM_TOKEN").ok().filter(|s| !s.trim().is_empty()),
+                std::env::var("DM_CLIENT_CERT").ok().filter(|s| !s.trim().is_empty()),
+                std::env::var("DM_CLIENT_KEY").ok().filter(|s| !s.trim().is_empty()),
                 config().server.clone(),
             )
         })
@@ -148,15 +157,28 @@ pub fn server_link() -> Option<&'static ServerLink> {
 /// Pure precedence resolver for the server link (unit-tested). url = endpoint else config; token =
 /// token_env else config; insecure/ca_cert from config. None only when neither is present.
 #[cfg_attr(not(feature = "client"), allow(dead_code))]
-fn resolve_server_link(endpoint: Option<String>, token_env: Option<String>, cfg: Option<ServerLink>) -> Option<ServerLink> {
+fn resolve_server_link(
+    endpoint: Option<String>,
+    token_env: Option<String>,
+    cert_env: Option<String>,
+    key_env: Option<String>,
+    cfg: Option<ServerLink>,
+) -> Option<ServerLink> {
     match (endpoint, cfg) {
         (Some(url), cfg) => Some(ServerLink {
             url,
             token: token_env.or_else(|| cfg.as_ref().map(|s| s.token.clone())).unwrap_or_default(),
             insecure: cfg.as_ref().map(|s| s.insecure).unwrap_or(false),
+            client_cert: cert_env.or_else(|| cfg.as_ref().and_then(|s| s.client_cert.clone())),
+            client_key: key_env.or_else(|| cfg.as_ref().and_then(|s| s.client_key.clone())),
             ca_cert: cfg.and_then(|s| s.ca_cert),
         }),
-        (None, Some(cfg)) => Some(ServerLink { token: token_env.unwrap_or(cfg.token), ..cfg }),
+        (None, Some(cfg)) => Some(ServerLink {
+            token: token_env.unwrap_or(cfg.token),
+            client_cert: cert_env.or(cfg.client_cert),
+            client_key: key_env.or(cfg.client_key),
+            ..cfg
+        }),
         (None, None) => None,
     }
 }
@@ -628,24 +650,48 @@ mod tests {
 
     #[test]
     fn server_link_resolution_precedence() {
-        let cfg = || ServerLink { url: "https://cfg".into(), token: "ctok".into(), insecure: true, ca_cert: Some("/ca.pem".into()) };
+        let cfg = || ServerLink { url: "https://cfg".into(), token: "ctok".into(), insecure: true, ca_cert: Some("/ca.pem".into()), client_cert: None, client_key: None };
+        let r = |ep: Option<&str>, tok: Option<&str>, cfg: Option<ServerLink>| {
+            resolve_server_link(ep.map(Into::into), tok.map(Into::into), None, None, cfg)
+        };
         // endpoint overrides url; token + insecure + ca_cert inherited from config when no DM_TOKEN
-        let r = resolve_server_link(Some("https://flag".into()), None, Some(cfg())).unwrap();
-        assert_eq!(r.url, "https://flag");
-        assert_eq!(r.token, "ctok");
-        assert!(r.insecure && r.ca_cert.as_deref() == Some("/ca.pem"));
+        let l = r(Some("https://flag"), None, Some(cfg())).unwrap();
+        assert_eq!(l.url, "https://flag");
+        assert_eq!(l.token, "ctok");
+        assert!(l.insecure && l.ca_cert.as_deref() == Some("/ca.pem"));
         // DM_TOKEN overrides the config token
-        assert_eq!(resolve_server_link(Some("https://flag".into()), Some("etok".into()), Some(cfg())).unwrap().token, "etok");
+        assert_eq!(r(Some("https://flag"), Some("etok"), Some(cfg())).unwrap().token, "etok");
         // endpoint with no config -> empty token
-        let r = resolve_server_link(Some("https://flag".into()), None, None).unwrap();
-        assert_eq!((r.url.as_str(), r.token.as_str(), r.insecure), ("https://flag", "", false));
+        let l = r(Some("https://flag"), None, None).unwrap();
+        assert_eq!((l.url.as_str(), l.token.as_str(), l.insecure), ("https://flag", "", false));
         // no endpoint, config only -> config url + token
-        let r = resolve_server_link(None, None, Some(cfg())).unwrap();
-        assert_eq!((r.url.as_str(), r.token.as_str()), ("https://cfg", "ctok"));
+        let l = r(None, None, Some(cfg())).unwrap();
+        assert_eq!((l.url.as_str(), l.token.as_str()), ("https://cfg", "ctok"));
         // DM_TOKEN overrides even without an endpoint
-        assert_eq!(resolve_server_link(None, Some("etok".into()), Some(cfg())).unwrap().token, "etok");
+        assert_eq!(r(None, Some("etok"), Some(cfg())).unwrap().token, "etok");
         // nothing -> embedded
-        assert!(resolve_server_link(None, None, None).is_none());
+        assert!(r(None, None, None).is_none());
+    }
+
+    #[test]
+    fn client_cert_env_overrides_the_config_field_by_field() {
+        let cfg = || ServerLink {
+            url: "https://cfg".into(), token: "t".into(), insecure: false, ca_cert: None,
+            client_cert: Some("/cfg/c.pem".into()), client_key: Some("/cfg/k.pem".into()),
+        };
+        let pair = |l: &ServerLink| (l.client_cert.clone(), l.client_key.clone());
+        // nothing in the environment: the config's pair
+        let l = resolve_server_link(None, None, None, None, Some(cfg())).unwrap();
+        assert_eq!(pair(&l), (Some("/cfg/c.pem".into()), Some("/cfg/k.pem".into())));
+        // one field overridden, the other kept
+        let l = resolve_server_link(None, None, Some("/env/c.pem".into()), None, Some(cfg())).unwrap();
+        assert_eq!(pair(&l), (Some("/env/c.pem".into()), Some("/cfg/k.pem".into())));
+        // an endpoint (the --endpoint flag) inherits the config's pair, and the env still wins
+        let l = resolve_server_link(Some("https://flag".into()), None, None, Some("/env/k.pem".into()), Some(cfg())).unwrap();
+        assert_eq!(pair(&l), (Some("/cfg/c.pem".into()), Some("/env/k.pem".into())));
+        // env only, no config at all
+        let l = resolve_server_link(Some("https://flag".into()), None, Some("/e/c".into()), Some("/e/k".into()), None).unwrap();
+        assert_eq!(pair(&l), (Some("/e/c".into()), Some("/e/k".into())));
     }
 
     #[test]
