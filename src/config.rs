@@ -303,6 +303,17 @@ pub fn recall_floor() -> RecallFloor {
     parse_recall_floor(std::env::var("DM_RECALL_FLOOR").ok().as_deref())
 }
 
+/// `DM_RECALL_FLOOR_SCOPE=area` makes a folder-scoped recall (`recall_in`) judge the relevance
+/// floor's relative gate against the best hit inside the folders instead of the whole tenant's
+/// best hit. Off by default: a scoped recall then gates exactly as a whole-tenant recall does.
+pub fn parse_recall_floor_scope_area(val: Option<&str>) -> bool {
+    matches!(val.map(|v| v.trim().to_ascii_lowercase()).as_deref(), Some("area"))
+}
+
+pub fn recall_floor_scope_area() -> bool {
+    parse_recall_floor_scope_area(std::env::var("DM_RECALL_FLOOR_SCOPE").ok().as_deref())
+}
+
 /// Graph-expansion depth for the per-prompt recall hook, read fresh from `DM_RECALL_EXPAND`
 /// (default 1 hop; "0"/"off"/"false"/"no" => plain recall, no expansion). An env knob like
 /// `recall_floor` so it can be dialed without a config-file edit; capped at 5 hops. Expansion is

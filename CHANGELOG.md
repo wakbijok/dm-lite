@@ -3,6 +3,43 @@
 Notable changes to dm-lite (`dmem`). Releases up to and including 0.3.6 are
 described on [GitHub Releases](https://github.com/wakbijok/dm-lite/releases).
 
+## 0.5.3 - 2026-11-13
+
+### Fixed
+
+- **A folder-scoped recall finds a small folder behind a large one.** `POST /recall` with
+  `"namespaces": [...]` (and `recall_in`) used to run the ordinary recall over the whole tenant
+  and keep, afterwards, the records under the named folders. With a large tenant the keyword and
+  vector pools were full of other folders' records, so a small folder got no hits at all (400
+  matching records under one folder and 3 under another: the 3 never came back). The folders are
+  now part of both searches: the keyword query carries them as a literal prefix match before its
+  `LIMIT`, and the vector search keeps looking deeper (up to 4096 slots instead of 1024) until
+  it has found enough records under them. Several prefixes in one call work the same way. No
+  index or file format changes. **Limit:** the vector search looks at most 4096 slots deep, so in
+  a tenant with far more than that many records nearer to the query than the folder's own, the
+  folder can still be missed on the vector side (the keyword side is exact). A vector-side filter
+  is planned for 0.6.
+
+### Changed
+
+- **`DM_RECALL_FLOOR_SCOPE=area` (off by default).** The relevance floor keeps a hit only if it
+  reaches 45% of the best hit of its channel. A folder-scoped recall judges that against the
+  whole tenant's best hit, as a whole-tenant recall does (one extra top-1 lookup per channel), so
+  by default the floor's decisions are the same as in 0.5.2. Set the variable to `area` to judge
+  it against the best hit inside the folders instead. **What the default does not fix:** in a
+  keyword-only build (no embedder) a folder whose matches are all weaker than 45% of the
+  tenant's best match is still gated out, because the pool is fixed but the gate is not. With
+  the embedder the gate that matters is the absolute cosine floor (0.62), which does not depend
+  on the pool, so there the default is enough. The same text is in the release notes.
+- **Small-corpus guard, keyword-only, folder-scoped recall.** In a keyword-only build, when
+  the floor gates every hit of a pool that is no larger than the limit, the pool is kept anyway
+  (the absolute scores of a tiny corpus mean nothing). A folder-scoped recall is no longer given
+  that benefit when the whole tenant's best hit does clear the floor: the folder is then one
+  part of a larger tenant, and its gated hits stay gated, as in a whole-tenant recall. This
+  changes what a scoped recall returns even with `DM_RECALL_FLOOR_SCOPE` unset. A whole-tenant
+  recall is unchanged (tests: a recall over every folder returns what `recall` returns; the guard's
+  own small, fully gated fixture).
+
 ## 0.5.2 - 2026-11-13
 
 ### Security

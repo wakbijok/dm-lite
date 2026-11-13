@@ -18,7 +18,15 @@ pub trait MemoryStore {
     /// that cannot score keywords should return a uniform `f64::INFINITY` (its keyword gate becomes
     /// a no-op). M0 is keyword-only (FTS); the dense vector + RRF layer fuses in above this, in the
     /// caller, when the embedder is present.
-    fn recall_scored(&self, query: &str, limit: usize) -> Result<Vec<(Entry, f64)>>;
+    fn recall_scored(&self, query: &str, limit: usize) -> Result<Vec<(Entry, f64)>> {
+        self.recall_scored_in(query, limit, &[])
+    }
+
+    /// `recall_scored` restricted to records whose namespace starts with ANY of `prefixes`
+    /// (a literal prefix, never a pattern). The restriction is part of the query, so the
+    /// `limit` counts only matching records: a small folder is not crowded out by a large one.
+    /// Empty `prefixes` = no restriction.
+    fn recall_scored_in(&self, query: &str, limit: usize, prefixes: &[String]) -> Result<Vec<(Entry, f64)>>;
 
     /// Live records best first (scores dropped). Derived from `recall_scored` so there is a single
     /// query path; callers that do not need magnitudes use this.

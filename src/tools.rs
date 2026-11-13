@@ -589,16 +589,33 @@ fn signal_boost(importance: i64, access_count: i64, last_access_ms: i64, now_ms:
 /// scale-free ratio trims the weak tail; the absolute keyword floor stays permissive). In that mode
 /// an off-topic query that shares a term can still leak a weak keyword hit - a documented limit of
 /// the keyword-only fallback; the off-topic-injects-zero guarantee lives in the cosine gate.
+#[cfg(test)]
 fn floor_survivors(
     kw: &[(String, f64)],
     vec: &[(String, f32)],
     f: &config::RecallFloor,
     small_corpus_max: usize,
 ) -> std::collections::HashSet<String> {
+    floor_survivors_ref(kw, vec, f, small_corpus_max, None, None)
+}
+
+/// `floor_survivors` with the relative gate's reference taken from the whole tenant's best hit
+/// (`ref_kw` for the keyword channel, `ref_vec` for the vector channel) instead of the best hit
+/// of the pool in hand. A folder-scoped recall passes them so that a small folder is judged
+/// against the same top hit as a whole-tenant recall (the 0.5.2 behaviour); `None` = the pool's
+/// own top, which is what a whole-tenant recall has always used.
+fn floor_survivors_ref(
+    kw: &[(String, f64)],
+    vec: &[(String, f32)],
+    f: &config::RecallFloor,
+    small_corpus_max: usize,
+    ref_kw: Option<f64>,
+    ref_vec: Option<f64>,
+) -> std::collections::HashSet<String> {
     use std::collections::HashSet;
     // Keyword-only mode: no cosine to gate on, so the bm25 relative gate is the floor.
     if vec.is_empty() {
-        let top_kw = kw.iter().map(|(_, s)| *s).fold(f64::NEG_INFINITY, f64::max);
+        let top_kw = kw.iter().map(|(_, s)| *s).fold(ref_kw.unwrap_or(f64::NEG_INFINITY), f64::max);
         let survivors: HashSet<String> = kw
             .iter()
             .filter(|(_, s)| *s >= f.abs_keyword && (top_kw <= 0.0 || *s >= f.rel_ratio * top_kw))
@@ -612,13 +629,17 @@ fn floor_survivors(
         // membership - FTS only returns docs containing the query terms - and keep them all
         // in rank order. Partial survival or a bigger pool means the magnitudes are
         // discriminating, so the gate stands.
-        if survivors.is_empty() && !kw.is_empty() && kw.len() <= small_corpus_max {
+        // A tenant-wide reference that clears the absolute floor shows the corpus is not tiny: the
+        // pool in hand is one folder of a larger tenant, so its gated hits stay gated, as they
+        // are in a whole-tenant recall.
+        let tenant_clears_floor = ref_kw.is_some_and(|r| r >= f.abs_keyword);
+        if survivors.is_empty() && !kw.is_empty() && kw.len() <= small_corpus_max && !tenant_clears_floor {
             return kw.iter().map(|(u, _)| u.clone()).collect();
         }
         return survivors;
     }
     // Hybrid: cosine is the floor.
-    let top_c = vec.iter().map(|(_, s)| *s as f64).fold(f64::NEG_INFINITY, f64::max);
+    let top_c = vec.iter().map(|(_, s)| *s as f64).fold(ref_vec.unwrap_or(f64::NEG_INFINITY), f64::max);
     let mut keep: HashSet<String> = vec
         .iter()
         .filter(|(_, s)| {
@@ -1552,9 +1573,16 @@ impl LocalMemory {
     }
 
     pub fn recall(&self, query: &str, limit: usize) -> Result<Vec<Entry>> {
+        self.recall_core(query, limit, &[], false)
+    }
+
+    /// The recall pipeline, optionally restricted to namespaces under any of `prefixes`
+    /// (empty = the whole tenant). The restriction is applied inside both channels, before
+    /// their pools are cut, so `limit` counts only records of those folders.
+    fn recall_core(&self, query: &str, limit: usize, prefixes: &[String], area_floor: bool) -> Result<Vec<Entry>> {
         #[cfg(feature = "zvec")]
         if let Some(vindex) = &self.vindex {
-            return self.recall_hybrid(query, limit, vindex);
+            return self.recall_hybrid(query, limit, vindex, prefixes, area_floor);
         }
         // Keyword-only: pull a deeper pool (so rescoring can promote beyond the top-`limit`
         // keyword hits), apply the relevance floor's keyword gate (drops the weak bm25 tail so a
@@ -1565,9 +1593,10 @@ impl LocalMemory {
             // No vector channel here, so the bm25 relative gate alone decides membership.
             // recall_scored preserves FTS-rank order and `filter` retains it, so rescore_keyword's
             // positional base stays aligned with bm25 rank.
-            let scored = self.store.recall_scored(query, pool)?;
+            let scored = self.store.recall_scored_in(query, pool, prefixes)?;
             let kw: Vec<(String, f64)> = scored.iter().map(|(e, s)| (e.uri.clone(), *s)).collect();
-            let keep = floor_survivors(&kw, &[], &floor, limit);
+            let ref_kw = self.keyword_floor_reference(query, prefixes, area_floor)?;
+            let keep = floor_survivors_ref(&kw, &[], &floor, limit, ref_kw, None);
             let kept: Vec<Entry> = scored.into_iter().filter(|(e, _)| keep.contains(&e.uri)).map(|(e, _)| e).collect();
             // Operator visibility: a default-on floor that empties a non-empty pool must not look
             // like "matched nothing". Say so, with the top magnitude that was rejected.
@@ -1580,7 +1609,7 @@ impl LocalMemory {
             }
             kept
         } else {
-            self.store.recall(query, pool)?
+            self.store.recall_scored_in(query, pool, prefixes)?.into_iter().map(|(e, _)| e).collect()
         };
         let out = self.rescore_keyword(hits, limit);
         self.bump_recalled(&out);
@@ -1589,33 +1618,60 @@ impl LocalMemory {
 
     /// Recall restricted to namespaces under any of `prefixes` (the knowledge plane's
     /// file-scope rule: a chunk's namespace is its file path, a reader's scope is the set of
-    /// folder prefixes they may see). Over-fetches, then filters; empty `prefixes` = no filter.
+    /// folder prefixes they may see). Each prefix is a literal; a record matches if its namespace
+    /// starts with any of them. The restriction is applied in both channels before ranking, so a
+    /// small folder is found however large the rest of the tenant is. Empty `prefixes` = no filter.
+    ///
+    /// The relevance floor's relative gate (a hit must reach `rel_ratio` of the best hit) takes
+    /// its reference from the whole tenant's best hit by default, as a whole-tenant recall does;
+    /// `DM_RECALL_FLOOR_SCOPE=area` takes it from the best hit inside the folders instead.
     pub fn recall_in(&self, query: &str, limit: usize, prefixes: &[String]) -> Result<Vec<Entry>> {
+        self.recall_in_with(query, limit, prefixes, config::recall_floor_scope_area())
+    }
+
+    /// `recall_in` with the per-area floor chosen by the caller (tests; the setting is
+    /// `DM_RECALL_FLOOR_SCOPE=area`).
+    pub(crate) fn recall_in_with(&self, query: &str, limit: usize, prefixes: &[String], area_floor: bool) -> Result<Vec<Entry>> {
         if prefixes.is_empty() {
             return self.recall(query, limit);
         }
-        let pool = self.recall(query, (limit * 6).max(30))?;
-        Ok(pool.into_iter()
-            .filter(|e| prefixes.iter().any(|p| e.namespace.starts_with(p.as_str())))
-            .take(limit)
-            .collect())
+        self.recall_core(query, limit, prefixes, area_floor)
+    }
+
+    /// The best keyword magnitude of a whole-tenant recall, for a folder-scoped recall's relative
+    /// gate (None when the gate should use the folders' own best hit, or there are no prefixes).
+    fn keyword_floor_reference(&self, query: &str, prefixes: &[String], area_floor: bool) -> Result<Option<f64>> {
+        if prefixes.is_empty() || area_floor {
+            return Ok(None);
+        }
+        Ok(self.store.recall_scored(query, 1)?.first().map(|(_, s)| *s).filter(|s| s.is_finite()))
     }
 
     /// Hybrid recall: SQLite FTS (keyword) + zvec (dense vector), fused by RRF, then nudged
     /// by runtime signals.
     #[cfg(feature = "zvec")]
-    fn recall_hybrid(&self, query: &str, limit: usize, vindex: &crate::zvec_index::ZvecIndex) -> Result<Vec<Entry>> {
+    fn recall_hybrid(&self, query: &str, limit: usize, vindex: &crate::zvec_index::ZvecIndex, prefixes: &[String], area_floor: bool) -> Result<Vec<Entry>> {
         use std::collections::HashMap;
         let pool = (limit * 2).max(10);
         // Pull both channels WITH their magnitudes: keyword hits carry -bm25 (and arrive already
         // hydrated), vector hits carry cosine similarity. Both are keyed per RECORD (uri, scope):
         // one uri can be held by several scopes this reader sees (global and its own room).
-        let kw_scored = self.store.recall_scored(query, pool)?;
+        let kw_scored = self.store.recall_scored_in(query, pool, prefixes)?;
         let kw: Vec<(String, f64)> = kw_scored.iter().map(|(e, s)| (record_key(&e.uri, &e.scope), *s)).collect();
         let mut entries: HashMap<String, Entry> =
             kw_scored.into_iter().map(|(e, _)| (record_key(&e.uri, &e.scope), e)).collect();
         let qv = self.query_vector(query);
-        let vec = self.vector_channel(vindex, &qv, pool, &mut entries)?;
+        let vec = self.vector_channel(vindex, &qv, pool, &mut entries, prefixes)?;
+        // The relative gate's reference for a folder-scoped recall: the whole tenant's best hit
+        // in each channel (one top-1 each), unless the per-area floor is on.
+        let (ref_kw, ref_vec) = if prefixes.is_empty() || area_floor {
+            (None, None)
+        } else {
+            let top_kw = self.store.recall_scored(query, 1)?.first().map(|(_, s)| *s).filter(|s| s.is_finite());
+            let mut scratch = HashMap::new();
+            let top_vec = self.vector_channel(vindex, &qv, 1, &mut scratch, &[])?.first().map(|(_, s)| *s as f64);
+            (top_kw, top_vec)
+        };
 
         // Relevance floor: gate channel MEMBERSHIP before fusion. RRF, the signal nudge, and
         // take(limit) below are byte-identical to before; the floor only removes weak pool hits
@@ -1628,7 +1684,7 @@ impl LocalMemory {
         if self.embedder.name() == "hash" {
             floor.abs_cosine = f64::NEG_INFINITY;
         }
-        let keep = if floor.enabled { Some(floor_survivors(&kw, &vec, &floor, limit)) } else { None };
+        let keep = if floor.enabled { Some(floor_survivors_ref(&kw, &vec, &floor, limit, ref_kw, ref_vec)) } else { None };
         let passes = |uri: &str| keep.as_ref().is_none_or(|k| k.contains(uri));
 
         let k = 60.0_f64;
@@ -1696,8 +1752,13 @@ impl LocalMemory {
         qv: &[f32],
         pool: usize,
         entries: &mut std::collections::HashMap<String, Entry>,
+        prefixes: &[String],
     ) -> Result<Vec<(String, f32)>> {
         const MAX_VECTOR_SLOTS: usize = 1024;
+        // A folder-scoped read may have to look much deeper: the index ranks every slot of the
+        // tenant, and the folders' slots can sit far down behind a large neighbour.
+        const MAX_SCOPED_VECTOR_SLOTS: usize = 4096;
+        let max_slots = if prefixes.is_empty() { MAX_VECTOR_SLOTS } else { MAX_SCOPED_VECTOR_SLOTS };
         let mut k = pool;
         loop {
             let hits = match vindex.search(qv, k) {
@@ -1710,11 +1771,15 @@ impl LocalMemory {
             };
             let exhausted = hits.len() < k;
             let mut vec = self.resolve_vector_hits(hits, entries)?;
-            if vec.len() >= pool || exhausted || k >= MAX_VECTOR_SLOTS || !self.store.filtered_reads() {
+            if !prefixes.is_empty() {
+                vec.retain(|(key, _)| entries.get(key).is_some_and(|e| prefixes.iter().any(|p| e.namespace.starts_with(p.as_str()))));
+            }
+            let widen = self.store.filtered_reads() || !prefixes.is_empty();
+            if vec.len() >= pool || exhausted || k >= max_slots || !widen {
                 vec.truncate(pool);
                 return Ok(vec);
             }
-            k = (k * 4).min(MAX_VECTOR_SLOTS);
+            k = (k * 4).min(max_slots);
         }
     }
 
@@ -4163,6 +4228,212 @@ mod tests {
         let vec = vec![v("x", 0.05)];
         let keep = floor_survivors(&kw, &vec, &floor(0.30, 0.0, 0.45), 0);
         assert!(keep.contains("recent1") && keep.contains("recent2"), "recent rows survive in hybrid too");
+    }
+
+    // A small area behind a big one (0.5.3). The knowledge plane asks recall_in for a few
+    // folders; the keyword and vector pools must be built from those folders, not from the whole
+    // tenant, or a small folder behind 400 matching chunks gets nothing.
+    fn fill_big_and_small(m: &LocalMemory) {
+        for i in 0..400 {
+            m.import_record_at(Kind::Chunk, &format!("Big/Area/f{i}.docx"), &format!("big {i}"),
+                &format!("tender evaluation tender evaluation tender evaluation criteria scoring matrix number {i}"), 1000, None).unwrap();
+        }
+        for i in 0..3 {
+            m.import_record_at(Kind::Chunk, &format!("Small/Channel/g{i}.docx"), &format!("small {i}"),
+                &format!("tender evaluation tender evaluation tender evaluation notes for the channel item {i}"), 1000, None).unwrap();
+        }
+        for i in 0..2 {
+            m.import_record_at(Kind::Chunk, &format!("Other/Channel/h{i}.docx"), &format!("other {i}"),
+                &format!("tender evaluation tender evaluation tender evaluation minutes of the other channel item {i}"), 1000, None).unwrap();
+        }
+    }
+
+    fn assert_only(hits: &[Entry], prefix: &str, n: usize) {
+        assert_eq!(hits.len(), n, "{:?}", hits.iter().map(|e| e.namespace.clone()).collect::<Vec<_>>());
+        assert!(hits.iter().all(|e| e.namespace.starts_with(prefix)));
+    }
+
+    #[test]
+    fn recall_in_finds_a_small_area_behind_a_big_one_keyword() {
+        let m = LocalMemory::for_test(tmp_store());
+        fill_big_and_small(&m);
+        assert_only(&m.recall_in("tender evaluation", 10, &["Small/".to_string()]).unwrap(), "Small/", 3);
+    }
+
+    #[cfg(feature = "zvec")]
+    #[test]
+    fn recall_in_finds_a_small_area_behind_a_big_one_hybrid() {
+        let m = LocalMemory::for_test_vec(tmp_store(), &tmp_vdir());
+        fill_big_and_small(&m);
+        assert_only(&m.recall_in("tender evaluation", 10, &["Small/".to_string()]).unwrap(), "Small/", 3);
+    }
+
+    #[test]
+    fn recall_in_with_several_prefixes_returns_each_area_keyword() {
+        let m = LocalMemory::for_test(tmp_store());
+        fill_big_and_small(&m);
+        let hits = m.recall_in("tender evaluation", 10, &["Small/".to_string(), "Other/".to_string()]).unwrap();
+        assert_eq!(hits.len(), 5);
+        assert!(hits.iter().all(|e| e.namespace.starts_with("Small/") || e.namespace.starts_with("Other/")));
+    }
+
+    #[cfg(feature = "zvec")]
+    #[test]
+    fn recall_in_with_several_prefixes_returns_each_area_hybrid() {
+        let m = LocalMemory::for_test_vec(tmp_store(), &tmp_vdir());
+        fill_big_and_small(&m);
+        let hits = m.recall_in("tender evaluation", 10, &["Small/".to_string(), "Other/".to_string()]).unwrap();
+        assert_eq!(hits.len(), 5);
+        assert!(hits.iter().all(|e| e.namespace.starts_with("Small/") || e.namespace.starts_with("Other/")));
+    }
+
+    // With the per-area floor off, a recall over every folder gates exactly as a whole-tenant
+    // recall (0.5.2): the same records in the same order, however the fixture is shaped.
+    #[test]
+    fn recall_in_over_every_folder_gates_like_a_whole_tenant_recall_keyword() {
+        let _g = crate::config::TEST_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let m = LocalMemory::for_test(tmp_store());
+        fill_big_and_small(&m);
+        m.import_record_at(Kind::Chunk, "Weak/Area/w.docx", "weak", "tender notes", 1000, None).unwrap();
+        let whole: Vec<String> = m.recall("tender evaluation", 20).unwrap().into_iter().map(|e| e.uri).collect();
+        let all: Vec<String> = m.recall_in_with("tender evaluation", 20, &[String::new()], false).unwrap().into_iter().map(|e| e.uri).collect();
+        assert_eq!(whole, all);
+    }
+
+    #[cfg(feature = "zvec")]
+    #[test]
+    fn recall_in_over_every_folder_gates_like_a_whole_tenant_recall_hybrid() {
+        let _g = crate::config::TEST_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let m = LocalMemory::for_test_vec(tmp_store(), &tmp_vdir());
+        fill_big_and_small(&m);
+        m.import_record_at(Kind::Chunk, "Weak/Area/w.docx", "weak", "tender notes", 1000, None).unwrap();
+        let whole: Vec<String> = m.recall("tender evaluation", 20).unwrap().into_iter().map(|e| e.uri).collect();
+        let all: Vec<String> = m.recall_in_with("tender evaluation", 20, &[String::new()], false).unwrap().into_iter().map(|e| e.uri).collect();
+        assert_eq!(whole, all);
+    }
+
+    // The relative gate (a hit must reach 45% of the best hit) is the part of the floor that
+    // depends on the pool. A folder whose matches are all much weaker than the tenant's best is
+    // gated by default (as a whole-tenant recall gates them) and found with the per-area floor.
+    #[test]
+    fn a_weak_folder_is_judged_against_the_tenant_best_unless_the_area_floor_is_on() {
+        let _g = crate::config::TEST_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let m = LocalMemory::for_test(tmp_store());
+        for i in 0..5 {
+            m.import_record_at(Kind::Chunk, &format!("Strong/f{i}.docx"), &format!("strong {i}"),
+                "tender evaluation tender evaluation tender evaluation tender evaluation tender evaluation", 1000, None).unwrap();
+        }
+        // padding so the weak record's bm25 is a small fraction of the strong ones
+        let pad = "lorem ipsum dolor sit amet ".repeat(40);
+        m.import_record_at(Kind::Chunk, "Weak/w.docx", "weak", &format!("{pad} tender {pad} evaluation {pad}"), 1000, None).unwrap();
+        let off = m.recall_in_with("tender evaluation", 10, &["Weak/".to_string()], false).unwrap();
+        let on = m.recall_in_with("tender evaluation", 10, &["Weak/".to_string()], true).unwrap();
+        let whole = m.recall("tender evaluation", 10).unwrap();
+        assert_eq!(off.iter().any(|e| e.namespace.starts_with("Weak/")), whole.iter().any(|e| e.namespace.starts_with("Weak/")),
+            "off: the weak folder is gated exactly as in a whole-tenant recall");
+        assert_eq!(on.len(), 1, "on: the folder is judged against its own best hit");
+    }
+
+    #[test]
+    fn the_per_area_floor_setting_is_only_the_word_area() {
+        assert!(config::parse_recall_floor_scope_area(Some("area")));
+        assert!(config::parse_recall_floor_scope_area(Some(" AREA ")));
+        for v in [None, Some(""), Some("0"), Some("tenant"), Some("on"), Some("1")] {
+            assert!(!config::parse_recall_floor_scope_area(v), "{v:?}");
+        }
+    }
+
+    // The small-corpus guard (a fully gated pool of at most `limit` hits is kept, because the
+    // absolute magnitudes of a tiny corpus mean nothing) is unchanged for a whole-tenant recall,
+    // and does not fire for a folder when the tenant-wide best hit clears the floor.
+    #[test]
+    fn the_small_corpus_guard_is_unchanged_by_default_and_not_applied_to_a_folder_of_a_larger_tenant() {
+        let mut f = config::RecallFloor::DEFAULTS;
+        f.abs_keyword = 1000.0; // every hit of a small corpus is under the absolute floor
+        let kw = vec![("a".to_string(), 3.0), ("b".to_string(), 2.0)];
+        let keep_all: std::collections::HashSet<String> = ["a", "b"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(floor_survivors(&kw, &[], &f, 5), keep_all, "whole tenant: the guard keeps the small pool");
+        assert_eq!(floor_survivors_ref(&kw, &[], &f, 5, None, None), keep_all);
+        // a folder whose tenant-wide best also fails the floor: the tenant is small, the guard still holds
+        assert_eq!(floor_survivors_ref(&kw, &[], &f, 5, Some(5.0), None), keep_all);
+        // a folder of a larger tenant whose best hit clears the floor: its gated hits stay gated
+        f.abs_keyword = 2.5;
+        assert!(floor_survivors_ref(&kw, &[], &f, 5, Some(50.0), None).is_empty());
+        assert_eq!(floor_survivors(&kw, &[], &f, 5).len(), 1, "whole tenant: only the top clears the floor");
+    }
+
+    #[test]
+    fn floor_survivors_ref_without_references_is_floor_survivors() {
+        let f = config::RecallFloor::DEFAULTS;
+        let kw = vec![("a".to_string(), 10.0), ("b".to_string(), 3.0), ("c".to_string(), 0.5)];
+        let vc = [("a".to_string(), 0.9f32), ("b".to_string(), 0.7), ("c".to_string(), 0.3)];
+        for (k, v) in [(&kw[..], &[][..]), (&kw[..], &vc[..]), (&[][..], &vc[..])] {
+            assert_eq!(floor_survivors(k, v, &f, 5), floor_survivors_ref(k, v, &f, 5, None, None));
+        }
+        // a higher tenant-wide reference gates more; a lower one changes nothing
+        assert!(floor_survivors_ref(&kw, &[], &f, 1, Some(100.0), None).len() < floor_survivors(&kw, &[], &f, 1).len());
+        assert_eq!(floor_survivors_ref(&kw, &[], &f, 1, Some(1.0), None), floor_survivors(&kw, &[], &f, 1));
+    }
+
+    // Needs the offline bge model (HF_HOME with HF_HUB_OFFLINE=1) and a candle build; run by hand:
+    //   cargo test --release --features dist --lib real_embedder_folder_recall -- --ignored --nocapture
+    // 400 on-topic sentences in one folder, 3 in another, real text. Prints what the cosine gate
+    // does to the small folder, with and without the folder restriction.
+    #[cfg(feature = "candle")]
+    #[test]
+    #[ignore]
+    fn real_embedder_folder_recall() {
+        let _g = crate::config::TEST_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let dir = std::env::temp_dir().join(format!("dmreal-{}-{}", std::process::id(), now_ms()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::env::set_var("DM_DATA_DIR", &dir);
+        let m = LocalMemory::open_tenant("realcheck").expect("open tenant");
+        assert_ne!(m.embedder.name(), "hash", "this check needs the real embedder");
+        eprintln!("REAL embedder = {} (dim {})", m.embedder.name(), m.embedder.dim());
+        let projects = ["the data centre refurbishment", "the network refresh", "the records digitisation service", "the fleet maintenance contract",
+            "the cleaning and security services", "the library furniture supply", "the cloud hosting service", "the printer lease", "the laptop supply", "the training programme"];
+        let criteria = ["price", "technical merit", "delivery time", "past performance", "after-sales support", "financial standing", "compliance with the specification", "risk"];
+        for i in 0..400 {
+            let text = format!(
+                "The evaluation committee scored bid number {i} for {} on {} and {}, then ranked the bidders by total marks and recorded the result in the tender evaluation report.",
+                projects[i % projects.len()], criteria[i % criteria.len()], criteria[(i / 3 + 1) % criteria.len()]);
+            m.import_record_at(Kind::Chunk, &format!("Big/Area/report{i}.docx"), &format!("evaluation {i}"), &text, 1000, None).unwrap();
+        }
+        let small = [
+            "After the technical evaluation the channel kept a shortlist of three bidders and noted why each one was ranked where it was.",
+            "Marks for the bids were agreed in the channel meeting: price carried sixty percent, and the evaluation sheet was filed with the minutes.",
+            "The panel for this channel scored every tender against the published criteria and the winning bid was the lowest compliant offer.",
+        ];
+        for (i, t) in small.iter().enumerate() {
+            m.import_record_at(Kind::Chunk, &format!("Small/Channel/notes{i}.docx"), &format!("notes {i}"), t, 1000, None).unwrap();
+        }
+        let q = "how were the tender bids evaluated and ranked";
+        let qv = m.embedder.embed(q);
+        let cos: Vec<(String, f32)> = m.vindex.as_ref().unwrap().search(&qv, 4096).unwrap().into_iter().map(|h| (h.uri, h.score)).collect();
+        let top_big = cos.iter().find(|(u, _)| u.contains("/Big/") || u.contains("Big/")).map(|x| x.1);
+        eprintln!("REAL top cosine among Big = {top_big:?}");
+        for (i, _) in small.iter().enumerate() {
+            let c = cos.iter().position(|(u, _)| u.contains(&format!("Small/Channel/notes{i}")));
+            eprintln!("REAL Small notes{i}: cosine {:?} at rank {:?} of {}", c.map(|r| cos[r].1), c, cos.len());
+        }
+        let n_small = |v: &[Entry]| v.iter().filter(|e| e.namespace.starts_with("Small/")).count();
+        let whole = m.recall(q, 100).unwrap();
+        eprintln!("REAL recall(limit 100): {} hits, Small={}", whole.len(), n_small(&whole));
+        for area in [false, true] {
+            let scoped = m.recall_in_with(q, 10, &["Small/".to_string()], area).unwrap();
+            eprintln!("REAL recall_in([Small/], 10, area_floor={area}): {} hits, Small={}", scoped.len(), n_small(&scoped));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recall_in_prefix_is_a_literal_prefix_not_a_pattern() {
+        // LIKE metacharacters in a folder name must match themselves only
+        let m = LocalMemory::for_test(tmp_store());
+        m.import_record_at(Kind::Chunk, "100%_done/a.docx", "a", "tender evaluation notes", 1000, None).unwrap();
+        m.import_record_at(Kind::Chunk, "100xxdone/b.docx", "b", "tender evaluation notes", 1000, None).unwrap();
+        let hits = m.recall_in("tender evaluation", 10, &["100%_done/".to_string()]).unwrap();
+        assert_only(&hits, "100%_done/", 1);
     }
 
     #[test]

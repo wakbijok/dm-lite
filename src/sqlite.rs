@@ -283,6 +283,19 @@ impl SqliteStore {
     /// ("1" and none for an unrestricted reader). Filtering in SQL makes LIMIT count VISIBLE
     /// rows only: a post-query filter over a fixed over-fetch can be exhausted by any amount of
     /// invisible churn (one uri with 800 versions in another scope hid its global row).
+    /// The keyword recall statement: `vis` is the reader gate, `pfx` the folder restriction.
+    /// Parameters: ?1 the FTS query, ?2 now, ?3 the limit, then the gate's and the folders'.
+    fn recall_sql(vis: &str, pfx: &str) -> String {
+        format!(
+            "SELECT {}, entries_fts.rank AS kw_rank FROM entries_fts JOIN entries e ON e.id = entries_fts.idref \
+             WHERE entries_fts MATCH ?1 AND e.system_to_ms IS NULL \
+             AND e.valid_from_ms <= ?2 AND (e.valid_to_ms IS NULL OR e.valid_to_ms > ?2) \
+             AND e.kind <> 'skill' AND {vis} AND {pfx} \
+             ORDER BY entries_fts.rank LIMIT ?3",
+            COLS.split(',').map(|c| format!("e.{c}")).collect::<Vec<_>>().join(",")
+        )
+    }
+
     fn visibility_sql(&self, p: &str, first: usize) -> (String, Vec<Value>) {
         let mut clauses: Vec<String> = Vec::new();
         let mut vals: Vec<Value> = Vec::new();
@@ -741,6 +754,19 @@ pub fn purge_prefix(p: &str) -> Result<String> {
     Ok(p.to_string())
 }
 
+/// SQL that keeps rows whose namespace column `{p}namespace` starts with any of `prefixes`
+/// (the bound parameter `?n` is a JSON array of them). No prefixes: `1`, no parameter.
+fn prefix_sql(p: &str, n: usize, prefixes: &[String]) -> (String, Vec<Value>) {
+    if prefixes.is_empty() {
+        return ("1".into(), Vec::new());
+    }
+    let json = serde_json::to_string(prefixes).unwrap_or_else(|_| "[]".into());
+    (
+        format!("EXISTS (SELECT 1 FROM json_each(?{n}) WHERE substr({p}namespace, 1, length(value)) = value)"),
+        vec![Value::Text(json)],
+    )
+}
+
 impl MemoryStore for SqliteStore {
     /// Bitemporal upsert with valid-time splitting. The new entry asserts its body over its valid
     /// interval [valid_from, valid_to). Any system-current segment of the same entity that OVERLAPS
@@ -798,11 +824,23 @@ impl MemoryStore for SqliteStore {
         Ok(())
     }
 
-    fn recall_scored(&self, query: &str, limit: usize) -> Result<Vec<(Entry, f64)>> {
+    fn recall_scored_in(&self, query: &str, limit: usize, prefixes: &[String]) -> Result<Vec<(Entry, f64)>> {
         let fq = match fts_query(query) {
             // No FTS terms (empty/short query) -> the recent() boot slice, which has no keyword
             // magnitude; tag each with INFINITY so the recall floor never gates the boot rows out.
-            None => return Ok(self.recent(limit)?.into_iter().map(|e| (e, f64::INFINITY)).collect()),
+            None if prefixes.is_empty() => {
+                return Ok(self.recent(limit)?.into_iter().map(|e| (e, f64::INFINITY)).collect())
+            }
+            // Scoped: take the boot slice deep enough that the folders still hold some of it.
+            None => {
+                return Ok(self
+                    .recent(limit.saturating_mul(6).max(30))?
+                    .into_iter()
+                    .filter(|e| prefixes.iter().any(|p| e.namespace.starts_with(p.as_str())))
+                    .take(limit)
+                    .map(|e| (e, f64::INFINITY))
+                    .collect())
+            }
             Some(q) => q,
         };
         let now = crate::entry::now_ms();
@@ -812,15 +850,15 @@ impl MemoryStore for SqliteStore {
         // entries_fts.rank keeps positional rescoring aligned. SQLite bm25 (entries_fts.rank) is
         // NEGATIVE with more-negative = better, so return -rank (>= 0, larger = better).
         let (vis, vis_vals) = self.visibility_sql("e.", 4);
-        let mut stmt = self.conn.prepare(&format!(
-            "SELECT {}, entries_fts.rank AS kw_rank FROM entries_fts JOIN entries e ON e.id = entries_fts.idref \
-             WHERE entries_fts MATCH ?1 AND e.system_to_ms IS NULL \
-             AND e.valid_from_ms <= ?2 AND (e.valid_to_ms IS NULL OR e.valid_to_ms > ?2) \
-             AND e.kind <> 'skill' AND {vis} \
-             ORDER BY entries_fts.rank LIMIT ?3",
-            COLS.split(',').map(|c| format!("e.{c}")).collect::<Vec<_>>().join(",")
-        ))?;
-        let binds = [Value::Text(fq), Value::Integer(now), Value::Integer(limit as i64)].into_iter().chain(vis_vals);
+        // The folder restriction sits in the WHERE, before ORDER BY ... LIMIT. One bound JSON
+        // array, however many prefixes: no SQL is built from reader input, and a prefix is
+        // compared as text (substr), so `%` and `_` in a folder name mean themselves.
+        let (pfx, pfx_vals) = prefix_sql("e.", 4 + vis_vals.len(), prefixes);
+        let mut stmt = self.conn.prepare(&Self::recall_sql(&vis, &pfx))?;
+        let binds = [Value::Text(fq), Value::Integer(now), Value::Integer(limit as i64)]
+            .into_iter()
+            .chain(vis_vals)
+            .chain(pfx_vals);
         let out = stmt
             .query_map(params_from_iter(binds), |r| {
                 let e = Self::row_to_entry(r)?;
@@ -1285,6 +1323,34 @@ mod tests {
         let dev: Vec<String> = s.by_kind_for_agent("persona", Some("dev_in"), 10).unwrap().into_iter().map(|e| e.title).collect();
         assert!(dev.contains(&"Dev_in Persona".to_string()));
         assert!(!dev.contains(&"Not Dev_in".to_string()), "underscore must not act as a wildcard");
+    }
+
+    #[test]
+    fn a_folder_prefix_is_applied_before_the_limit_and_the_plan_does_not_scan_entries() {
+        let s = mem_store();
+        for i in 0..400 {
+            s.put(&mk(Kind::Chunk, &format!("Big/Area/f{i}.docx"), &format!("big {i}"), "tender evaluation tender evaluation tender evaluation criteria")).unwrap();
+        }
+        for i in 0..3 {
+            s.put(&mk(Kind::Chunk, &format!("Small/Channel/g{i}.docx"), &format!("small {i}"), "tender evaluation notes")).unwrap();
+        }
+        let q = "tender evaluation";
+        let prefixes = vec!["Small/".to_string()];
+        let hits = s.recall_scored_in(q, 10, &prefixes).unwrap();
+        assert_eq!(hits.len(), 3, "limit counts only the folder's records");
+        assert!(hits.iter().all(|(e, _)| e.namespace.starts_with("Small/")));
+        // 10 whole-tenant hits are all Big: the limit was not spent on them
+        assert!(s.recall_scored_in(q, 10, &[]).unwrap().iter().all(|(e, _)| e.namespace.starts_with("Big/")));
+
+        let (vis, vis_vals) = s.visibility_sql("e.", 4);
+        let (pfx, pfx_vals) = prefix_sql("e.", 4 + vis_vals.len(), &prefixes);
+        let sql = format!("EXPLAIN QUERY PLAN {}", SqliteStore::recall_sql(&vis, &pfx));
+        let fq = fts_query(q).unwrap();
+        let binds = [Value::Text(fq), Value::Integer(now_ms()), Value::Integer(10)].into_iter().chain(vis_vals).chain(pfx_vals);
+        let mut stmt = s.conn.prepare(&sql).unwrap();
+        let plan: Vec<String> = stmt.query_map(params_from_iter(binds), |r| r.get::<_, String>(3)).unwrap().filter_map(|r| r.ok()).collect();
+        eprintln!("QUERY PLAN (folder-scoped keyword recall):\n  {}", plan.join("\n  "));
+        assert!(!plan.iter().any(|l| l.starts_with("SCAN e") && !l.contains("entries_fts")), "entries must not be scanned: {plan:?}");
     }
 
     #[test]
